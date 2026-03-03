@@ -4,6 +4,7 @@ from .tomography  import (AMPITomographicIndex, AMPITwoStageIndex,
 from .hashing     import AMPIHashIndex
 from .subspace    import AMPISubspaceIndex
 from .fan         import AMPIPrincipalFanIndex
+from .affine_fan  import AMPIAffineFanIndex
 
 AMPIIndex = AMPITomographicIndex  # default alias
 
@@ -17,5 +18,6 @@ __all__ = [
     "AMPIHashIndex",
     "AMPISubspaceIndex",
     "AMPIPrincipalFanIndex",
+    "AMPIAffineFanIndex",
     "AMPIIndex",
 ]

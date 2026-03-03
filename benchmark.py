@@ -26,8 +26,9 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, ".")
 from ampi import (
     AMPIBinaryIndex,
-    AMPITomographicIndex, AMPITwoStageIndex,
+    AMPITomographicIndex,
     AMPIPrincipalFanIndex,
+    AMPIAffineFanIndex,
 )
 
 K             = 10      # neighbours to retrieve
@@ -116,8 +117,14 @@ def _pareto_group(label):
     """
     parts = label.split()
     p = parts[0]
+    if p == "Fan-vote":
+        return f"Fan-vote {parts[1]}"
     if p == "Fan":
-        return f"Fan {parts[1]}"   # separate frontier per K value
+        return f"Fan {parts[1]}"
+    if p == "AFan-vote":
+        return f"AFan-vote {parts[1]}"
+    if p == "AFan":
+        return f"AFan {parts[1]}"
     return p
 
 
@@ -160,7 +167,7 @@ def evaluate(label, query_fn, cands_fn, queries, gt, data, n, pareto=None):
     r     = dict(label=label, recall=rec, ratio=ratio, ms=ms, qps=1e3 / ms, cands=cands)
 
     cands_str = f"{cands:>7,}" if cands < n else f"{'n':>7}"
-    print(f"  {label:<24}  {rec:>6.3f}  {ratio:>10.4f}  {1e3/ms:>8.1f}  {ms:>7.3f}  {cands_str}",
+    print(f"  {label:<38}  {rec:>6.3f}  {ratio:>10.4f}  {1e3/ms:>8.1f}  {ms:>7.3f}  {cands_str}",
           flush=True)
     return r
 
@@ -174,10 +181,14 @@ _FAMILY_STYLE = {
     "Binary":         dict(color="#8c8c8c", marker="s",  ls="-",    lw=1.5, ms=7),
     "Tomo-loc L=16":  dict(color="#2ca02c", marker="^",  ls="-",    lw=1.5),
     "Tomo-loc L=32":  dict(color="#006400", marker="^",  ls="--",   lw=1.5),
-    "TwoStage L=16":  dict(color="#e6194b", marker="P",  ls="-",    lw=2,  ms=9),
-    "TwoStage L=32":  dict(color="#911eb4", marker="P",  ls="--",   lw=2,  ms=9),
     "Fan K=16":       dict(color="#e07020", marker="D",  ls="-",    lw=2,   ms=7),
     "Fan K=32":       dict(color="#a03000", marker="D",  ls="--",   lw=2,   ms=7),
+    "Fan-vote K=16":  dict(color="#e07020", marker="*",  ls="-",    lw=2,   ms=10),
+    "Fan-vote K=32":  dict(color="#a03000", marker="*",  ls="--",   lw=2,   ms=10),
+    "AFan F=16":      dict(color="#9467bd", marker="D",  ls="-",    lw=2,   ms=7),
+    "AFan F=32":      dict(color="#6a0dad", marker="D",  ls="--",   lw=2,   ms=7),
+    "AFan-vote F=16": dict(color="#9467bd", marker="*",  ls="-",    lw=2,   ms=10),
+    "AFan-vote F=32": dict(color="#6a0dad", marker="*",  ls="--",   lw=2,   ms=10),
 }
 
 
@@ -187,8 +198,10 @@ def _family(label):
     if parts[0] == "IVF":             return "IVF"
     if parts[0] == "Binary":          return "Binary"
     if parts[0].startswith("Tomo-"):  return f"{parts[0]} {parts[1]}"
-    if parts[0] == "TwoStage":        return f"TwoStage {parts[1]}"
+    if parts[0] == "Fan-vote":        return f"Fan-vote {parts[1]}"
     if parts[0] == "Fan":             return f"Fan {parts[1]}"
+    if parts[0] == "AFan-vote":       return f"AFan-vote {parts[1]}"
+    if parts[0] == "AFan":            return f"AFan {parts[1]}"
     return parts[0]
 
 
@@ -306,11 +319,7 @@ def scale_params(n, d):
 
     w_base = max(15, int(15 * math.sqrt(n / 10_000)))
 
-    bins_broad  = max(4,  min(32, int(math.sqrt(n / 500))))
-    bins_narrow = max(6,  min(64, bins_broad * 2))
-
-    return dict(S=S, L1=L1, L2=L2, w_base=w_base,
-                bins_broad=bins_broad, bins_narrow=bins_narrow)
+    return dict(S=S, L1=L1, L2=L2, w_base=w_base)
 
 
 # ── main benchmark ────────────────────────────────────────────────────────────
@@ -334,8 +343,7 @@ def run(dataset_name, data, queries, gt):
     L1, L2 = pr['L1'], pr['L2']
     S      = pr['S']
     wb     = pr['w_base']
-    bins_b = pr['bins_broad']
-    print(f"  auto-params: L={L1}/{L2}  S={S}  w_base={wb}  bins={bins_b}")
+    print(f"  auto-params: L={L1}/{L2}  S={S}  w_base={wb}")
 
     def build(label, cls, **kw):
         print(f"  Building {label}…", end=" ", flush=True)
@@ -344,10 +352,9 @@ def run(dataset_name, data, queries, gt):
         print(f"{time.perf_counter()-t0:.2f}s")
         return idx
 
-    idx_tomo16 = build(f"Tomo-loc L={L1}", AMPITomographicIndex, num_projections=L1, C_factor=5, S=S, power_iter=1, local=True, seed=0)
-    idx_tomo32 = build(f"Tomo-loc L={L2}", AMPITomographicIndex, num_projections=L2, C_factor=5, S=S, power_iter=1, local=True, seed=0)
-    idx_2st16  = build(f"TwoStage L={L1}", AMPITwoStageIndex,    num_projections=L1, bins_per_axis=bins_b, subspace_dim=2, C_factor=5, S=S, power_iter=1, local=True, seed=0)
-    idx_2st32  = build(f"TwoStage L={L2}", AMPITwoStageIndex,    num_projections=L2, bins_per_axis=bins_b, subspace_dim=2, C_factor=5, S=S, power_iter=1, local=True, seed=0)
+    idx_bin    = build(f"Binary   L={L2}", AMPIBinaryIndex,       num_projections=L2, seed=0)
+    idx_tomo16 = build(f"Tomo-loc L={L1}", AMPITomographicIndex,  num_projections=L1, C_factor=5, S=S, power_iter=1, local=True, seed=0)
+    idx_tomo32 = build(f"Tomo-loc L={L2}", AMPITomographicIndex,  num_projections=L2, C_factor=5, S=S, power_iter=1, local=True, seed=0)
 
     configs = []
 
@@ -362,41 +369,60 @@ def run(dataset_name, data, queries, gt):
             return (None, None, ivf.search(q[None], K)[1][0])
         configs.append((f"IVF nprobe={nprobe}", _ivf, lambda q, p=nprobe: p * (n // nlist)))
 
-    # Binary: random-direction baseline — the simplest AMPI method, equivalent to the
-    # original C++ code.  Everything else should beat this on structured data.
-    idx_bin = build("Binary L=16", AMPIBinaryIndex, num_projections=L2, seed=0)
+    # Binary: random-direction baseline (= original C++ code)
     for w in [wb, 2*wb, 4*wb]:
         configs.append((f"Binary L={L2} w={w}",
                         lambda q, i=idx_bin, w=w: i.query(q, k=K, window_size=w),
                         lambda q, i=idx_bin, w=w: i.query_candidates(q, window_size=w)))
 
-    # Tomo-loc: three window sizes per L value
+    # Tomo-loc: geometry-guided directions
     for idx, L in [(idx_tomo16, L1), (idx_tomo32, L2)]:
         for w in [wb, 2*wb, 4*wb]:
             configs.append((f"Tomo-loc L={L} w={w}",
                             lambda q, i=idx, w=w: i.query(q, k=K, window_size=w),
                             lambda q, i=idx, w=w: i.query_candidates(q, window_size=w)))
 
-    # Two-stage: coarse subspace hash → voting precision pass
-    for idx, L in [(idx_2st16, L1), (idx_2st32, L2)]:
-        for sp, fw in [(1, 0.08), (1, 0.20), (2, 0.20)]:
-            label = f"TwoStage L={L} sp={sp} fw={fw}"
-            configs.append((label,
-                            lambda q, i=idx, sp=sp, fw=fw: i.query(q, k=K, sub_probes=sp, fine_window=fw),
-                            lambda q, i=idx, sp=sp, fw=fw: i.query_candidates(q, sub_probes=sp, fine_window=fw, min_return=K)))
-
-    # Fan: principal-direction cones (unit-sphere assignment); sorted projections within each cone.
-    # Window scales with per-cone size n/K.
+    # Fan: principal-direction cones; sorted projections within each cone.
+    # Fan-union: union over all axis windows (more candidates, higher recall ceiling).
+    # Fan-vote: vote-threshold within each cone — keeps only high-confidence NNs,
+    #   ideally matching IVF recall with a fraction of its candidate count.
     for K_fans in [L1, L2]:
         w_fan = max(5, int(15 * math.sqrt(n / (K_fans * 10_000))))
-        idx_fan = build(f"Fan K={K_fans}", AMPIPrincipalFanIndex,
+        idx_fan = build(f"Fan      K={K_fans}", AMPIPrincipalFanIndex,
                         num_fans=K_fans, C_factor=5, S=S, power_iter=1, seed=0)
         for w, probes in [(w_fan, 1), (2*w_fan, 1), (w_fan, 2), (2*w_fan, 2)]:
             configs.append((f"Fan K={K_fans} w={w} p={probes}",
                             lambda q, i=idx_fan, w=w, p=probes: i.query(q, k=K, window_size=w, probes=p),
                             lambda q, i=idx_fan, w=w, p=probes: i.query_candidates(q, window_size=w, probes=p)))
+        # Vote variants: mv sweeps the precision dial
+        for w, probes, mv in [(2*w_fan, 1, K_fans//8), (2*w_fan, 1, K_fans//4),
+                              (2*w_fan, 2, K_fans//8), (2*w_fan, 2, K_fans//4)]:
+            configs.append((f"Fan-vote K={K_fans} w={w} p={probes} mv={mv}",
+                            lambda q, i=idx_fan, w=w, p=probes, mv=mv: i.query_voting(q, k=K, window_size=w, probes=p, min_votes=mv),
+                            lambda q, i=idx_fan, w=w, p=probes, mv=mv: i.query_candidates_voting(q, window_size=w, probes=p, min_votes=mv)))
 
-    hdr = f"  {'Method':<24}  {'R@10':>6}  {'dist ratio':>10}  {'QPS':>8}  {'ms/q':>7}  {'cands':>7}"
+    # AffineFan: FAISS k-means partition + affine fan cones.
+    af_nlist = max(16, int(np.sqrt(n)))
+    for F in [L1, L2]:
+        idx_af = build(f"AFan     F={F}", AMPIAffineFanIndex,
+                       nlist=af_nlist, num_fans=F,
+                       C_factor=5, S=S, power_iter=1, seed=0)
+        # Union mode: sweep cluster probes × fan probes × window
+        for w, cp, fp in [(wb//4, 5, 2), (wb//4, 10, 2), (wb//4, 10, 4),
+                          (wb//2, 5, 2), (wb//2, 10, 2), (wb//2, 10, 4),
+                          (wb//2, 10, F), (wb, 10, F)]:
+            configs.append((f"AFan F={F} w={w} cp={cp} fp={fp}",
+                            lambda q, i=idx_af, w=w, cp=cp, fp=fp: i.query(q, k=K, window_size=w, probes=cp, fan_probes=fp),
+                            lambda q, i=idx_af, w=w, cp=cp, fp=fp: i.query_candidates(q, window_size=w, probes=cp, fan_probes=fp)))
+        # Vote variants
+        for w, cp, fp, mv in [(wb//2, 10, F, F//8), (wb//2, 10, F, F//4),
+                               (wb, 10, F, F//8), (wb, 10, F, F//4),
+                               (wb//2, 5, 2, F//8), (wb//2, 10, 2, F//4)]:
+            configs.append((f"AFan-vote F={F} w={w} cp={cp} fp={fp} mv={mv}",
+                            lambda q, i=idx_af, w=w, cp=cp, fp=fp, mv=mv: i.query_voting(q, k=K, window_size=w, probes=cp, fan_probes=fp, min_votes=mv),
+                            lambda q, i=idx_af, w=w, cp=cp, fp=fp, mv=mv: i.query_candidates_voting(q, window_size=w, probes=cp, fan_probes=fp, min_votes=mv)))
+
+    hdr = f"  {'Method':<38}  {'R@10':>6}  {'dist ratio':>10}  {'QPS':>8}  {'ms/q':>7}  {'cands':>7}"
     print()
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))

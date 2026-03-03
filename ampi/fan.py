@@ -1,40 +1,38 @@
 """
-AMPI Principal Fan Index: principal-direction cone partition on the unit sphere.
+AMPI Principal Fan Index: affine cone partition around the data centroid.
 
 Build
-  1. Compute K geometry-guided unit directions {a₀, …, a_{K-1}} — the fan axes.
-  2. L2-normalise every data point: x̂ = x/‖x‖.
-  3. Assign each point to its dominant axis on the unit sphere:
-       cone(x) = argmax_k |aₖ · x̂|
-     The 2K half-spaces are the Voronoi cells of {±aₖ} on the unit sphere.
-     Normalising first ensures the partition is purely directional: two points
-     at the same angular position land in the same cone regardless of norm,
-     so nearby points on real-world datasets (which concentrate on a low-
-     dimensional manifold) share a cone with high probability.
-  4. Within each cone, sort by raw projections on all K axes (no extra passes).
+  1. Compute the data centroid μ.
+  2. Compute K geometry-guided unit directions {a₀, …, a_{K-1}} on centred
+     data (x − μ) — the fan axes radiate from where the data actually lives.
+  3. Assign each point to its dominant axis from the centroid:
+       cone(x) = argmax_k |aₖ · (x̂ − μ̂)|
+     where (x̂ − μ̂) is the unit-norm centred displacement.  The 2K half-spaces
+     are the Voronoi cells of {±aₖ} around the centroid on the unit sphere of
+     displacements.  This is an *affine* fan: the partition adapts to the data's
+     location, not just its spread through the origin.
+  4. Within each cone, sort by centred projections aₖ · (x − μ) on all K axes.
 
 Query
-  1. Normalise q: q̂ = q/‖q‖.
-  2. Rank cones by |aₖ · q̂|; probe the top-P cones.
-  3. Union-query within each probed cone using jit_union_query on raw projections.
-  4. Re-rank survivors by exact L2.
+  1. Centre q: δ = q − μ;  δ̂ = δ/‖δ‖.
+  2. Rank cones by |aₖ · δ̂|; probe the top-P cones.
+  3. Within each probed cone, run sorted-projection search (union or voting)
+     on centred projections.
+  4. Re-rank survivors by exact L2 against original (uncentred) data.
 
-Note on isotropic Gaussian data
-  For x ~ N(0, I_d), direction x̂ and magnitude ‖x‖ are independent, so
-  unit-sphere normalisation gives the same cone assignment as the raw argmax.
-  Fan's principal-cone partition is designed for structured data (real images,
-  speech, text) where the manifold geometry aligns with a directional partition.
-  On pure isotropic noise, no angular partition helps — and the nearest-neighbour
-  problem itself is degenerate (all pairwise distances concentrate around the same
-  value, so R@k measures arbitrary index assignments rather than geometry).
+Why affine beats origin-centred cones
+  Real datasets (SIFT, GloVe, MNIST) cluster far from the origin.  Origin-
+  centred cones concentrate most data into a few cones near the centroid
+  direction, leaving others empty.  Affine fans partition the data by direction
+  *from the centroid*, which tracks actual cluster structure.
 """
 
 import numpy as np
-from ._kernels import jit_union_query, l2_distances
+from ._kernels import jit_union_query, jit_vote_query, l2_distances
 
 
 class AMPIPrincipalFanIndex:
-    """Approximate nearest-neighbour index via principal-direction cone partition.
+    """Approximate nearest-neighbour index via affine cone partition.
 
     Parameters
     ----------
@@ -53,21 +51,23 @@ class AMPIPrincipalFanIndex:
         self.n, self.d = self.data.shape
         self.K = min(num_fans, self.n)
 
-        # K geometry-guided directions — fan axes AND sort directions
+        # Centroid — the origin of the affine fan
+        self.centroid = self.data.mean(axis=0).astype(np.float32)
+        centered = self.data - self.centroid  # (n, d)
+
+        # K geometry-guided directions on centred data
         self.axes = geometry_guided_directions(
-            self.data, self.K,
+            centered, self.K,
             C_factor=C_factor, S=S, power_iter=power_iter, seed=seed,
         )  # (K, d)
 
-        # Project all data onto every axis — reused for sorting within cones
-        all_projs = (self.data @ self.axes.T).astype(np.float32)  # (n, K)
+        # Centred projections — used for both assignment and within-cone search
+        all_projs = (centered @ self.axes.T).astype(np.float32)  # (n, K)
 
-        # Cone assignment: dominant axis on the unit sphere.
-        # Normalise first so the partition is purely directional; two points at
-        # the same angular position land in the same cone regardless of norm.
-        norms = np.linalg.norm(self.data, axis=1, keepdims=True).astype(np.float32)
+        # Affine cone assignment: dominant axis on centred unit sphere
+        norms = np.linalg.norm(centered, axis=1, keepdims=True).astype(np.float32)
         norms = np.where(norms < 1e-10, 1.0, norms)
-        normed_projs = all_projs / norms           # (n, K) — unit-sphere projections
+        normed_projs = all_projs / norms
         assignment = np.argmax(np.abs(normed_projs), axis=1)  # (n,)
 
         self.cone_global       = []   # K × (n_k,) int32  global index map
@@ -90,7 +90,7 @@ class AMPIPrincipalFanIndex:
             s_projs = np.empty((self.K, n_k), dtype=np.float32)
             for l in range(self.K):
                 o = np.argsort(sub_p[:, l])
-                s_idxs[l]  = o.astype(np.int32)   # LOCAL indices (0..n_k-1)
+                s_idxs[l]  = o.astype(np.int32)
                 s_projs[l] = sub_p[o, l]
 
             self.cone_sorted_idxs.append(s_idxs)
@@ -98,34 +98,78 @@ class AMPIPrincipalFanIndex:
 
     # ── internal ──────────────────────────────────────────────────────────────
 
-    def _best_cones(self, q, probes):
-        """Indices of the probes cones with largest |aₖ · q̂| (unit-sphere)."""
-        q_norm = float(np.linalg.norm(q))
+    def _best_cones(self, q_centered, probes):
+        """Indices of the probes cones with largest |aₖ · δ̂| (centred unit sphere)."""
+        q_norm = float(np.linalg.norm(q_centered))
         if q_norm < 1e-10:
             return np.arange(probes, dtype=np.int32)
-        q_hat_proj = q @ self.axes.T / q_norm
+        q_hat_proj = q_centered @ self.axes.T / q_norm
         return np.argsort(-np.abs(q_hat_proj))[:probes]
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def query_candidates(self, q, window_size=50, probes=2):
-        q      = np.ascontiguousarray(q, dtype=np.float32)
-        q_proj = np.ascontiguousarray(q @ self.axes.T, dtype=np.float32)
-        cones  = self._best_cones(q, probes)
+        q         = np.ascontiguousarray(q, dtype=np.float32)
+        q_centered = q - self.centroid
+        q_proj    = np.ascontiguousarray(q_centered @ self.axes.T, dtype=np.float32)
+        cones     = self._best_cones(q_centered, probes)
 
         parts = []
         for c in cones:
             if self.cone_sorted_idxs[c] is None:
                 continue
+            n_k = self.cone_sorted_idxs[c].shape[1]
+            w = max(1, int(window_size * n_k / max(1, self.n // self.K)))
             local = jit_union_query(
                 self.cone_sorted_idxs[c],
                 self.cone_sorted_projs[c],
-                q_proj, window_size,
+                q_proj, w,
             )
-            parts.append(self.cone_global[c][local])   # map local → global
+            parts.append(self.cone_global[c][local])
         if not parts:
             return np.zeros(0, dtype=np.int32)
         return np.unique(np.concatenate(parts))
+
+    def query_candidates_voting(self, q, window_size=50, probes=2, min_votes=None):
+        """Like query_candidates but uses vote-thresholding within each cone."""
+        q         = np.ascontiguousarray(q, dtype=np.float32)
+        q_centered = q - self.centroid
+        q_proj    = np.ascontiguousarray(q_centered @ self.axes.T, dtype=np.float32)
+        cones     = self._best_cones(q_centered, probes)
+        if min_votes is None:
+            min_votes = max(1, self.K // 8)
+
+        parts = []
+        for c in cones:
+            if self.cone_sorted_idxs[c] is None:
+                continue
+            n_k = self.cone_sorted_idxs[c].shape[1]
+            w   = max(1, int(window_size * n_k / max(1, self.n // self.K)))
+            local = jit_vote_query(
+                self.cone_sorted_idxs[c],
+                self.cone_sorted_projs[c],
+                q_proj, w, min_votes,
+            )
+            if len(local) == 0:
+                local = jit_union_query(
+                    self.cone_sorted_idxs[c],
+                    self.cone_sorted_projs[c],
+                    q_proj, w,
+                )
+            parts.append(self.cone_global[c][local])
+        if not parts:
+            return np.zeros(0, dtype=np.int32)
+        return np.unique(np.concatenate(parts))
+
+    def query_voting(self, q, k=10, window_size=50, probes=2, min_votes=None):
+        """Voting-mode query: sharply fewer candidates, same or better recall."""
+        q     = np.ascontiguousarray(q, dtype=np.float32)
+        cands = self.query_candidates_voting(q, window_size, probes, min_votes)
+        if len(cands) < k:
+            cands = np.arange(min(k, self.n), dtype=np.int32)
+        dists = l2_distances(self.data, q, cands)
+        top   = np.argsort(dists)[:k]
+        return self.data[cands[top]], dists[top], cands[top]
 
     def query(self, q, k=10, window_size=50, probes=2):
         q     = np.ascontiguousarray(q, dtype=np.float32)
