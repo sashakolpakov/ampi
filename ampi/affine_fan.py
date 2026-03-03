@@ -28,6 +28,91 @@ import numpy as np
 from ._kernels import jit_union_query, jit_vote_query, l2_distances
 
 
+def _bootstrap_nn_pairs(data, S, rng):
+    """Approximate NN pairs via a single random projection → (S, 2) int32."""
+    n, d = data.shape
+    a = rng.randn(d).astype(np.float32)
+    a /= np.linalg.norm(a)
+    order = np.argsort(data @ a)
+    adj   = np.stack([order[:-1], order[1:]], axis=1)
+    sel   = rng.choice(len(adj), min(S, len(adj)), replace=False)
+    return adj[sel]
+
+
+def _score_directions(data, candidates, pairs, rng):
+    """score(a) = mean|a·(anchor−rand)| / mean|a·(anchor−nn)| → (C,) float32."""
+    n        = data.shape[0]
+    S        = len(pairs)
+    anchors  = data[pairs[:, 0]]
+    nns      = data[pairs[:, 1]]
+    randoms  = data[rng.choice(n, S, replace=True)]
+    nn_proj   = np.abs((anchors - nns)     @ candidates.T)   # (S, C)
+    rand_proj = np.abs((anchors - randoms) @ candidates.T)   # (S, C)
+    return (rand_proj.mean(0) / (nn_proj.mean(0) + 1e-8)).astype(np.float32)
+
+
+def _global_power_iter(data, directions, steps):
+    """a ← X^T(Xa)/‖·‖ over full dataset — vectorised over all L at once."""
+    A = directions.T.astype(np.float64)          # (d, L)
+    for _ in range(steps):
+        XA = data @ A                            # (n, L)
+        A  = data.T @ XA                         # (d, L)
+        norms = np.linalg.norm(A, axis=0, keepdims=True)
+        A /= np.where(norms < 1e-10, 1.0, norms)
+    return A.T.astype(np.float32)                # (L, d)
+
+
+def _local_power_iter(data, directions, pairs, steps):
+    """a ← D^T(Da)/‖·‖ where D = NN-pair difference vectors."""
+    anchors = data[pairs[:, 0]].astype(np.float64)
+    nns     = data[pairs[:, 1]].astype(np.float64)
+    D       = anchors - nns                      # (S, d)
+    A = directions.T.astype(np.float64)          # (d, L)
+    for _ in range(steps):
+        DA = D @ A                               # (S, L)
+        A  = D.T @ DA                            # (d, L)
+        norms = np.linalg.norm(A, axis=0, keepdims=True)
+        A /= np.where(norms < 1e-10, 1.0, norms)
+    return A.T.astype(np.float32)                # (L, d)
+
+
+def geometry_guided_directions(data, L, C_factor=5, S=500,
+                                power_iter=1, local=True, seed=0):
+    """Select L geometry-aware unit vectors for projecting ``data``."""
+    data = np.ascontiguousarray(data, dtype=np.float32)
+    rng  = np.random.RandomState(seed)
+    n, d = data.shape
+    C    = C_factor * L
+
+    pairs = _bootstrap_nn_pairs(data, S, rng)
+
+    ii = rng.choice(n, C, replace=True)
+    jj = rng.choice(n, C, replace=True)
+    jj[ii == jj] = (jj[ii == jj] + 1) % n
+    diffs = (data[ii] - data[jj]).astype(np.float64)
+    norms = np.linalg.norm(diffs, axis=1)
+    valid = norms > 1e-8
+    diffs = diffs[valid] / norms[valid, None]
+    shortfall = C - len(diffs)
+    if shortfall > 0:
+        extra = rng.randn(shortfall, d)
+        extra /= np.linalg.norm(extra, axis=1, keepdims=True)
+        diffs = np.vstack([diffs, extra])
+
+    candidates = diffs[:C].astype(np.float32)
+    scores     = _score_directions(data, candidates, pairs, rng)
+    top_idx    = np.argsort(scores)[::-1][:L]
+    selected   = candidates[top_idx].copy()
+
+    if power_iter > 0:
+        if local:
+            selected = _local_power_iter(data, selected, pairs, steps=power_iter)
+        else:
+            selected = _global_power_iter(data, selected, steps=power_iter)
+
+    return selected
+
+
 def _blas_assign(data, centroids, data_sq=None):
     """Assign each row of data to nearest centroid using BLAS gemm.
 
@@ -140,7 +225,6 @@ class AMPIAffineFanIndex:
 
     def __init__(self, data, nlist=None, num_fans=16,
                  C_factor=5, S=500, power_iter=1, seed=0):
-        from .tomography import geometry_guided_directions
 
         self.data = np.ascontiguousarray(data, dtype=np.float32)
         self.n, self.d = self.data.shape

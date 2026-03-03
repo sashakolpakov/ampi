@@ -1,23 +1,8 @@
-from .binary      import AMPIBinaryIndex
-from .tomography  import (AMPITomographicIndex, AMPITwoStageIndex,
-                          geometry_guided_directions, estimate_nn_distance)
-from .hashing     import AMPIHashIndex
-from .subspace    import AMPISubspaceIndex
-from .fan         import AMPIPrincipalFanIndex
-from .affine_fan  import AMPIAffineFanIndex
-
-AMPIIndex = AMPITomographicIndex  # default alias
+from .binary     import AMPIBinaryIndex
+from .affine_fan import AMPIAffineFanIndex
 
 __version__ = "0.5.0"
 __all__ = [
     "AMPIBinaryIndex",
-    "AMPITomographicIndex",
-    "AMPITwoStageIndex",
-    "geometry_guided_directions",
-    "estimate_nn_distance",
-    "AMPIHashIndex",
-    "AMPISubspaceIndex",
-    "AMPIPrincipalFanIndex",
     "AMPIAffineFanIndex",
-    "AMPIIndex",
 ]

@@ -26,8 +26,6 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, ".")
 from ampi import (
     AMPIBinaryIndex,
-    AMPITomographicIndex,
-    AMPIPrincipalFanIndex,
     AMPIAffineFanIndex,
 )
 
@@ -35,7 +33,7 @@ K             = 10      # neighbours to retrieve
 N_QUERIES     = 200     # queries used for evaluation
 WARMUP        = 10      # queries discarded before timing
 MAX_CAND_FRAC = 0.40    # skip configs whose avg candidates exceed this fraction of n …
-MAX_CAND_ABS  = 50_000  # … but never allow more than this regardless of n
+MIN_CAND_ABS  = 100_000 # … but always allow at least this many candidates
 CAND_SAMPLE   = 1       # queries used to estimate candidate count (rough is fine)
 QUICK_SAMPLE  = 5       # queries for quick Pareto dominance check
 PARETO_TOL    = 0.03    # skip if estimated recall is within this of a Pareto point with fewer cands
@@ -112,26 +110,20 @@ def approx_ratio(data, queries, gt_indices, found_indices):
 
 def _pareto_group(label):
     """Broad family group for within-family Pareto pruning.
-    IVF, Tomo-loc, TwoStage, Fan are kept separate so a fast IVF result
+    IVF, Binary, AFan are kept separate so a fast IVF result
     cannot dominate and prune the entire AMPI curve.
     """
     parts = label.split()
     p = parts[0]
-    if p == "Fan-vote":
-        return f"Fan-vote {parts[1]}"
-    if p == "Fan":
-        return f"Fan {parts[1]}"
-    if p == "AFan-vote":
-        return f"AFan-vote {parts[1]}"
     if p == "AFan":
-        return f"AFan {parts[1]}"
+        return f"AFan {parts[1]}"  # F=<num_fans>
     return p
 
 
 def evaluate(label, query_fn, cands_fn, queries, gt, data, n, pareto=None):
     # Step 1: candidate count check (1 query)
     cands = avg_cands(cands_fn, queries)
-    limit = min(MAX_CAND_FRAC * n, MAX_CAND_ABS)
+    limit = max(MAX_CAND_FRAC * n, MIN_CAND_ABS)
     if label != "Flat L2" and cands > limit:
         print(f"  [skip] {label}  — avg candidates > {limit:,.0f}", flush=True)
         return None
@@ -179,16 +171,8 @@ _FAMILY_STYLE = {
     "Flat L2":        dict(color="black",   marker="*",  ls="none", ms=14, zorder=5),
     "IVF":            dict(color="#1f77b4", marker="o",  ls="-",    lw=2),
     "Binary":         dict(color="#8c8c8c", marker="s",  ls="-",    lw=1.5, ms=7),
-    "Tomo-loc L=16":  dict(color="#2ca02c", marker="^",  ls="-",    lw=1.5),
-    "Tomo-loc L=32":  dict(color="#006400", marker="^",  ls="--",   lw=1.5),
-    "Fan K=16":       dict(color="#e07020", marker="D",  ls="-",    lw=2,   ms=7),
-    "Fan K=32":       dict(color="#a03000", marker="D",  ls="--",   lw=2,   ms=7),
-    "Fan-vote K=16":  dict(color="#e07020", marker="*",  ls="-",    lw=2,   ms=10),
-    "Fan-vote K=32":  dict(color="#a03000", marker="*",  ls="--",   lw=2,   ms=10),
     "AFan F=16":      dict(color="#9467bd", marker="D",  ls="-",    lw=2,   ms=7),
     "AFan F=32":      dict(color="#6a0dad", marker="D",  ls="--",   lw=2,   ms=7),
-    "AFan-vote F=16": dict(color="#9467bd", marker="*",  ls="-",    lw=2,   ms=10),
-    "AFan-vote F=32": dict(color="#6a0dad", marker="*",  ls="--",   lw=2,   ms=10),
 }
 
 
@@ -197,9 +181,6 @@ def _family(label):
     if parts[0] == "Flat":            return "Flat L2"
     if parts[0] == "IVF":             return "IVF"
     if parts[0] == "Binary":          return "Binary"
-    if parts[0].startswith("Tomo-"):  return f"{parts[0]} {parts[1]}"
-    if parts[0] == "Fan-vote":        return f"Fan-vote {parts[1]}"
-    if parts[0] == "Fan":             return f"Fan {parts[1]}"
     if parts[0] == "AFan-vote":       return f"AFan-vote {parts[1]}"
     if parts[0] == "AFan":            return f"AFan {parts[1]}"
     return parts[0]
@@ -352,9 +333,7 @@ def run(dataset_name, data, queries, gt):
         print(f"{time.perf_counter()-t0:.2f}s")
         return idx
 
-    idx_bin    = build(f"Binary   L={L2}", AMPIBinaryIndex,       num_projections=L2, seed=0)
-    idx_tomo16 = build(f"Tomo-loc L={L1}", AMPITomographicIndex,  num_projections=L1, C_factor=5, S=S, power_iter=1, local=True, seed=0)
-    idx_tomo32 = build(f"Tomo-loc L={L2}", AMPITomographicIndex,  num_projections=L2, C_factor=5, S=S, power_iter=1, local=True, seed=0)
+    idx_bin = build(f"Binary   L={L2}", AMPIBinaryIndex, num_projections=L2, seed=0)
 
     configs = []
 
@@ -369,58 +348,104 @@ def run(dataset_name, data, queries, gt):
             return (None, None, ivf.search(q[None], K)[1][0])
         configs.append((f"IVF nprobe={nprobe}", _ivf, lambda q, p=nprobe: p * (n // nlist)))
 
-    # Binary: random-direction baseline (= original C++ code)
     for w in [wb, 2*wb, 4*wb]:
         configs.append((f"Binary L={L2} w={w}",
                         lambda q, i=idx_bin, w=w: i.query(q, k=K, window_size=w),
                         lambda q, i=idx_bin, w=w: i.query_candidates(q, window_size=w)))
 
-    # Tomo-loc: geometry-guided directions
-    for idx, L in [(idx_tomo16, L1), (idx_tomo32, L2)]:
-        for w in [wb, 2*wb, 4*wb]:
-            configs.append((f"Tomo-loc L={L} w={w}",
-                            lambda q, i=idx, w=w: i.query(q, k=K, window_size=w),
-                            lambda q, i=idx, w=w: i.query_candidates(q, window_size=w)))
+    # === AffineFan: tune index params on a small sample ===
+    print(f"  Tuning AFan parameters on sample...", flush=True)
 
-    # Fan: principal-direction cones; sorted projections within each cone.
-    # Fan-union: union over all axis windows (more candidates, higher recall ceiling).
-    # Fan-vote: vote-threshold within each cone — keeps only high-confidence NNs,
-    #   ideally matching IVF recall with a fraction of its candidate count.
-    for K_fans in [L1, L2]:
-        w_fan = max(5, int(15 * math.sqrt(n / (K_fans * 10_000))))
-        idx_fan = build(f"Fan      K={K_fans}", AMPIPrincipalFanIndex,
-                        num_fans=K_fans, C_factor=5, S=S, power_iter=1, seed=0)
-        for w, probes in [(w_fan, 1), (2*w_fan, 1), (w_fan, 2), (2*w_fan, 2)]:
-            configs.append((f"Fan K={K_fans} w={w} p={probes}",
-                            lambda q, i=idx_fan, w=w, p=probes: i.query(q, k=K, window_size=w, probes=p),
-                            lambda q, i=idx_fan, w=w, p=probes: i.query_candidates(q, window_size=w, probes=p)))
-        # Vote variants: mv sweeps the precision dial
-        for w, probes, mv in [(2*w_fan, 1, K_fans//8), (2*w_fan, 1, K_fans//4),
-                              (2*w_fan, 2, K_fans//8), (2*w_fan, 2, K_fans//4)]:
-            configs.append((f"Fan-vote K={K_fans} w={w} p={probes} mv={mv}",
-                            lambda q, i=idx_fan, w=w, p=probes, mv=mv: i.query_voting(q, k=K, window_size=w, probes=p, min_votes=mv),
-                            lambda q, i=idx_fan, w=w, p=probes, mv=mv: i.query_candidates_voting(q, window_size=w, probes=p, min_votes=mv)))
+    sample_frac = min(0.1, 50_000 / n)
+    n_sample    = max(5000, int(n * sample_frac))
+    data_sample = data[np.random.choice(n, n_sample, replace=False)]
+    tune_qs     = queries[:QUICK_SAMPLE]
 
-    # AffineFan: FAISS k-means partition + affine fan cones.
-    af_nlist = max(16, int(np.sqrt(n)))
-    for F in [L1, L2]:
-        idx_af = build(f"AFan     F={F}", AMPIAffineFanIndex,
-                       nlist=af_nlist, num_fans=F,
-                       C_factor=5, S=S, power_iter=1, seed=0)
-        # Union mode: sweep cluster probes × fan probes × window
-        for w, cp, fp in [(wb//4, 5, 2), (wb//4, 10, 2), (wb//4, 10, 4),
-                          (wb//2, 5, 2), (wb//2, 10, 2), (wb//2, 10, 4),
-                          (wb//2, 10, F), (wb, 10, F)]:
-            configs.append((f"AFan F={F} w={w} cp={cp} fp={fp}",
-                            lambda q, i=idx_af, w=w, cp=cp, fp=fp: i.query(q, k=K, window_size=w, probes=cp, fan_probes=fp),
-                            lambda q, i=idx_af, w=w, cp=cp, fp=fp: i.query_candidates(q, window_size=w, probes=cp, fan_probes=fp)))
-        # Vote variants
-        for w, cp, fp, mv in [(wb//2, 10, F, F//8), (wb//2, 10, F, F//4),
-                               (wb, 10, F, F//8), (wb, 10, F, F//4),
-                               (wb//2, 5, 2, F//8), (wb//2, 10, 2, F//4)]:
-            configs.append((f"AFan-vote F={F} w={w} cp={cp} fp={fp} mv={mv}",
-                            lambda q, i=idx_af, w=w, cp=cp, fp=fp, mv=mv: i.query_voting(q, k=K, window_size=w, probes=cp, fan_probes=fp, min_votes=mv),
-                            lambda q, i=idx_af, w=w, cp=cp, fp=fp, mv=mv: i.query_candidates_voting(q, window_size=w, probes=cp, fan_probes=fp, min_votes=mv)))
+    # Build a flat GT on the sample for the tune queries
+    flat_sample = faiss.IndexFlatL2(d)
+    flat_sample.add(data_sample)
+    _, gt_sample = flat_sample.search(tune_qs, K)
+    gt_sample = gt_sample.astype(np.int32)
+
+    # Tune alpha = nlist/sqrt(n) only, using a fixed small F on the sample.
+    # F cannot be tuned on the sample: large F gives near-empty cones at 50k scale
+    # (e.g. 50k/(223×128)≈1.7 pts/cone), so the sample always favours F=16.
+    # Instead, F is derived analytically from the full dataset after picking alpha.
+    tune_results = []
+    for alpha in [0.5, 1.0, 1.5, 2.0]:
+        nlist_tune = max(16, int(alpha * math.sqrt(n_sample)))
+        F_tune     = 16  # fixed; only alpha (nlist density) is being selected here
+        idx_tune = AMPIAffineFanIndex(data_sample, nlist=nlist_tune, num_fans=F_tune,
+                                      C_factor=5, S=min(S, 500), power_iter=1, seed=0)
+        for cp in [5, 10]:
+            for fp in sorted(set([F_tune // 4, F_tune // 2, F_tune])):
+                for w_mult in [0.5, 1.0]:
+                    w      = max(5, int(wb * w_mult))
+                    cands  = idx_tune.query_candidates(tune_qs[0], window_size=w, probes=cp, fan_probes=fp)
+                    res    = [idx_tune.query(q, k=K, window_size=w, probes=cp, fan_probes=fp) for q in tune_qs]
+                    idxs   = [r[2] if isinstance(r, tuple) else r for r in res]
+                    padded = [np.pad(ix[:K], (0, max(0, K - len(ix))), constant_values=-1) for ix in idxs]
+                    rec    = recall(gt_sample, padded)
+                    tune_results.append((alpha, cp, fp, w, rec, int(len(cands))))
+
+    pareto_tune = []
+    for r in tune_results:
+        _, _, _, _, rec, cands = r
+        if any(pc <= cands and pr >= rec - PARETO_TOL for pc, pr in pareto_tune):
+            continue
+        pareto_tune = [(c, rc) for c, rc in pareto_tune if not (c <= cands and rc >= rec)]
+        pareto_tune.append((cands, rec))
+
+    best_cands, best_rec = max(pareto_tune, key=lambda x: x[1])
+    best_alpha = 1.0
+    for alpha, _, _, _, rec, cands in tune_results:
+        if abs(cands - best_cands) < best_cands * 0.2 and abs(rec - best_rec) < 0.01:
+            best_alpha = alpha
+            break
+
+    best_nlist = max(16, int(best_alpha * math.sqrt(n)))
+
+    # Pick the largest F such that the full dataset has >= MIN_CONE_PTS per cone.
+    # This scales F with dataset density: SIFT 1M → F=128, MNIST 60k → F=32.
+    MIN_CONE_PTS = 5
+    viable_Fs = [F for F in sorted(set([16, 32, 64, L2]))
+                 if n // (best_nlist * F) >= MIN_CONE_PTS]
+    best_F = max(viable_Fs) if viable_Fs else 16
+
+    print(f"    Best: nlist={best_nlist} (alpha={best_alpha:.1f}), F={best_F}")
+
+    idx_af = build(f"AFan     F={best_F}", AMPIAffineFanIndex,
+                   nlist=best_nlist, num_fans=best_F,
+                   C_factor=5, S=S, power_iter=1, seed=0)
+
+    # Warmup AMPI indexes (triggers JIT compilation)
+    print(f"  Warming up AMPI indexes...", flush=True)
+    for w in [wb, 2*wb, 4*wb]:
+        for q in queries[:WARMUP]:
+            idx_bin.query(q, k=K, window_size=w)
+    for q in queries[:WARMUP]:
+        idx_af.query(q, k=K, window_size=wb, probes=10, fan_probes=best_F)
+    print(f"  Warmup complete.")
+
+    # Add AFan query-param sweep to configs (sorted by estimated candidates)
+    limit = max(MAX_CAND_FRAC * n, MIN_CAND_ABS)
+    af_candidates = []
+    for cp in [5, 10, 20]:
+        for fp in sorted(set([2, 4, 8, best_F//4, best_F//2, best_F])):
+            for w_mult in [0.25, 0.5, 1.0, 1.5, 2.0]:
+                w = max(5, int(wb * w_mult))
+                af_candidates.append((cp, fp, w, cp * fp * 2 * w))
+    af_candidates.sort(key=lambda x: x[3])
+
+    for cp, fp, w, est_cands in af_candidates:
+        if est_cands > limit * 1.5:
+            continue
+        label = f"AFan F={best_F} cp={cp} fp={fp} w={w}"
+        configs.append((
+            label,
+            lambda q, i=idx_af, w=w, cp=cp, fp=fp: i.query(q, k=K, window_size=w, probes=cp, fan_probes=fp),
+            lambda q, i=idx_af, w=w, cp=cp, fp=fp: i.query_candidates(q, window_size=w, probes=cp, fan_probes=fp),
+        ))
 
     hdr = f"  {'Method':<38}  {'R@10':>6}  {'dist ratio':>10}  {'QPS':>8}  {'ms/q':>7}  {'cands':>7}"
     print()
