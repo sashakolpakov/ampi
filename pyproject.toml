@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "numpy", "numba"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ampi"
 version = "0.3.0"
-description = "Adaptive Multi-Projection Index for Approximate Nearest Neighbor Search"
+description = "Adaptive Multi-Projection Index — approximate nearest-neighbour search via sorted projections, p-stable LSH, and subspace hashing"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
@@ -14,15 +14,16 @@ authors = [
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "numpy>=1.20.0",
     "numba>=0.55.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ampi*"]
