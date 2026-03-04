@@ -1,5 +1,5 @@
 """
-benchmark.py — AMPI vs FAISS: recall@10 / candidates across all index variants.
+benchmark.py — AMPI vs FAISS: recall@1 / recall@10 / recall@100 / candidates across all index variants.
 
 Datasets
   gauss   : 10 000 iid N(0,1) vectors, d=128  (synthetic)
@@ -28,14 +28,17 @@ from ampi import (
     AMPIBinaryIndex,
     AMPIAffineFanIndex,
 )
+from ampi.tuner import _GP1D
 
-K             = 10      # neighbours to retrieve
+K             = 10      # primary recall threshold (Pareto / tuning)
+K_MAX         = 100     # maximum neighbours to retrieve (enables recall@1/10/100)
 N_QUERIES     = 200     # queries used for evaluation
 WARMUP        = 10      # queries discarded before timing
 MAX_CAND_FRAC = 0.40    # skip configs whose avg candidates exceed this fraction of n …
 MIN_CAND_ABS  = 100_000 # … but always allow at least this many candidates
 CAND_SAMPLE   = 1       # queries used to estimate candidate count (rough is fine)
-QUICK_SAMPLE  = 5       # queries for quick Pareto dominance check
+QUICK_SAMPLE  = 10      # queries for quick Pareto dominance check (coarse, speed-critical)
+TUNE_SAMPLE   = 20      # queries used for alpha tuning (needs reliable recall signal)
 PARETO_TOL    = 0.03    # skip if estimated recall is within this of a Pareto point with fewer cands
 
 FIGURES_DIR = Path("figures")
@@ -49,7 +52,7 @@ def make_gaussian(n=10_000, d=128, seed=42):
     qs    = rng.standard_normal((N_QUERIES, d)).astype(np.float32)
     flat  = faiss.IndexFlatL2(d)
     flat.add(data)
-    _, gt = flat.search(qs, K)
+    _, gt = flat.search(qs, K_MAX)
     return data, qs, gt.astype(np.int32)
 
 
@@ -68,18 +71,19 @@ def load_hdf5(path, n_train=None, normalize=False):
         queries = queries / qnorms
     flat = faiss.IndexFlatL2(data.shape[1])
     flat.add(data)
-    _, nn = flat.search(queries, K)
+    _, nn = flat.search(queries, K_MAX)
     return data, queries, nn.astype(np.int32)
 
 
 # ── evaluation ────────────────────────────────────────────────────────────────
 
-def recall(gt, approx):
+def recall(gt, approx, k=K):
+    """Recall@k: fraction of true top-k neighbours found in returned top-k."""
     hits = sum(
-        len(set(g.tolist()) & set(a[:K].tolist()))
+        len(set(g[:k].tolist()) & set(a[:k].tolist()))
         for g, a in zip(gt, approx)
     )
-    return hits / (len(gt) * K)
+    return hits / (len(gt) * k)
 
 
 def time_ms(fn, queries):
@@ -116,7 +120,7 @@ def _pareto_group(label):
     parts = label.split()
     p = parts[0]
     if p == "AFan":
-        return f"AFan {parts[1]}"  # F=<num_fans>
+        return f"AFan {parts[1]} {parts[2]}"  # F=<num_fans> K=<top_k>
     return p
 
 
@@ -137,9 +141,15 @@ def evaluate(label, query_fn, cands_fn, queries, gt, data, n, pareto=None):
             quick_idx     = [r[2] if isinstance(r, tuple) else r for r in quick_results]
             quick_pad     = [np.pad(ix[:K], (0, max(0, K - len(ix))), constant_values=-1)
                              for ix in quick_idx]
-            est_rec = recall(gt[:QUICK_SAMPLE], quick_pad)
-            if any(p_cands <= cands and p_rec >= est_rec - PARETO_TOL
-                   for p_cands, p_rec in group_front):
+            est_rec      = recall(gt[:QUICK_SAMPLE], quick_pad, K)
+            max_front_rec = max(pr for _, pr in group_front)
+            # Never skip a config that may push recall beyond the current frontier
+            # maximum — that would extend the frontier upward, not just rightward.
+            # Only apply dominance pruning within the already-covered recall range.
+            if est_rec <= max_front_rec and any(
+                p_cands <= cands and p_rec >= est_rec - PARETO_TOL
+                for p_cands, p_rec in group_front
+            ):
                 print(f"  [skip-pareto] {label}  "
                       f"(est R@10={est_rec:.3f}, cands≈{cands:,})", flush=True)
                 return None
@@ -152,14 +162,18 @@ def evaluate(label, query_fn, cands_fn, queries, gt, data, n, pareto=None):
     ms      = (time.perf_counter() - t0) / len(queries) * 1e3
 
     indices = [r[2] if isinstance(r, tuple) else r for r in results]
-    padded  = [np.pad(ix[:K], (0, max(0, K - len(ix))), constant_values=-1)
+    padded  = [np.pad(ix[:K_MAX], (0, max(0, K_MAX - len(ix))), constant_values=-1)
                for ix in indices]
-    rec   = recall(gt, padded)
-    ratio = approx_ratio(data, queries, gt, padded)
-    r     = dict(label=label, recall=rec, ratio=ratio, ms=ms, qps=1e3 / ms, cands=cands)
+    rec1   = recall(gt, padded, 1)
+    rec10  = recall(gt, padded, K)
+    rec100 = recall(gt, padded, K_MAX)
+    ratio  = approx_ratio(data, queries, gt[:, :K], padded)
+    r = dict(label=label, recall=rec10, recall1=rec1, recall100=rec100,
+             ratio=ratio, ms=ms, qps=1e3 / ms, cands=cands)
 
     cands_str = f"{cands:>7,}" if cands < n else f"{'n':>7}"
-    print(f"  {label:<38}  {rec:>6.3f}  {ratio:>10.4f}  {1e3/ms:>8.1f}  {ms:>7.3f}  {cands_str}",
+    print(f"  {label:<38}  {rec1:>6.3f}  {rec10:>6.3f}  {rec100:>6.3f}"
+          f"  {ratio:>10.4f}  {1e3/ms:>8.1f}  {ms:>7.3f}  {cands_str}",
           flush=True)
     return r
 
@@ -168,21 +182,25 @@ def evaluate(label, query_fn, cands_fn, queries, gt, data, n, pareto=None):
 
 # Map label prefix → (color, marker, linestyle)
 _FAMILY_STYLE = {
-    "Flat L2":        dict(color="black",   marker="*",  ls="none", ms=14, zorder=5),
-    "IVF":            dict(color="#1f77b4", marker="o",  ls="-",    lw=2),
-    "Binary":         dict(color="#8c8c8c", marker="s",  ls="-",    lw=1.5, ms=7),
-    "AFan F=16":      dict(color="#9467bd", marker="D",  ls="-",    lw=2,   ms=7),
-    "AFan F=32":      dict(color="#6a0dad", marker="D",  ls="--",   lw=2,   ms=7),
+    "Flat L2":   dict(color="black",   marker="*",  ls="none", ms=14, zorder=5),
+    "IVF":       dict(color="#1f77b4", marker="o",  ls="-",    lw=2),
+    "Binary":    dict(color="#8c8c8c", marker="s",  ls="-",    lw=1.5, ms=7),
+    "AFan K=1":  dict(color="#9467bd", marker="D",  ls="-",    lw=2,   ms=7),
+    "AFan K=2":  dict(color="#e377c2", marker="D",  ls="--",   lw=2,   ms=7),
+    "AFan K=3":  dict(color="#6a0dad", marker="D",  ls=":",    lw=2,   ms=7),
 }
 
 
 def _family(label):
     parts = label.split()
-    if parts[0] == "Flat":            return "Flat L2"
-    if parts[0] == "IVF":             return "IVF"
-    if parts[0] == "Binary":          return "Binary"
-    if parts[0] == "AFan-vote":       return f"AFan-vote {parts[1]}"
-    if parts[0] == "AFan":            return f"AFan {parts[1]}"
+    if parts[0] == "Flat":   return "Flat L2"
+    if parts[0] == "IVF":    return "IVF"
+    if parts[0] == "Binary": return "Binary"
+    if parts[0] == "AFan":
+        # Label format: "AFan F=<F> K=<K> cp=... fp=... w=..."
+        # Group by K so each cone_top_k gets its own colour/style.
+        k_part = next((p for p in parts if p.startswith("K=")), "K=1")
+        return f"AFan {k_part}"
     return parts[0]
 
 
@@ -211,66 +229,73 @@ def save_figures(all_results):
         for pts in families.values():
             pts.sort(key=lambda x: x["cands"])
 
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        ax_r1, ax_r10, ax_r100 = axes[0]
+        ax_qps, ax_ratio, ax_hide = axes[1]
+        ax_hide.set_visible(False)
         fig.suptitle(dataset_name, fontsize=13, fontweight="bold")
 
         legend_handles = []
         for fam, pts in sorted(families.items()):
             style = _FAMILY_STYLE.get(fam, dict(color="gray", marker="x", ls="-", lw=1))
-            cands = [p["cands"]  for p in pts]
-            rec   = [p["recall"] for p in pts]
-            ratio = [p["ratio"]  for p in pts]
-            qps   = [p["qps"]    for p in pts]
+            cands  = [p["cands"]    for p in pts]
+            rec1   = [p["recall1"]  for p in pts]
+            rec10  = [p["recall"]   for p in pts]
+            rec100 = [p["recall100"]for p in pts]
+            ratio  = [p["ratio"]    for p in pts]
+            qps    = [p["qps"]      for p in pts]
             kw = {k: v for k, v in style.items() if k != "zorder"}
             zo = style.get("zorder", 2)
 
-            line, = ax1.plot(cands, rec, zorder=zo, **kw)
-            ax2.plot(cands, qps, zorder=zo, **kw)
-            ax3.plot(rec, ratio, zorder=zo, **kw)
+            line, = ax_r1.plot(cands, rec1, zorder=zo, **kw)
+            ax_r10.plot(cands, rec10, zorder=zo, **kw)
+            ax_r100.plot(cands, rec100, zorder=zo, **kw)
+            ax_qps.plot(cands, qps, zorder=zo, **kw)
+            ax_ratio.plot(rec10, ratio, zorder=zo, **kw)
             legend_handles.append((line, fam))
 
-            # highlight Pareto-optimal configs on panel 1
-            fi = _pareto_frontier(cands, rec)
+            # Pareto highlight on recall@10 panel
+            fi = _pareto_frontier(cands, rec10)
             if len(fi) > 1:
                 px = [cands[i] for i in fi]
-                py = [rec[i]   for i in fi]
-                ax1.plot(px, py, color=style.get("color", "gray"),
-                         lw=2.5, ls="-", alpha=0.35, zorder=zo - 1)
+                py = [rec10[i] for i in fi]
+                ax_r10.plot(px, py, color=style.get("color", "gray"),
+                            lw=2.5, ls="-", alpha=0.35, zorder=zo - 1)
 
-        # ── panel 1: Recall vs Candidates (algorithm quality, impl-agnostic) ──
-        ax1.set_xscale("log")
-        ax1.set_xlabel("Candidates examined (log scale)")
-        ax1.set_ylabel("Recall@10")
-        ax1.set_ylim(-0.02, 1.05)
-        ax1.grid(True, alpha=0.3)
-        ax1.set_title("Recall@10 vs Candidates  (↖ better)")
-        ax1.annotate("↖ better", xy=(0.04, 0.92), xycoords="axes fraction",
-                     fontsize=9, color="gray")
+        for ax, ylabel, title in [
+            (ax_r1,   "Recall@1",   "Recall@1 vs Candidates"),
+            (ax_r10,  "Recall@10",  "Recall@10 vs Candidates  (↖ better)"),
+            (ax_r100, "Recall@100", "Recall@100 vs Candidates"),
+        ]:
+            ax.set_xscale("log")
+            ax.set_xlabel("Candidates examined (log scale)")
+            ax.set_ylabel(ylabel)
+            ax.set_ylim(-0.02, 1.05)
+            ax.grid(True, alpha=0.3)
+            ax.set_title(title)
 
-        # ── panel 2: QPS vs Candidates (implementation gap) ──────────────────
-        ax2.set_xscale("log")
-        ax2.set_yscale("log")
-        ax2.set_xlabel("Candidates examined (log scale)")
-        ax2.set_ylabel("QPS (log scale)")
-        ax2.grid(True, alpha=0.3)
-        ax2.set_title("QPS vs Candidates  (vertical gap = C++ speedup)")
+        ax_qps.set_xscale("log")
+        ax_qps.set_yscale("log")
+        ax_qps.set_xlabel("Candidates examined (log scale)")
+        ax_qps.set_ylabel("QPS (log scale)")
+        ax_qps.grid(True, alpha=0.3)
+        ax_qps.set_title("QPS vs Candidates  (vertical gap = C++ speedup)")
 
-        # ── panel 3: Dist ratio vs Recall ─────────────────────────────────────
-        ax3.set_xlabel("Recall@10")
-        ax3.set_ylabel("Dist ratio  (1.0 = perfect)")
-        ax3.set_xlim(-0.02, 1.05)
-        ax3.axhline(1.0, color="black", lw=0.8, ls=":")
-        ax3.grid(True, alpha=0.3)
-        ax3.set_title("Dist ratio vs Recall@10")
+        ax_ratio.set_xlabel("Recall@10")
+        ax_ratio.set_ylabel("Dist ratio  (1.0 = perfect)")
+        ax_ratio.set_xlim(-0.02, 1.05)
+        ax_ratio.axhline(1.0, color="black", lw=0.8, ls=":")
+        ax_ratio.grid(True, alpha=0.3)
+        ax_ratio.set_title("Dist ratio vs Recall@10")
 
         # shared legend below all panels
         hs = [h for h, _ in legend_handles]
         ls = [l for _, l in legend_handles]
         n_col = min(len(ls), 7)
         fig.legend(hs, ls, loc="lower center", ncol=n_col, fontsize=8,
-                   bbox_to_anchor=(0.5, -0.08), framealpha=0.9)
+                   bbox_to_anchor=(0.5, -0.04), framealpha=0.9)
 
-        fig.tight_layout(rect=[0, 0.08, 1, 1])
+        fig.tight_layout(rect=[0, 0.06, 1, 1])
         slug = dataset_name.split()[0].lower()
         out  = FIGURES_DIR / f"{slug}.png"
         fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -338,19 +363,19 @@ def run(dataset_name, data, queries, gt):
     configs = []
 
     configs.append(("Flat L2",
-                    lambda q: (None, None, flat.search(q[None], K)[1][0]),
+                    lambda q: (None, None, flat.search(q[None], K_MAX)[1][0]),
                     lambda q: n))
 
     for nprobe in [1, 5, 10, 25, 50]:
         if nprobe > nlist: continue
         def _ivf(q, p=nprobe):
             ivf.nprobe = p
-            return (None, None, ivf.search(q[None], K)[1][0])
+            return (None, None, ivf.search(q[None], K_MAX)[1][0])
         configs.append((f"IVF nprobe={nprobe}", _ivf, lambda q, p=nprobe: p * (n // nlist)))
 
     for w in [wb, 2*wb, 4*wb]:
         configs.append((f"Binary L={L2} w={w}",
-                        lambda q, i=idx_bin, w=w: i.query(q, k=K, window_size=w),
+                        lambda q, i=idx_bin, w=w: i.query(q, k=K_MAX, window_size=w),
                         lambda q, i=idx_bin, w=w: i.query_candidates(q, window_size=w)))
 
     # === AffineFan: tune index params on a small sample ===
@@ -359,7 +384,7 @@ def run(dataset_name, data, queries, gt):
     sample_frac = min(0.1, 50_000 / n)
     n_sample    = max(5000, int(n * sample_frac))
     data_sample = data[np.random.choice(n, n_sample, replace=False)]
-    tune_qs     = queries[:QUICK_SAMPLE]
+    tune_qs     = queries[:TUNE_SAMPLE]
 
     # Build a flat GT on the sample for the tune queries
     flat_sample = faiss.IndexFlatL2(d)
@@ -367,41 +392,44 @@ def run(dataset_name, data, queries, gt):
     _, gt_sample = flat_sample.search(tune_qs, K)
     gt_sample = gt_sample.astype(np.int32)
 
-    # Tune alpha = nlist/sqrt(n) only, using a fixed small F on the sample.
-    # F cannot be tuned on the sample: large F gives near-empty cones at 50k scale
-    # (e.g. 50k/(223×128)≈1.7 pts/cone), so the sample always favours F=16.
-    # Instead, F is derived analytically from the full dataset after picking alpha.
-    tune_results = []
-    for alpha in [0.5, 1.0, 1.5, 2.0]:
-        nlist_tune = max(16, int(alpha * math.sqrt(n_sample)))
-        F_tune     = 16  # fixed; only alpha (nlist density) is being selected here
-        idx_tune = AMPIAffineFanIndex(data_sample, nlist=nlist_tune, num_fans=F_tune,
-                                      C_factor=5, S=min(S, 500), power_iter=1, seed=0)
-        for cp in [5, 10]:
-            for fp in sorted(set([F_tune // 4, F_tune // 2, F_tune])):
-                for w_mult in [0.5, 1.0]:
-                    w      = max(5, int(wb * w_mult))
-                    cands  = idx_tune.query_candidates(tune_qs[0], window_size=w, probes=cp, fan_probes=fp)
-                    res    = [idx_tune.query(q, k=K, window_size=w, probes=cp, fan_probes=fp) for q in tune_qs]
-                    idxs   = [r[2] if isinstance(r, tuple) else r for r in res]
-                    padded = [np.pad(ix[:K], (0, max(0, K - len(ix))), constant_values=-1) for ix in idxs]
-                    rec    = recall(gt_sample, padded)
-                    tune_results.append((alpha, cp, fp, w, rec, int(len(cands))))
+    # Tune alpha = nlist/sqrt(n) via GP-BO on the sample.
+    # F is fixed at 16 for sample builds (large F → empty cones at 50k scale).
+    # F is derived analytically from the full dataset after alpha is chosen.
+    # Objective: average recall across 3 operating points (low/mid/high cands).
+    wb_s = max(5, int(wb * math.sqrt(n_sample / n)))
 
-    pareto_tune = []
-    for r in tune_results:
-        _, _, _, _, rec, cands = r
-        if any(pc <= cands and pr >= rec - PARETO_TOL for pc, pr in pareto_tune):
-            continue
-        pareto_tune = [(c, rc) for c, rc in pareto_tune if not (c <= cands and rc >= rec)]
-        pareto_tune.append((cands, rec))
+    def _alpha_score(alpha):
+        nlist_s = max(16, int(alpha * math.sqrt(n_sample)))
+        idx_s   = AMPIAffineFanIndex(data_sample, nlist=nlist_s, num_fans=16,
+                                     C_factor=5, S=min(S, 500), power_iter=1, seed=0)
+        scores  = []
+        for cp, fp, w in [(3, 4, max(5, wb_s // 2)), (5, 8, wb_s), (10, 16, wb_s)]:
+            res    = [idx_s.query(q, k=K, window_size=w, probes=cp, fan_probes=fp)
+                      for q in tune_qs]
+            idxs   = [r[2] if isinstance(r, tuple) else r for r in res]
+            padded = [np.pad(ix[:K], (0, max(0, K - len(ix))), constant_values=-1)
+                      for ix in idxs]
+            scores.append(recall(gt_sample, padded, K))
+        return float(np.mean(scores))
 
-    best_cands, best_rec = max(pareto_tune, key=lambda x: x[1])
-    best_alpha = 1.0
-    for alpha, _, _, _, rec, cands in tune_results:
-        if abs(cands - best_cands) < best_cands * 0.2 and abs(rec - best_rec) < 0.01:
-            best_alpha = alpha
-            break
+    ALPHA_LO, ALPHA_HI = 0.1, 2.0
+    N_BO_ITER = 8
+    x_obs = [ALPHA_LO, (ALPHA_LO + ALPHA_HI) / 2, ALPHA_HI]
+    y_obs = [_alpha_score(a) for a in x_obs]
+
+    gp     = _GP1D()
+    x_cand = np.linspace(ALPHA_LO, ALPHA_HI, 200)
+    rng_bo = np.random.default_rng(0)
+    for _ in range(N_BO_ITER - 3):
+        gp.fit(x_obs, y_obs)
+        ei     = gp.EI(x_cand)
+        next_a = float(x_cand[np.argmax(ei)])
+        if any(abs(next_a - a) < (ALPHA_HI - ALPHA_LO) / 40 for a in x_obs):
+            next_a = float(rng_bo.uniform(ALPHA_LO, ALPHA_HI))
+        y_obs.append(_alpha_score(next_a))
+        x_obs.append(next_a)
+
+    best_alpha = x_obs[int(np.argmax(y_obs))]
 
     best_nlist = max(16, int(best_alpha * math.sqrt(n)))
 
@@ -412,42 +440,52 @@ def run(dataset_name, data, queries, gt):
                  if n // (best_nlist * F) >= MIN_CONE_PTS]
     best_F = max(viable_Fs) if viable_Fs else 16
 
-    print(f"    Best: nlist={best_nlist} (alpha={best_alpha:.1f}), F={best_F}")
+    print(f"    Best: nlist={best_nlist} (alpha={best_alpha:.3f}), F={best_F}")
 
-    idx_af = build(f"AFan     F={best_F}", AMPIAffineFanIndex,
-                   nlist=best_nlist, num_fans=best_F,
-                   C_factor=5, S=S, power_iter=1, seed=0)
+    # Build one AFan index per cone_top_k value.
+    # K=1: original hard assignment.  K=2: each point in top-2 cones (2x memory, bounded).
+    cone_top_ks = [1, 2]
+    af_indexes  = {}
+    for ktk in cone_top_ks:
+        tag = f"AFan F={best_F} K={ktk}"
+        idx = build(tag, AMPIAffineFanIndex,
+                    nlist=best_nlist, num_fans=best_F,
+                    C_factor=5, S=S, power_iter=1, seed=0,
+                    cone_top_k=ktk)
+        af_indexes[ktk] = idx
 
     # Warmup AMPI indexes (triggers JIT compilation)
     print(f"  Warming up AMPI indexes...", flush=True)
     for w in [wb, 2*wb, 4*wb]:
         for q in queries[:WARMUP]:
             idx_bin.query(q, k=K, window_size=w)
-    for q in queries[:WARMUP]:
-        idx_af.query(q, k=K, window_size=wb, probes=10, fan_probes=best_F)
+    for ktk, idx_af in af_indexes.items():
+        for q in queries[:WARMUP]:
+            idx_af.query(q, k=K, window_size=wb, probes=10, fan_probes=best_F)
     print(f"  Warmup complete.")
 
-    # Add AFan query-param sweep to configs (sorted by estimated candidates)
+    # Add AFan query-param sweep for each cone_top_k value
     limit = max(MAX_CAND_FRAC * n, MIN_CAND_ABS)
     af_candidates = []
-    for cp in [5, 10, 20]:
+    for cp in [5, 10, 20, 50]:
         for fp in sorted(set([2, 4, 8, best_F//4, best_F//2, best_F])):
             for w_mult in [0.25, 0.5, 1.0, 1.5, 2.0]:
                 w = max(5, int(wb * w_mult))
                 af_candidates.append((cp, fp, w, cp * fp * 2 * w))
     af_candidates.sort(key=lambda x: x[3])
 
-    for cp, fp, w, est_cands in af_candidates:
-        if est_cands > limit * 1.5:
-            continue
-        label = f"AFan F={best_F} cp={cp} fp={fp} w={w}"
-        configs.append((
-            label,
-            lambda q, i=idx_af, w=w, cp=cp, fp=fp: i.query(q, k=K, window_size=w, probes=cp, fan_probes=fp),
-            lambda q, i=idx_af, w=w, cp=cp, fp=fp: i.query_candidates(q, window_size=w, probes=cp, fan_probes=fp),
-        ))
+    for ktk, idx_af in af_indexes.items():
+        for cp, fp, w, est_cands in af_candidates:
+            if est_cands > limit * 1.5:
+                continue
+            label = f"AFan F={best_F} K={ktk} cp={cp} fp={fp} w={w}"
+            configs.append((
+                label,
+                lambda q, i=idx_af, w=w, cp=cp, fp=fp: i.query(q, k=K_MAX, window_size=w, probes=cp, fan_probes=fp),
+                lambda q, i=idx_af, w=w, cp=cp, fp=fp: i.query_candidates(q, window_size=w, probes=cp, fan_probes=fp),
+            ))
 
-    hdr = f"  {'Method':<38}  {'R@10':>6}  {'dist ratio':>10}  {'QPS':>8}  {'ms/q':>7}  {'cands':>7}"
+    hdr = f"  {'Method':<38}  {'R@1':>6}  {'R@10':>6}  {'R@100':>6}  {'dist ratio':>10}  {'QPS':>8}  {'ms/q':>7}  {'cands':>7}"
     print()
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))

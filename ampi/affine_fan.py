@@ -224,12 +224,14 @@ class AMPIAffineFanIndex:
     """
 
     def __init__(self, data, nlist=None, num_fans=16,
-                 C_factor=5, S=500, power_iter=1, seed=0):
+                 C_factor=5, S=500, power_iter=1, seed=0,
+                 cone_top_k=1):
 
         self.data = np.ascontiguousarray(data, dtype=np.float32)
         self.n, self.d = self.data.shape
         self.F = num_fans
         self.L = num_fans
+        self.cone_top_k = max(1, int(cone_top_k))
 
         if nlist is None:
             nlist = max(16, int(np.sqrt(self.n)))
@@ -265,15 +267,22 @@ class AMPIAffineFanIndex:
             # Project centred data onto global axes
             all_projs = (centered @ self.axes.T).astype(np.float32)
 
-            # Affine cone assignment
+            # Affine cone assignment with top-K multi-assignment.
+            # Each point is assigned to its top cone_top_k cones by |normalised
+            # projection|.  cone_top_k=1 recovers the original hard argmax.
+            # K=2,3 doubles/triples build memory but gives bounded overhead,
+            # unlike a score-threshold approach which explodes in high dimensions.
             norms = np.linalg.norm(centered, axis=1, keepdims=True).astype(np.float32)
             norms = np.where(norms < 1e-10, 1.0, norms)
-            normed = all_projs / norms
-            cone_assign = np.argmax(np.abs(normed), axis=1)
+            normed   = np.abs(all_projs / norms)                        # (n_c, F)
+            K        = min(self.cone_top_k, self.F)
+            top_cones = np.argpartition(-normed, K - 1, axis=1)[:, :K]  # (n_c, K)
+            soft_mask = np.zeros((normed.shape[0], self.F), dtype=bool)
+            soft_mask[np.arange(normed.shape[0])[:, None], top_cones] = True
 
             cones = []
             for f in range(self.F):
-                f_local_idx = np.where(cone_assign == f)[0]
+                f_local_idx = np.where(soft_mask[:, f])[0]
                 n_f = len(f_local_idx)
                 if n_f == 0:
                     cones.append(None)
