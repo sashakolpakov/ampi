@@ -34,11 +34,11 @@ K             = 10      # primary recall threshold (Pareto / tuning)
 K_MAX         = 100     # maximum neighbours to retrieve (enables recall@1/10/100)
 N_QUERIES     = 200     # queries used for evaluation
 WARMUP        = 10      # queries discarded before timing
-MAX_CAND_FRAC = 0.40    # skip configs whose avg candidates exceed this fraction of n …
-MIN_CAND_ABS  = 100_000 # … but always allow at least this many candidates
+MAX_CAND_FRAC        = 0.25   # skip configs whose avg candidates exceed this fraction of n
+MAX_CAND_FRAC_BINARY = 1.00   # Binary needs wider windows; allow up to 4× the normal limit
 CAND_SAMPLE   = 1       # queries used to estimate candidate count (rough is fine)
 QUICK_SAMPLE  = 10      # queries for quick Pareto dominance check (coarse, speed-critical)
-TUNE_SAMPLE   = 20      # queries used for alpha tuning (needs reliable recall signal)
+TUNE_SAMPLE   = 50      # queries used for alpha tuning (needs reliable recall signal)
 PARETO_TOL    = 0.03    # skip if estimated recall is within this of a Pareto point with fewer cands
 
 FIGURES_DIR = Path("figures")
@@ -127,7 +127,8 @@ def _pareto_group(label):
 def evaluate(label, query_fn, cands_fn, queries, gt, data, n, pareto=None):
     # Step 1: candidate count check (1 query)
     cands = avg_cands(cands_fn, queries)
-    limit = max(MAX_CAND_FRAC * n, MIN_CAND_ABS)
+    is_binary = label.startswith("Binary")
+    limit = (MAX_CAND_FRAC_BINARY if is_binary else MAX_CAND_FRAC) * n
     if label != "Flat L2" and cands > limit:
         print(f"  [skip] {label}  — avg candidates > {limit:,.0f}", flush=True)
         return None
@@ -182,12 +183,12 @@ def evaluate(label, query_fn, cands_fn, queries, gt, data, n, pareto=None):
 
 # Map label prefix → (color, marker, linestyle)
 _FAMILY_STYLE = {
-    "Flat L2":   dict(color="black",   marker="*",  ls="none", ms=14, zorder=5),
-    "IVF":       dict(color="#1f77b4", marker="o",  ls="-",    lw=2),
-    "Binary":    dict(color="#8c8c8c", marker="s",  ls="-",    lw=1.5, ms=7),
-    "AFan K=1":  dict(color="#9467bd", marker="D",  ls="-",    lw=2,   ms=7),
-    "AFan K=2":  dict(color="#e377c2", marker="D",  ls="--",   lw=2,   ms=7),
-    "AFan K=3":  dict(color="#6a0dad", marker="D",  ls=":",    lw=2,   ms=7),
+    "Flat L2":      dict(color="black",   marker="*",  ls="none", ms=14, zorder=5),
+    "IVF":          dict(color="#1f77b4", marker="o",  ls="-",    lw=2),
+    "Binary":       dict(color="#8c8c8c", marker="s",  ls="-",    lw=1.5, ms=7),
+    "AFan K=1":     dict(color="#9467bd", marker="D",  ls="-",    lw=2,   ms=7),
+    "AFan K=2":     dict(color="#e377c2", marker="D",  ls="--",   lw=2,   ms=7),
+    "AFan K=3":     dict(color="#6a0dad", marker="D",  ls=":",    lw=2,   ms=7),
 }
 
 
@@ -197,8 +198,6 @@ def _family(label):
     if parts[0] == "IVF":    return "IVF"
     if parts[0] == "Binary": return "Binary"
     if parts[0] == "AFan":
-        # Label format: "AFan F=<F> K=<K> cp=... fp=... w=..."
-        # Group by K so each cone_top_k gets its own colour/style.
         k_part = next((p for p in parts if p.startswith("K=")), "K=1")
         return f"AFan {k_part}"
     return parts[0]
@@ -378,8 +377,7 @@ def run(dataset_name, data, queries, gt):
     # === AffineFan: tune index params on a small sample ===
     print(f"  Tuning AFan parameters on sample...", flush=True)
 
-    sample_frac = min(0.1, 50_000 / n)
-    n_sample    = max(5000, int(n * sample_frac))
+    n_sample    = max(10_000, min(50_000, int(n * 0.3)))
     data_sample = data[np.random.choice(n, n_sample, replace=False)]
     tune_qs     = queries[:TUNE_SAMPLE]
 
@@ -408,8 +406,8 @@ def run(dataset_name, data, queries, gt):
             scores.append(recall(gt_sample, padded, K))
         return float(np.mean(scores))
 
-    ALPHA_LO, ALPHA_HI = 0.1, 2.0
-    N_BO_ITER = 8
+    ALPHA_LO, ALPHA_HI = 0.10, 2.0
+    N_BO_ITER = 12
     x_obs = [ALPHA_LO, (ALPHA_LO + ALPHA_HI) / 2, ALPHA_HI]
     y_obs = [_alpha_score(a) for a in x_obs]
 
@@ -432,7 +430,7 @@ def run(dataset_name, data, queries, gt):
     # Pick the largest F such that the full dataset has >= MIN_CONE_PTS per cone.
     # This scales F with dataset density: SIFT 1M → F=128, MNIST 60k → F=32.
     MIN_CONE_PTS = 5
-    viable_Fs = [F for F in sorted(set([16, 32, 64, L2]))
+    viable_Fs = [F for F in sorted(set([16, 32, 64, L1]))
                  if n // (best_nlist * F) >= MIN_CONE_PTS]
     best_F = max(viable_Fs) if viable_Fs else 16
 
@@ -460,7 +458,7 @@ def run(dataset_name, data, queries, gt):
     print(f"  Warmup complete.")
 
     # Add AFan query-param sweep for each cone_top_k value
-    limit = max(MAX_CAND_FRAC * n, MIN_CAND_ABS)
+    limit = MAX_CAND_FRAC * n
     af_candidates = []
     for cp in [5, 10, 20, 50]:
         for fp in sorted(set([2, 4, 8, best_F//4, best_F//2, best_F])):

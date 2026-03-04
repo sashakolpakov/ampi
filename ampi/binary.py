@@ -23,7 +23,7 @@ Key property: adaptive density
 """
 
 import numpy as np
-from ._kernels import project_data, l2_distances, jit_union_query, jit_vote_query
+from ._kernels import project_data, l2_distances, jit_union_query
 
 
 class AMPIBinaryIndex:
@@ -74,33 +74,6 @@ class AMPIBinaryIndex:
         q = np.ascontiguousarray(q, dtype=np.float32)
         q_projs = np.ascontiguousarray(q @ self.proj_dirs.T, dtype=np.float32)
         return jit_union_query(self.sorted_idxs, self.sorted_projs, q_projs, window_size)
-
-    def query_candidates_voting(self, q, window_size=100, min_votes=None, min_return=0):
-        """Voting-based candidates: keep points appearing in ≥min_votes projections.
-
-        Falls back to union if fewer than min_return candidates survive the filter.
-        Pass min_return=k to match the behaviour of query_voting.
-        """
-        q = np.ascontiguousarray(q, dtype=np.float32)
-        if min_votes is None:
-            min_votes = max(1, self.L // 4)
-        q_projs = np.ascontiguousarray(q @ self.proj_dirs.T, dtype=np.float32)
-        cands   = jit_vote_query(
-            self.sorted_idxs, self.sorted_projs, q_projs, window_size, min_votes
-        )
-        if len(cands) < min_return:
-            cands = jit_union_query(
-                self.sorted_idxs, self.sorted_projs, q_projs, window_size
-            )
-        return cands
-
-    def query_voting(self, q, k=10, window_size=100, min_votes=None):
-        """Voting-mode query: far fewer candidates, same or better recall."""
-        q     = np.ascontiguousarray(q, dtype=np.float32)
-        cands = self.query_candidates_voting(q, window_size, min_votes, min_return=k)
-        dists = l2_distances(self.data, q, cands)
-        top   = np.argsort(dists)[:k]
-        return self.data[cands[top]], dists[top], cands[top]
 
     def query(self, q, k=10, window_size=100):
         """Return the k approximate nearest neighbours of q.

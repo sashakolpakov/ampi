@@ -15,7 +15,7 @@ Random axes work as well as geometry-guided ones at F=128 in d=128
 """
 
 import numpy as np
-from ._kernels import jit_union_query, jit_vote_query, l2_distances
+from ._kernels import jit_union_query, l2_distances
 
 
 def _blas_assign(data, centroids, data_sq=None):
@@ -270,57 +270,6 @@ class AMPIAffineFanIndex:
             return np.zeros(0, dtype=np.int32)
         return np.unique(np.concatenate(parts))
 
-    def query_candidates_voting(self, q, window_size=50, probes=10,
-                                fan_probes=2, min_votes=None):
-        q = np.ascontiguousarray(q, dtype=np.float32)
-        if min_votes is None:
-            min_votes = max(1, self.L // 4)
-        clusters = self._best_clusters(q, probes)
-
-        parts = []
-        for c in clusters:
-            c = int(c)
-            cones = self.cluster_cones[c]
-            gi = self.cluster_global[c]
-            if cones is None or len(gi) == 0:
-                if len(gi) > 0:
-                    parts.append(gi)
-                continue
-
-            if fan_probes >= self.F:
-                parts.append(gi)
-                continue
-
-            centroid = self.centroids[c]
-            q_centered = q - centroid
-            q_proj = np.ascontiguousarray((q_centered @ self.axes.T).astype(np.float32))
-
-            best_cones = self._best_fan_cones(q_centered, fan_probes)
-            for f in best_cones:
-                f = int(f)
-                if f >= len(cones) or cones[f] is None:
-                    continue
-                cone = cones[f]
-                if cone['n'] <= 2 * window_size:
-                    parts.append(cone['global_idx'])
-                else:
-                    local = jit_vote_query(
-                        cone['sorted_idxs'],
-                        cone['sorted_projs'],
-                        q_proj, window_size, min_votes,
-                    )
-                    if len(local) == 0:
-                        local = jit_union_query(
-                            cone['sorted_idxs'],
-                            cone['sorted_projs'],
-                            q_proj, window_size,
-                        )
-                    parts.append(cone['global_idx'][local])
-
-        if not parts:
-            return np.zeros(0, dtype=np.int32)
-        return np.unique(np.concatenate(parts))
-
     def query(self, q, k=10, window_size=50, probes=10, fan_probes=2):
         q     = np.ascontiguousarray(q, dtype=np.float32)
         cands = self.query_candidates(q, window_size, probes, fan_probes)
@@ -330,13 +279,3 @@ class AMPIAffineFanIndex:
         top   = np.argsort(dists)[:k]
         return self.data[cands[top]], dists[top], cands[top]
 
-    def query_voting(self, q, k=10, window_size=50, probes=10,
-                     fan_probes=2, min_votes=None):
-        q     = np.ascontiguousarray(q, dtype=np.float32)
-        cands = self.query_candidates_voting(q, window_size, probes,
-                                             fan_probes, min_votes)
-        if len(cands) < k:
-            cands = np.arange(min(k, self.n), dtype=np.int32)
-        dists = l2_distances(self.data, q, cands)
-        top   = np.argsort(dists)[:k]
-        return self.data[cands[top]], dists[top], cands[top]

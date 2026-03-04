@@ -15,7 +15,6 @@ try:
         project_data,
         l2_distances,
         union_query      as jit_union_query,
-        vote_query       as jit_vote_query,
     )
     _BACKEND = "cpp"
 
@@ -108,25 +107,3 @@ except ImportError:
                 c += 1
         return result
 
-    @jit(nopython=True, cache=True)
-    def jit_vote_query(sorted_idxs, sorted_projs, q_projs, window_size, min_votes):
-        """Voting-mode candidate selection."""
-        L, n = sorted_idxs.shape
-        votes = np.zeros(n, dtype=np.int32)
-        for i in range(L):
-            pos = np.searchsorted(sorted_projs[i], q_projs[i])
-            lo  = max(np.int64(0), pos - window_size)
-            hi  = min(np.int64(n), pos + window_size)
-            for j in range(lo, hi):
-                votes[sorted_idxs[i, j]] += 1
-        count = np.int64(0)
-        for k in range(n):
-            if votes[k] >= min_votes:
-                count += 1
-        result = np.empty(count, dtype=np.int32)
-        c = np.int64(0)
-        for k in range(n):
-            if votes[k] >= min_votes:
-                result[c] = k
-                c += 1
-        return result

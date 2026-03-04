@@ -132,45 +132,6 @@ py::array_t<int32_t> union_query(
     return out;
 }
 
-// ── vote_query ────────────────────────────────────────────────────────────────
-
-py::array_t<int32_t> vote_query(
-    py::array_t<int32_t, py::array::c_style | py::array::forcecast> sorted_idxs,
-    py::array_t<float,   py::array::c_style | py::array::forcecast> sorted_projs,
-    py::array_t<float,   py::array::c_style | py::array::forcecast> q_projs,
-    int64_t  window_size,
-    int32_t  min_votes)
-{
-    auto SI = sorted_idxs.unchecked<2>();
-    auto SP = sorted_projs.unchecked<2>();
-    auto QP = q_projs.unchecked<1>();
-    const int64_t L = SI.shape(0), n = SI.shape(1);
-
-    std::vector<int32_t> votes(n, 0);
-
-    for (int64_t i = 0; i < L; ++i) {
-        const float*   sp = &SP(i, 0);
-        const int32_t* si = &SI(i, 0);
-        int64_t pos = lb_float(sp, n, QP(i));
-        int64_t lo  = std::max(int64_t(0), pos - window_size);
-        int64_t hi  = std::min(n,           pos + window_size);
-        for (int64_t j = lo; j < hi; ++j)
-            votes[si[j]]++;
-    }
-
-    int64_t count = 0;
-    for (int64_t k = 0; k < n; ++k)
-        if (votes[k] >= min_votes) ++count;
-
-    auto out     = py::array_t<int32_t>(count);
-    auto out_buf = out.mutable_unchecked<1>();
-    int64_t c = 0;
-    for (int64_t k = 0; k < n; ++k)
-        if (votes[k] >= min_votes) out_buf(c++) = static_cast<int32_t>(k);
-
-    return out;
-}
-
 // ── module ────────────────────────────────────────────────────────────────────
 
 PYBIND11_MODULE(_ampi_ext, m) {
@@ -185,8 +146,4 @@ PYBIND11_MODULE(_ampi_ext, m) {
           "Union-mode candidate selection via sorted projections",
           py::arg("sorted_idxs"), py::arg("sorted_projs"),
           py::arg("q_projs"), py::arg("window_size"));
-    m.def("vote_query",   &vote_query,
-          "Voting-mode candidate selection via sorted projections",
-          py::arg("sorted_idxs"), py::arg("sorted_projs"),
-          py::arg("q_projs"), py::arg("window_size"), py::arg("min_votes"));
 }
