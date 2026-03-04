@@ -1,116 +1,21 @@
 """
-AMPI Affine Fan Index: FAISS k-means partition + affine cone refinement
-+ sorted-projection voting.
+AMPI Affine Fan Index: k-means partition + random affine fan cones
++ sorted-projection search.
 
-Architecture (3 levels):
-  1. Coarse partition: FAISS k-means (optimised C++ with BLAS).
-  2. Within each cluster: affine fan cones around the cluster centroid.
-     Global geometry-guided directions (computed once) → cone assignment on
-     centred data → sorted projections per cone.
-  3. Within each cone: sorted-projection vote/union query.
+Architecture:
+  1. Coarse partition: k-means (mini-batch, BLAS-accelerated).
+  2. Within each cluster: F random unit-vector fan axes → cone assignment
+     on centred data → sorted projections per cone.
+  3. Query: find nearest cp clusters, best fp cones per cluster via
+     |aₖ · (q−μ_c)_hat|, collect candidates via sorted-projection window,
+     L2 rerank.
 
-Query:
-  1. Find P nearest centroids by L2 distance.
-  2. For each probed cluster, find the best F cones via |aₖ · (q−μ_c)_hat|.
-  3. Within each cone, sorted-projection vote/union → candidates.
-  4. L2 rerank survivors.
-
-The innovation is not the partition (k-means is standard) but:
-  - Affine fan cones within clusters partition the cluster members by
-    direction from the centroid, so within-cluster search is sublinear.
-  - Sorted-projection voting within each cone further prunes candidates:
-    true NNs score high votes across all projection axes, impostors don't.
-  - This replaces IVF's exhaustive within-cluster scan, reducing candidate
-    count while maintaining recall.
+Random axes work as well as geometry-guided ones at F=128 in d=128
+(near-full coverage of the space regardless), with zero build overhead.
 """
 
 import numpy as np
 from ._kernels import jit_union_query, jit_vote_query, l2_distances
-
-
-def _bootstrap_nn_pairs(data, S, rng):
-    """Approximate NN pairs via a single random projection → (S, 2) int32."""
-    n, d = data.shape
-    a = rng.randn(d).astype(np.float32)
-    a /= np.linalg.norm(a)
-    order = np.argsort(data @ a)
-    adj   = np.stack([order[:-1], order[1:]], axis=1)
-    sel   = rng.choice(len(adj), min(S, len(adj)), replace=False)
-    return adj[sel]
-
-
-def _score_directions(data, candidates, pairs, rng):
-    """score(a) = mean|a·(anchor−rand)| / mean|a·(anchor−nn)| → (C,) float32."""
-    n        = data.shape[0]
-    S        = len(pairs)
-    anchors  = data[pairs[:, 0]]
-    nns      = data[pairs[:, 1]]
-    randoms  = data[rng.choice(n, S, replace=True)]
-    nn_proj   = np.abs((anchors - nns)     @ candidates.T)   # (S, C)
-    rand_proj = np.abs((anchors - randoms) @ candidates.T)   # (S, C)
-    return (rand_proj.mean(0) / (nn_proj.mean(0) + 1e-8)).astype(np.float32)
-
-
-def _global_power_iter(data, directions, steps):
-    """a ← X^T(Xa)/‖·‖ over full dataset — vectorised over all L at once."""
-    A = directions.T.astype(np.float64)          # (d, L)
-    for _ in range(steps):
-        XA = data @ A                            # (n, L)
-        A  = data.T @ XA                         # (d, L)
-        norms = np.linalg.norm(A, axis=0, keepdims=True)
-        A /= np.where(norms < 1e-10, 1.0, norms)
-    return A.T.astype(np.float32)                # (L, d)
-
-
-def _local_power_iter(data, directions, pairs, steps):
-    """a ← D^T(Da)/‖·‖ where D = NN-pair difference vectors."""
-    anchors = data[pairs[:, 0]].astype(np.float64)
-    nns     = data[pairs[:, 1]].astype(np.float64)
-    D       = anchors - nns                      # (S, d)
-    A = directions.T.astype(np.float64)          # (d, L)
-    for _ in range(steps):
-        DA = D @ A                               # (S, L)
-        A  = D.T @ DA                            # (d, L)
-        norms = np.linalg.norm(A, axis=0, keepdims=True)
-        A /= np.where(norms < 1e-10, 1.0, norms)
-    return A.T.astype(np.float32)                # (L, d)
-
-
-def geometry_guided_directions(data, L, C_factor=5, S=500,
-                                power_iter=1, local=True, seed=0):
-    """Select L geometry-aware unit vectors for projecting ``data``."""
-    data = np.ascontiguousarray(data, dtype=np.float32)
-    rng  = np.random.RandomState(seed)
-    n, d = data.shape
-    C    = C_factor * L
-
-    pairs = _bootstrap_nn_pairs(data, S, rng)
-
-    ii = rng.choice(n, C, replace=True)
-    jj = rng.choice(n, C, replace=True)
-    jj[ii == jj] = (jj[ii == jj] + 1) % n
-    diffs = (data[ii] - data[jj]).astype(np.float64)
-    norms = np.linalg.norm(diffs, axis=1)
-    valid = norms > 1e-8
-    diffs = diffs[valid] / norms[valid, None]
-    shortfall = C - len(diffs)
-    if shortfall > 0:
-        extra = rng.randn(shortfall, d)
-        extra /= np.linalg.norm(extra, axis=1, keepdims=True)
-        diffs = np.vstack([diffs, extra])
-
-    candidates = diffs[:C].astype(np.float32)
-    scores     = _score_directions(data, candidates, pairs, rng)
-    top_idx    = np.argsort(scores)[::-1][:L]
-    selected   = candidates[top_idx].copy()
-
-    if power_iter > 0:
-        if local:
-            selected = _local_power_iter(data, selected, pairs, steps=power_iter)
-        else:
-            selected = _global_power_iter(data, selected, steps=power_iter)
-
-    return selected
 
 
 def _blas_assign(data, centroids, data_sq=None):
@@ -223,9 +128,7 @@ class AMPIAffineFanIndex:
                  : passed to geometry_guided_directions (called once globally)
     """
 
-    def __init__(self, data, nlist=None, num_fans=16,
-                 C_factor=5, S=500, power_iter=1, seed=0,
-                 cone_top_k=1):
+    def __init__(self, data, nlist=None, num_fans=16, seed=0, cone_top_k=1):
 
         self.data = np.ascontiguousarray(data, dtype=np.float32)
         self.n, self.d = self.data.shape
@@ -238,10 +141,10 @@ class AMPIAffineFanIndex:
         self.nlist = nlist
 
         # ── Global fan directions (computed once) ────────────────────────
-        self.axes = geometry_guided_directions(
-            self.data, self.F,
-            C_factor=C_factor, S=S, power_iter=power_iter, seed=seed,
-        )  # (F, d)
+        rng  = np.random.RandomState(seed)
+        axes = rng.randn(self.F, self.d).astype(np.float32)
+        axes /= np.linalg.norm(axes, axis=1, keepdims=True)
+        self.axes = axes  # (F, d)
 
         # ── K-means partition ────────────────────────────────────────────
         self.centroids, assignments = _mini_batch_kmeans(
@@ -330,10 +233,17 @@ class AMPIAffineFanIndex:
         for c in clusters:
             c = int(c)
             cones = self.cluster_cones[c]
-            if cones is None:
-                gi = self.cluster_global[c]
+            gi = self.cluster_global[c]
+            if cones is None or len(gi) == 0:
                 if len(gi) > 0:
                     parts.append(gi)
+                continue
+
+            # Fast path: fp >= F means every cone is visited and each cone's
+            # window (w >> n_f at typical scales) returns all its points anyway.
+            # Skip unnecessary JIT calls and just return the whole cluster.
+            if fan_probes >= self.F:
+                parts.append(gi)
                 continue
 
             centroid = self.centroids[c]
@@ -346,12 +256,15 @@ class AMPIAffineFanIndex:
                 if f >= len(cones) or cones[f] is None:
                     continue
                 cone = cones[f]
-                local = jit_union_query(
-                    cone['sorted_idxs'],
-                    cone['sorted_projs'],
-                    q_proj, window_size,
-                )
-                parts.append(cone['global_idx'][local])
+                if cone['n'] <= 2 * window_size:
+                    parts.append(cone['global_idx'])
+                else:
+                    local = jit_union_query(
+                        cone['sorted_idxs'],
+                        cone['sorted_projs'],
+                        q_proj, window_size,
+                    )
+                    parts.append(cone['global_idx'][local])
 
         if not parts:
             return np.zeros(0, dtype=np.int32)
@@ -368,10 +281,14 @@ class AMPIAffineFanIndex:
         for c in clusters:
             c = int(c)
             cones = self.cluster_cones[c]
-            if cones is None:
-                gi = self.cluster_global[c]
+            gi = self.cluster_global[c]
+            if cones is None or len(gi) == 0:
                 if len(gi) > 0:
                     parts.append(gi)
+                continue
+
+            if fan_probes >= self.F:
+                parts.append(gi)
                 continue
 
             centroid = self.centroids[c]
@@ -384,18 +301,21 @@ class AMPIAffineFanIndex:
                 if f >= len(cones) or cones[f] is None:
                     continue
                 cone = cones[f]
-                local = jit_vote_query(
-                    cone['sorted_idxs'],
-                    cone['sorted_projs'],
-                    q_proj, window_size, min_votes,
-                )
-                if len(local) == 0:
-                    local = jit_union_query(
+                if cone['n'] <= 2 * window_size:
+                    parts.append(cone['global_idx'])
+                else:
+                    local = jit_vote_query(
                         cone['sorted_idxs'],
                         cone['sorted_projs'],
-                        q_proj, window_size,
+                        q_proj, window_size, min_votes,
                     )
-                parts.append(cone['global_idx'][local])
+                    if len(local) == 0:
+                        local = jit_union_query(
+                            cone['sorted_idxs'],
+                            cone['sorted_projs'],
+                            q_proj, window_size,
+                        )
+                    parts.append(cone['global_idx'][local])
 
         if not parts:
             return np.zeros(0, dtype=np.int32)

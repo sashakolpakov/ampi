@@ -28,7 +28,7 @@ from ampi import (
     AMPIBinaryIndex,
     AMPIAffineFanIndex,
 )
-from ampi.tuner import _GP1D
+from ampi.tuner import _GP1D, _pareto_knee
 
 K             = 10      # primary recall threshold (Pareto / tuning)
 K_MAX         = 100     # maximum neighbours to retrieve (enables recall@1/10/100)
@@ -254,13 +254,18 @@ def save_figures(all_results):
             ax_ratio.plot(rec10, ratio, zorder=zo, **kw)
             legend_handles.append((line, fam))
 
-            # Pareto highlight on recall@10 panel
+            # Pareto highlight + knee annotation on recall@10 panel
             fi = _pareto_frontier(cands, rec10)
             if len(fi) > 1:
                 px = [cands[i] for i in fi]
                 py = [rec10[i] for i in fi]
                 ax_r10.plot(px, py, color=style.get("color", "gray"),
                             lw=2.5, ls="-", alpha=0.35, zorder=zo - 1)
+                pf = [(None, None, None, rec10[i], cands[i]) for i in fi]
+                knee = _pareto_knee(pf)
+                ax_r10.scatter([knee[4]], [knee[3]], s=150,
+                               facecolors="none", edgecolors=style.get("color", "gray"),
+                               lw=2, zorder=zo + 2)
 
         for ax, ylabel, title in [
             (ax_r1,   "Recall@1",   "Recall@1 vs Candidates"),
@@ -306,26 +311,19 @@ def save_figures(all_results):
 # ── auto-scaling ──────────────────────────────────────────────────────────────
 
 def scale_params(n, d):
-    """Return AMPI build/query parameters scaled to dataset size and dimensionality.
+    """Return benchmark parameters scaled to dataset size and dimensionality.
 
-    S        : bootstrap NN-pairs for geometry estimation (local power iter needs
-               enough pairs to span the d-dim subspace) → O(sqrt(n)), min 500
-    L        : projections ∝ d/8 (angular resolution) × log₂(n/5k) (scale),
-               rounded to multiples of 8, capped at 64/128
-    w_base   : sorted-projection half-window; baseline w=15 at n=10k scales by
-               sqrt(n/10k) so the covered fraction of the array stays constant
-    bins     : equal-frequency hash bins (subspace_dim=2) sized so each bucket
-               holds ~500 vectors → bins = sqrt(n/500); narrow build doubles it
+    L        : Binary index projections ∝ d/8 × log₂(n/5k), capped at 64/128
+    w_base   : sorted-projection half-window; baseline w=15 at n=10k, scales
+               by sqrt(n/10k) so the covered fraction of each cone stays constant
     """
-    S = max(500, min(10_000, int(3 * math.sqrt(n))))
-
     L_raw = (d / 8) * max(1.0, math.log2(n / 5_000))
     L1    = max(16, min(64, 8 * round(L_raw / 8)))
     L2    = min(128, L1 * 2)
 
     w_base = max(15, int(15 * math.sqrt(n / 10_000)))
 
-    return dict(S=S, L1=L1, L2=L2, w_base=w_base)
+    return dict(L1=L1, L2=L2, w_base=w_base)
 
 
 # ── main benchmark ────────────────────────────────────────────────────────────
@@ -347,9 +345,8 @@ def run(dataset_name, data, queries, gt):
 
     pr = scale_params(n, d)
     L1, L2 = pr['L1'], pr['L2']
-    S      = pr['S']
     wb     = pr['w_base']
-    print(f"  auto-params: L={L1}/{L2}  S={S}  w_base={wb}")
+    print(f"  auto-params: L={L1}/{L2}  w_base={wb}")
 
     def build(label, cls, **kw):
         print(f"  Building {label}…", end=" ", flush=True)
@@ -400,8 +397,7 @@ def run(dataset_name, data, queries, gt):
 
     def _alpha_score(alpha):
         nlist_s = max(16, int(alpha * math.sqrt(n_sample)))
-        idx_s   = AMPIAffineFanIndex(data_sample, nlist=nlist_s, num_fans=16,
-                                     C_factor=5, S=min(S, 500), power_iter=1, seed=0)
+        idx_s   = AMPIAffineFanIndex(data_sample, nlist=nlist_s, num_fans=16, seed=0)
         scores  = []
         for cp, fp, w in [(3, 4, max(5, wb_s // 2)), (5, 8, wb_s), (10, 16, wb_s)]:
             res    = [idx_s.query(q, k=K, window_size=w, probes=cp, fan_probes=fp)
@@ -450,8 +446,7 @@ def run(dataset_name, data, queries, gt):
         tag = f"AFan F={best_F} K={ktk}"
         idx = build(tag, AMPIAffineFanIndex,
                     nlist=best_nlist, num_fans=best_F,
-                    C_factor=5, S=S, power_iter=1, seed=0,
-                    cone_top_k=ktk)
+                    seed=0, cone_top_k=ktk)
         af_indexes[ktk] = idx
 
     # Warmup AMPI indexes (triggers JIT compilation)

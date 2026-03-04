@@ -93,12 +93,11 @@ class _GP1D:
 # ── utilities ──────────────────────────────────────────────────────────────
 
 def _scale_params(n, d):
-    S      = max(500, min(10_000, int(3 * math.sqrt(n))))
     L_raw  = (d / 8) * max(1.0, math.log2(n / 5_000))
     L1     = max(16, min(64,  8 * round(L_raw / 8)))
     L2     = min(128, L1 * 2)
     w_base = max(15, int(15 * math.sqrt(n / 10_000)))
-    return dict(S=S, L1=L1, L2=L2, w_base=w_base)
+    return dict(L1=L1, L2=L2, w_base=w_base)
 
 
 def _recall(gt, approx, k):
@@ -188,7 +187,7 @@ class AFanTuner:
         self.n_sample = n_sample
 
         pr = _scale_params(self.n, self.d)
-        self.S, self.L1, self.L2, self.w_base = pr['S'], pr['L1'], pr['L2'], pr['w_base']
+        self.L1, self.L2, self.w_base = pr['L1'], pr['L2'], pr['w_base']
 
         # Sample data + sample-level ground truth for BO objective
         rng              = np.random.default_rng(seed)
@@ -217,8 +216,7 @@ class AFanTuner:
         # (< 1 pt/cone), so only alpha is being selected here.
         return AMPIAffineFanIndex(
             self.data_sample, nlist=nlist, num_fans=16,
-            C_factor=5, S=min(self.S, 500), power_iter=1, seed=self.seed,
-            cone_top_k=int(round(K)),
+            seed=self.seed, cone_top_k=int(round(K)),
         )
 
     def _score(self, idx):
@@ -318,8 +316,7 @@ class AFanTuner:
         t0  = time.perf_counter()
         idx = AMPIAffineFanIndex(
             self.data, nlist=best_nlist, num_fans=best_F,
-            C_factor=5, S=self.S, power_iter=1, seed=self.seed,
-            cone_top_k=best_K,
+            seed=self.seed, cone_top_k=best_K,
         )
         if verbose:
             print(f"{time.perf_counter() - t0:.1f}s")
