@@ -28,7 +28,7 @@ from ampi import (
     AMPIBinaryIndex,
     AMPIAffineFanIndex,
 )
-from ampi.tuner import _GP1D, _pareto_knee
+from ampi.tuner import _GP1D, _pareto_knee, _scale_params as scale_params
 
 K             = 10      # primary recall threshold (Pareto / tuning)
 K_MAX         = 100     # maximum neighbours to retrieve (enables recall@1/10/100)
@@ -305,24 +305,6 @@ def save_figures(all_results):
         fig.savefig(out, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"  → saved {out}")
-
-
-# ── auto-scaling ──────────────────────────────────────────────────────────────
-
-def scale_params(n, d):
-    """Return benchmark parameters scaled to dataset size and dimensionality.
-
-    L        : Binary index projections ∝ d/8 × log₂(n/5k), capped at 64/128
-    w_base   : sorted-projection half-window; baseline w=15 at n=10k, scales
-               by sqrt(n/10k) so the covered fraction of each cone stays constant
-    """
-    L_raw = (d / 8) * max(1.0, math.log2(n / 5_000))
-    L1    = max(16, min(64, 8 * round(L_raw / 8)))
-    L2    = min(128, L1 * 2)
-
-    w_base = max(15, int(15 * math.sqrt(n / 10_000)))
-
-    return dict(L1=L1, L2=L2, w_base=w_base)
 
 
 # ── main benchmark ────────────────────────────────────────────────────────────

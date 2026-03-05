@@ -2,11 +2,9 @@
 Smoke test: build small indexes, verify exact NN is found at high recall.
 Runs in ~10s on a laptop, no datasets required.
 """
-import sys
 import numpy as np
 import faiss
 
-sys.path.insert(0, ".")
 from ampi import AMPIBinaryIndex, AMPIAffineFanIndex
 
 rng  = np.random.default_rng(42)

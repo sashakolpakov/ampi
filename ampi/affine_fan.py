@@ -133,7 +133,6 @@ class AMPIAffineFanIndex:
         self.data = np.ascontiguousarray(data, dtype=np.float32)
         self.n, self.d = self.data.shape
         self.F = num_fans
-        self.L = num_fans
         self.cone_top_k = max(1, int(cone_top_k))
 
         if nlist is None:
