@@ -34,6 +34,12 @@ Query collects a window of size `w` around the query rank on each projection, re
 the union. No partition, density-adaptive (window always covers exactly `2w` points per
 projection regardless of local density).
 
+### Backend
+
+Hot-path kernels (`project_data`, `l2_distances`, `union_query`) are implemented in
+C++ via pybind11 (`ampi/_ext.cpp`). A numba JIT fallback is used automatically if the
+compiled extension is not present.
+
 ---
 
 ## Quick Start
@@ -107,6 +113,9 @@ python benchmark.py mnist
 python benchmark.py all
 ```
 
+Benchmark output includes Recall@1, Recall@10, Recall@100, QPS, and distance ratio
+for each method, with per-family Pareto frontier plots saved to `figures/`.
+
 ---
 
 ## Installation
@@ -116,6 +125,9 @@ git clone <repo>
 cd ampi
 pip install -e .
 ```
+
+The C++ extension is built automatically by setuptools (requires a C++17 compiler and
+`pybind11`). If the build fails, the package still works via the numba fallback.
 
 **Dependencies**: `numpy`, `numba`. Benchmarks additionally need `faiss-cpu`, `h5py`, `matplotlib`.
 
@@ -127,13 +139,21 @@ pip install -e .
 ampi/
 ├── ampi/
 │   ├── __init__.py
-│   ├── _kernels.py       # Numba JIT: jit_union_query, l2_distances
+│   ├── _kernels.py       # C++ ext wrapper + numba fallback
+│   ├── _ext.cpp          # pybind11 C++ kernels
 │   ├── affine_fan.py     # AMPIAffineFanIndex
 │   ├── binary.py         # AMPIBinaryIndex
 │   └── tuner.py          # AFanTuner (GP-BO over alpha, Pareto knee detection)
 ├── tests/
 │   └── smoke_test.py
 ├── benchmark.py          # recall@1/10/100 curves vs FAISS IVF
-├── TODO.md               # architecture notes (Bayesian insertion, distributed DB)
+├── DATABASE_PLAN.md      # phased implementation plan for streaming insert + distributed DB
+├── TODO.md               # architecture notes and task tracking
 └── pyproject.toml
 ```
+
+## Roadmap
+
+The next major milestone is streaming insertion (no full rebuild on `add`/`delete`)
+and a distributed multi-shard architecture. See `DATABASE_PLAN.md` for the phased
+implementation plan, and `TODO.md` for current task status.

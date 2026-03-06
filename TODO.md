@@ -25,6 +25,8 @@ Batch rebuild of the full index (k-means + fan axes) is O(n·F) and impractical 
 - Mark-and-sweep: logical delete with tombstone bit; physical removal during next cluster refresh.
 - Update = delete + insert.
 
+See **DATABASE_PLAN.md** for the concrete phased implementation plan.
+
 ---
 
 ## 2. Distributed Vector Database
@@ -60,18 +62,29 @@ Batch rebuild of the full index (k-means + fan axes) is O(n·F) and impractical 
 - Periodic background task compares shard sizes; migrates whole clusters (not individual vectors) between shard hosts.
 - Cluster migration = ship sorted arrays + fan axes + WAL tail, then atomic centroid-table update.
 
+See **DATABASE_PLAN.md** for the phased build sequence and default constants.
+
 ---
 
-## 3. C++ Port (next major milestone)
+## 3. C++ Port
 
-- Core index (affine_fan.py) → C++ with pybind11 wrapper.
-- Sorted arrays → `std::vector<std::pair<float,uint32_t>>` with `std::lower_bound`.
-- SIMD projection: AVX2 dot products for all-F-axes at once.
-- Expected 20-50× QPS improvement over current Python path.
+### Done
+- [x] Hot-path kernels ported to C++ with pybind11: `project_data`, `l2_distances`,
+      `union_query` (`ampi/_ext.cpp`, compiled to `_ampi_ext.so`).
+- [x] `_kernels.py` transparently falls back to numba JIT if the extension is absent.
+
+### Remaining
+- [ ] Mutable cone structures in C++: replace immutable NumPy sorted arrays with
+      `std::vector<std::pair<float,uint32_t>>` + `std::lower_bound` insert.
+      Required for Phase 1 streaming insertion.
+- [ ] SIMD projection: AVX2 dot products over all F axes at once in `project_data`.
+- [ ] Move cluster centroid EMA and drift-check into C++ for insert hot-path.
+
+### Notes
 - K=2 QPS collapse on SIFT (0.5–6 vs K=1's 3–19) is a Python/NumPy cache artifact:
   K=2 doubles memory footprint (2×nlist×F sorted arrays), thrashing L3 at 1M×128-D.
   The algorithmic recall improvement is real (K=2 tops 0.977 vs K=1's 0.973 at equal
-  candidates). A C++ implementation with tighter memory layout will close this gap.
+  candidates). The mutable C++ cone layout will close this gap.
 - Python API surface stays identical; tuner.py and benchmark.py unchanged.
 
 ---
@@ -80,8 +93,8 @@ Batch rebuild of the full index (k-means + fan axes) is O(n·F) and impractical 
 
 - [x] Fashion-MNIST (60k, d=784)
 - [x] SIFT-128 full 1M
+- [x] Recall@1 / Recall@100 curves (benchmark.py now reports all three)
 - [ ] GIST (1M, d=960) — high-d stress test
-- [ ] Add recall@1 / recall@100 curves in addition to recall@10
 - [ ] Profile per-cluster fan-axis variance to validate drift-detection threshold θ_drift
 - [ ] ann-benchmarks wrapper: `module.py` with `fit` / `set_query_arguments` / `query`, `Dockerfile`, `config.yml`
 - [ ] Target: competitive on MNIST and SIFT before opening ann-benchmarks PR
@@ -90,6 +103,6 @@ Batch rebuild of the full index (k-means + fan axes) is O(n·F) and impractical 
 
 ## 5. Packaging
 
-- [ ] Publish to PyPI once recall is competitive
-- [ ] Add CI: import + smoke tests on push
+- [x] CI: smoke test on every push/PR (`.github/workflows/ci.yml`)
 - [ ] Pin numba/numpy versions in pyproject.toml
+- [ ] Publish to PyPI once recall is competitive and streaming insert is stable
