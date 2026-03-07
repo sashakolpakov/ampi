@@ -385,10 +385,15 @@ def run(dataset_name, data, queries, gt):
             idxs   = [r[2] if isinstance(r, tuple) else r for r in res]
             padded = [np.pad(ix[:K], (0, max(0, K - len(ix))), constant_values=-1)
                       for ix in idxs]
-            scores.append(recall(gt_sample, padded, K))
+            rec   = recall(gt_sample, padded, K)
+            # Penalise by candidate fraction: large clusters produce many candidates
+            # regardless of window, so pure recall would always favour small alpha.
+            avg_cands = float(np.mean([len(r[2]) for r in res]))
+            cand_frac = avg_cands / n_sample
+            scores.append(rec / (1.0 + cand_frac))
         return float(np.mean(scores))
 
-    ALPHA_LO, ALPHA_HI = 0.10, 2.0
+    ALPHA_LO, ALPHA_HI = 0.50, 2.0
     N_BO_ITER = 12
     x_obs = [ALPHA_LO, (ALPHA_LO + ALPHA_HI) / 2, ALPHA_HI]
     y_obs = [_alpha_score(a) for a in x_obs]

@@ -269,9 +269,93 @@ class AMPIAffineFanIndex:
             return np.zeros(0, dtype=np.int32)
         return np.unique(np.concatenate(parts))
 
-    def query(self, q, k=10, window_size=50, probes=10, fan_probes=2):
-        q     = np.ascontiguousarray(q, dtype=np.float32)
-        cands = self.query_candidates(q, window_size, probes, fan_probes)
+    def query(self, q, k=10, window_size=200, probes=10, fan_probes=2):
+        """Adaptive sorted-projection search.
+
+        Starts with a small window and expands only until the projection lower
+        bound guarantees no unvisited point can improve the current top-k.
+        window_size is a ceiling; most queries stop well before reaching it.
+
+        Stopping condition per cone: there exists an axis l whose window
+        boundary projection gap >= sqrt(kth_sq). Since L2(x,q) >= |proj_l(x-q)|
+        for any unit vector l, those unvisited points cannot enter the top-k.
+        """
+        q = np.ascontiguousarray(q, dtype=np.float32)
+
+        # Collect cone contexts once so cluster/cone selection is not repeated
+        # on every window expansion.
+        cone_ctxs = []   # list of (cone_dict, q_proj_float32)
+        fallback_parts = []
+
+        for c in map(int, self._best_clusters(q, probes)):
+            cones = self.cluster_cones[c]
+            gi    = self.cluster_global[c]
+            if not len(gi):
+                continue
+            if cones is None or fan_probes >= self.F:
+                fallback_parts.append(gi)
+                continue
+            centroid   = self.centroids[c]
+            q_centered = q - centroid
+            q_proj     = np.ascontiguousarray(
+                (q_centered @ self.axes.T).astype(np.float32)
+            )
+            for f in map(int, self._best_fan_cones(q_centered, fan_probes)):
+                if f < len(cones) and cones[f] is not None:
+                    cone_ctxs.append((cones[f], q_proj))
+
+        w = max(k, 8)
+        cands = np.zeros(0, dtype=np.int32)
+
+        while True:
+            parts = list(fallback_parts)
+            for cone, q_proj in cone_ctxs:
+                if cone['n'] <= 2 * w:
+                    parts.append(cone['global_idx'])
+                else:
+                    local = jit_union_query(
+                        cone['sorted_idxs'], cone['sorted_projs'], q_proj, w,
+                    )
+                    parts.append(cone['global_idx'][local])
+
+            cands = np.unique(np.concatenate(parts)) if parts else np.zeros(0, dtype=np.int32)
+
+            if w >= window_size or len(cands) < k:
+                break
+
+            dists    = l2_distances(self.data, q, cands)
+            kth_sq   = float(np.partition(dists, k - 1)[k - 1])
+            kth_proj = np.sqrt(max(0.0, kth_sq))
+
+            # A cone is covered when at least one axis l has both sides of its
+            # window boundary further than kth_proj in projection space.
+            # Any unvisited point on that axis has L2 >= its projection gap,
+            # so it cannot improve the top-k.
+            all_covered = True
+            for cone, q_proj in cone_ctxs:
+                if cone['n'] <= 2 * w:
+                    continue  # already exhausted
+                n_f     = cone['n']
+                covered = False
+                for l in range(self.F):
+                    sp  = cone['sorted_projs'][l]
+                    pos = int(np.searchsorted(sp, q_proj[l]))
+                    lo  = max(0, pos - w)
+                    hi  = min(n_f, pos + w)
+                    gap_right = float(sp[hi] - q_proj[l]) if hi < n_f else np.inf
+                    gap_left  = float(q_proj[l] - sp[lo - 1]) if lo > 0 else np.inf
+                    if min(gap_right, gap_left) >= kth_proj:
+                        covered = True
+                        break
+                if not covered:
+                    all_covered = False
+                    break
+
+            if all_covered:
+                break
+
+            w = min(w * 2, window_size)
+
         if len(cands) < k:
             cands = np.arange(min(k, self.n), dtype=np.int32)
         dists = l2_distances(self.data, q, cands)
