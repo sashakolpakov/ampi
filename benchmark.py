@@ -57,6 +57,20 @@ def make_gaussian(n=10_000, d=128, seed=42):
 
 
 def load_hdf5(path, n_train=None, normalize=False):
+    """Load an ANN-benchmark HDF5 file and return (data, queries, gt).
+
+    Parameters
+    ----------
+    path      : path to .hdf5 file with 'train' and 'test' datasets
+    n_train   : optional cap on training vectors (None = use all)
+    normalize : if True, L2-normalise both data and queries (for cosine benchmarks)
+
+    Returns
+    -------
+    data    : (n, d) float32 — training vectors (index corpus)
+    queries : (N_QUERIES, d) float32 — held-out query vectors
+    gt      : (N_QUERIES, K_MAX) int32 — exact k-NN indices into data
+    """
     with h5py.File(path) as f:
         train   = f["train"][:n_train].astype(np.float32)
         queries = f["test"][:N_QUERIES].astype(np.float32)
@@ -125,6 +139,30 @@ def _pareto_group(label):
 
 
 def evaluate(label, query_fn, cands_fn, queries, gt, data, n, pareto=None):
+    """Run one benchmark configuration and print a result row.
+
+    Applies two pruning passes before the full timed run:
+      1. Skip if average candidate count exceeds MAX_CAND_FRAC * n.
+      2. Skip if a within-family Pareto point dominates this config
+         (fewer candidates, at least as high recall).
+
+    Parameters
+    ----------
+    label    : display name for this configuration
+    query_fn : callable(q) → (pts, dists, indices) or just indices
+    cands_fn : callable(q) → candidate array or count
+    queries  : (N_QUERIES, d) float32
+    gt       : (N_QUERIES, K_MAX) int32 ground-truth indices
+    data     : (n, d) float32 corpus (for distance-ratio computation)
+    n        : corpus size
+    pareto   : dict {family_group: [(cands, recall), ...]} — updated in-place
+               by the caller; used for within-family dominance pruning
+
+    Returns
+    -------
+    dict with keys label, recall, recall1, recall100, ratio, ms, qps, cands,
+    or None if the configuration was skipped.
+    """
     # Step 1: candidate count check (1 query)
     cands = avg_cands(cands_fn, queries)
     is_binary = label.startswith("Binary")
@@ -310,6 +348,25 @@ def save_figures(all_results):
 # ── main benchmark ────────────────────────────────────────────────────────────
 
 def run(dataset_name, data, queries, gt, metric='l2'):
+    """Benchmark all index variants on one dataset and return result rows.
+
+    Builds Flat L2, IVF, Binary, and AffineFan indexes, sweeps their query
+    parameters, evaluates Recall@1/10/100 / QPS / distance ratio, and prints
+    a formatted table.  AffineFan index parameters (nlist, F) are chosen via
+    GP-BO on a data subsample before the full index is built.
+
+    Parameters
+    ----------
+    dataset_name : display name printed in the table header
+    data         : (n, d) float32 corpus
+    queries      : (N_QUERIES, d) float32 held-out queries
+    gt           : (N_QUERIES, K_MAX) int32 ground-truth indices into data
+    metric       : 'l2' (default) or 'cosine'
+
+    Returns
+    -------
+    rows : list of result dicts (one per evaluated configuration)
+    """
     n, d = data.shape
     sep  = "═" * 72
     print(f"\n{sep}")

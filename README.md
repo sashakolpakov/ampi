@@ -4,10 +4,6 @@ Approximate nearest-neighbour search via k-means partition + random affine fan c
 + sorted-projection candidate selection.  Supports streaming `add` / `delete` /
 `update` without a full rebuild.
 
-```bash
-pip install -e .
-```
-
 For a full mathematical treatment of the algorithm see **[ALGORITHM.md](ALGORITHM.md)**.
 
 ---
@@ -67,20 +63,24 @@ data = rng.standard_normal((100_000, 128)).astype("float32")
 q    = rng.standard_normal(128).astype("float32")
 
 # AffineFan — main index
-idx = AMPIAffineFanIndex(data, nlist=100, num_fans=128, seed=0)
-pts, dists, ids = idx.query(q, k=10, window_size=150, probes=10, fan_probes=32)
+afan = AMPIAffineFanIndex(data, nlist=100, num_fans=128, seed=0)
+pts, dists, ids = afan.query(q, k=10, window_size=150, probes=10, fan_probes=32)
 
-# Binary — simpler baseline
-idx = AMPIBinaryIndex(data, num_projections=128, seed=0)
-pts, dists, ids = idx.query(q, k=10, window_size=200)
+# Cosine similarity (normalises data internally)
+afan_cos = AMPIAffineFanIndex(data, nlist=100, num_fans=128, seed=0, metric='cosine')
 
-# Streaming mutations
-new_id = idx.add(rng.standard_normal(128).astype("float32"))
-idx.delete(new_id)
-idx.update(42, rng.standard_normal(128).astype("float32"))
+# Binary — simpler baseline (no partition, no streaming mutations)
+binary = AMPIBinaryIndex(data, num_projections=128, seed=0)
+pts, dists, ids = binary.query(q, k=10, window_size=200)
+
+# Streaming mutations (AffineFan only)
+new_id = afan.add(rng.standard_normal(128).astype("float32"))
+afan.delete(new_id)
+afan.update(42, rng.standard_normal(128).astype("float32"))
 
 # Inspect candidate pool before reranking
-cands = idx.query_candidates(q, window_size=200)   # (m,) int32 indices
+afan_cands   = afan.query_candidates(q, window_size=150, probes=10, fan_probes=32)
+binary_cands = binary.query_candidates(q, window_size=200)   # (m,) int32 indices
 ```
 
 ### Parameter guide
@@ -90,6 +90,7 @@ cands = idx.query_candidates(q, window_size=200)   # (m,) int32 indices
 | `nlist` | cluster count | `alpha × sqrt(n)`, tune alpha ∈ [0.25, 3.0] |
 | `num_fans` F | cones per cluster | largest F s.t. `n/(nlist×F) ≥ w_base` |
 | `cone_top_k` K | soft assignment | K=1 fast; K=2 better recall at cluster boundaries |
+| `metric` | distance function | `'l2'` (default) or `'cosine'` (normalises data internally) |
 | `probes` cp | clusters probed per query | 5–20 |
 | `fan_probes` fp | cones probed per cluster | F/4 … F |
 | `window_size` w | candidates per cone per axis | scales with `sqrt(n)` |
@@ -104,12 +105,15 @@ from ampi import AFanTuner
 tuner  = AFanTuner(data, queries, gt)   # gt: (n_queries, k) true NN indices
 result = tuner.tune()
 
-idx  = result["index"]        # ready-to-use AMPIAffineFanIndex
-sugg = result["suggestions"]  # [(target_recall, cp, fp, w, cands, recall), ...]
+idx   = result["index"]        # ready-to-use AMPIAffineFanIndex
+sugg  = result["suggestions"]  # [(target_recall, cp, fp, w, cands, recall), ...]
+# also available: result["nlist"], result["alpha"], result["K"], result["F"]
 ```
 
-`AFanTuner` runs Gaussian-Process Bayesian optimisation over `(alpha, cone_top_k)`,
-maximising recall@10 subject to a QPS target, then returns the full Pareto frontier.
+`AFanTuner` runs Gaussian-Process Bayesian optimisation over `alpha` (where
+`nlist = alpha × sqrt(n)`) and `cone_top_k` ∈ {1, 2, 3}, then builds the full
+index with the best params and sweeps query parameters to return a Pareto frontier
+of `(probes, fan_probes, window_size)` configs — one per target recall level.
 
 ---
 
@@ -146,16 +150,37 @@ each method, with Pareto frontier plots saved to `figures/`.
 
 ## Installation
 
+**Requirements**: Python ≥ 3.8, a C++17 compiler (gcc ≥ 9 / clang ≥ 10 / MSVC 2019),
+and `pybind11` (installed automatically by the build step below).
+
+### From source
+
 ```bash
-git clone <repo>
+git clone https://github.com/sashakolpakov/ampi.git
 cd ampi
 pip install -e .
 ```
 
-The C++ extension is built automatically by setuptools (requires a C++17 compiler and
-`pybind11`). If the build fails, the package still works via the numba fallback.
+The C++ extension (`ampi/_ext.cpp`) is compiled automatically by setuptools during
+install. If the build fails, the package falls back to a numba JIT implementation
+transparently — no extra action needed.
 
-**Dependencies**: `numpy`, `numba`. Benchmarks additionally need `faiss-cpu`, `h5py`, `matplotlib`.
+### Dependencies
+
+| Package | Purpose | Installed automatically |
+|---|---|---|
+| `numpy ≥ 1.24` | array operations | yes |
+| `numba ≥ 0.57` | JIT fallback kernels | yes |
+| `pybind11 ≥ 2.11` | C++ extension build | yes (build-only) |
+| `faiss-cpu` | benchmark baseline | no |
+| `h5py` | loading `.hdf5` datasets | no |
+| `matplotlib` | Pareto frontier plots | no |
+
+To install benchmark extras:
+
+```bash
+pip install faiss-cpu h5py matplotlib
+```
 
 ---
 
@@ -169,15 +194,22 @@ ampi/
 │   ├── _ext.cpp          # pybind11 C++ kernels + SortedCone class
 │   ├── affine_fan.py     # AMPIAffineFanIndex (streaming insert/delete/update)
 │   ├── binary.py         # AMPIBinaryIndex
-│   └── tuner.py          # AFanTuner (GP-BO over alpha, Pareto knee detection)
+│   ├── tuner.py          # AFanTuner (GP-BO over alpha, Pareto knee detection)
+│   └── README.md         # package-level pointer to this document
 ├── tests/
 │   ├── smoke_test.py     # fast unit test, no datasets needed
 │   └── stress_test.py    # adversarial add/delete/update/churn scenarios
+├── figures/              # Pareto frontier plots saved by benchmark.py
+├── .github/workflows/
+│   └── ci.yml            # CI: lint + smoke test on push
 ├── benchmark.py          # recall@1/10/100 vs FAISS IVF
+├── demo.ipynb            # interactive walkthrough
+├── setup.py              # C++ extension build (called by pip)
+├── pyproject.toml        # project metadata and dependencies
 ├── ALGORITHM.md          # full mathematical algorithm description
 ├── DATABASE_PLAN.md      # phased implementation plan (persistence + distributed DB)
 ├── TODO.md               # task tracking
-└── pyproject.toml
+└── LICENSE               # MIT
 ```
 
 ## Roadmap

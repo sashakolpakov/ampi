@@ -334,7 +334,7 @@ PYBIND11_MODULE(_ampi_ext, m) {
           py::arg("q_projs"), py::arg("window_size"));
 
     py::class_<SortedCone>(m, "SortedCone",
-        "Mutable sorted-projection cone for streaming insertion (Phase 1).\n\n"
+        "Mutable sorted-projection cone supporting streaming insert/delete.\n\n"
         "Each cone holds F sorted arrays of (proj_value, global_id) pairs.\n"
         "Logical deletes use tombstones; compact() does physical removal.")
         .def(py::init<int>(), py::arg("F"),

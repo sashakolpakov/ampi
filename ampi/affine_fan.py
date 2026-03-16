@@ -16,20 +16,18 @@ Random axes work as well as geometry-guided ones at F=128 in d=128
 Cone representation
 -------------------
 When the compiled C++ extension is available, each cone is a SortedCone
-object (mutable, supports streaming insert/delete — Phase 1).  Otherwise
-cones fall back to a _DictCone wrapper around numpy sorted arrays.  Both
-expose the same interface: .size(), .all_ids(), .query(), .is_covered().
+object (mutable, supports streaming insert/delete).  Otherwise cones fall
+back to a _DictCone wrapper around numpy sorted arrays.  Both expose the
+same interface: .size(), .all_ids(), .query(), .is_covered().
 
-Streaming insertion (Phase 1)
-------------------------------
+Streaming mutations
+-------------------
 add(x)         — insert one vector, returns its global_id.
 delete(id)     — logical tombstone; compacts automatically when the
                  per-cluster tombstone fraction exceeds _TOMBSTONE_THRESHOLD.
 update(id, x)  — delete + insert.
 
-Cluster assignment uses nearest-centroid (top-K by L2); no Dirichlet-Process
-weighting is applied (the DP formulation in DATABASE_PLAN.md §1.2 would only
-add a N_c prior bias that is not worth the extra complexity at this stage).
+Cluster assignment uses nearest-centroid (top-K by L2).
 
 Drift detection: per cluster a d×d covariance EMA tracks the displacement
 (x − y) where y is the approximate NN of x found from the just-inserted
@@ -57,7 +55,11 @@ _NN_PROBE_W           = 8      # half-window for approx-NN lookup in drift EMA
 # ── fallback cone (numba / no C++ ext) ───────────────────────────────────────
 
 class _DictCone:
-    """Numpy-backed cone mimicking the SortedCone interface (read-only)."""
+    """Numpy-backed cone mimicking the SortedCone interface.
+
+    Used as a fallback when the C++ extension is not available.
+    Does not support streaming mutations (no insert/remove).
+    """
     __slots__ = ('_n', '_global_idx', '_sorted_idxs', '_sorted_projs')
 
     def __init__(self, global_idx, sorted_idxs, sorted_projs):
@@ -569,6 +571,19 @@ class AMPIAffineFanIndex:
     # ── public query API ──────────────────────────────────────────────────────
 
     def query_candidates(self, q, window_size=50, probes=10, fan_probes=2):
+        """Return the union of cone candidates before exact-distance re-ranking.
+
+        Parameters
+        ----------
+        q           : (d,) array_like, float32
+        window_size : half-window of sorted-projection entries per cone per axis
+        probes      : number of nearest clusters to probe
+        fan_probes  : number of best-aligned cones to probe per cluster
+
+        Returns
+        -------
+        candidates : (m,) int32 — unique live data indices
+        """
         q = self._prepare_query(q)
         clusters = self._best_clusters(q, probes)
 
