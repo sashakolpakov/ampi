@@ -309,7 +309,7 @@ def save_figures(all_results):
 
 # ── main benchmark ────────────────────────────────────────────────────────────
 
-def run(dataset_name, data, queries, gt):
+def run(dataset_name, data, queries, gt, metric='l2'):
     n, d = data.shape
     sep  = "═" * 72
     print(f"\n{sep}")
@@ -359,15 +359,13 @@ def run(dataset_name, data, queries, gt):
     # === AffineFan: tune index params on a small sample ===
     print(f"  Tuning AFan parameters on sample...", flush=True)
 
-    n_sample    = max(10_000, min(50_000, int(n * 0.3)))
+    n_sample    = max(10_000, min(100_000, int(n * 0.2)))
     data_sample = data[np.random.choice(n, n_sample, replace=False)]
     tune_qs     = queries[:TUNE_SAMPLE]
 
-    # Build a flat GT on the sample for the tune queries
-    flat_sample = faiss.IndexFlatL2(d)
-    flat_sample.add(data_sample)
-    _, gt_sample = flat_sample.search(tune_qs, K)
-    gt_sample = gt_sample.astype(np.int32)
+    # Exact kNN on the sample — pure numpy, no faiss needed for tuning
+    from ampi.tuner import _brute_knn
+    gt_sample = _brute_knn(data_sample, tune_qs, K)
 
     # Tune alpha = nlist/sqrt(n) via GP-BO on the sample.
     # F is fixed at 16 for sample builds (large F → empty cones at 50k scale).
@@ -376,21 +374,26 @@ def run(dataset_name, data, queries, gt):
     wb_s = max(5, int(wb * math.sqrt(n_sample / n)))
 
     def _alpha_score(alpha):
-        nlist_s = max(16, int(alpha * math.sqrt(n_sample)))
-        idx_s   = AMPIAffineFanIndex(data_sample, nlist=nlist_s, num_fans=16, seed=0)
-        scores  = []
-        for cp, fp, w in [(3, 4, max(5, wb_s // 2)), (5, 8, wb_s), (10, 16, wb_s)]:
+        nlist_s      = max(16, int(alpha * math.sqrt(n_sample)))
+        cluster_size = max(1, n_sample // nlist_s)
+        idx_s        = AMPIAffineFanIndex(data_sample, nlist=nlist_s, num_fans=16, seed=0, metric=metric)
+
+        # Evaluate recall at three fixed candidate-budget targets.
+        # cp is scaled so that cp * cluster_size ≈ T, making every alpha
+        # scan the same total data.  Raw recall is the objective — the budget
+        # is already normalised, so no penalty term is needed.
+        scores = []
+        fp = 8
+        for target_frac in [0.02, 0.05, 0.15]:
+            T  = max(K + 1, int(n_sample * target_frac))
+            cp = max(1, min(nlist_s, T // cluster_size))
+            w  = max(5, T // max(1, 2 * cp * fp))
             res    = [idx_s.query(q, k=K, window_size=w, probes=cp, fan_probes=fp)
                       for q in tune_qs]
             idxs   = [r[2] if isinstance(r, tuple) else r for r in res]
             padded = [np.pad(ix[:K], (0, max(0, K - len(ix))), constant_values=-1)
                       for ix in idxs]
-            rec   = recall(gt_sample, padded, K)
-            # Penalise by candidate fraction: large clusters produce many candidates
-            # regardless of window, so pure recall would always favour small alpha.
-            avg_cands = float(np.mean([len(r[2]) for r in res]))
-            cand_frac = avg_cands / n_sample
-            scores.append(rec / (1.0 + cand_frac))
+            scores.append(recall(gt_sample, padded, K))
         return float(np.mean(scores))
 
     ALPHA_LO, ALPHA_HI = 0.50, 2.0
@@ -431,7 +434,7 @@ def run(dataset_name, data, queries, gt):
         tag = f"AFan F={best_F} K={ktk}"
         idx = build(tag, AMPIAffineFanIndex,
                     nlist=best_nlist, num_fans=best_F,
-                    seed=0, cone_top_k=ktk)
+                    seed=0, cone_top_k=ktk, metric=metric)
         af_indexes[ktk] = idx
 
     # Warmup AMPI indexes (triggers JIT compilation)
@@ -523,7 +526,7 @@ if __name__ == "__main__":
 
     if "glove" in targets:
         data, queries, gt = load_hdf5("data/glove/glove-100-angular.hdf5", normalize=True)
-        rows = run("GloVe 1.18M  d=100", data, queries, gt)
+        rows = run("GloVe 1.18M  d=100", data, queries, gt, metric='cosine')
         all_results.append(("GloVe 1.18M  d=100", rows))
 
     print()

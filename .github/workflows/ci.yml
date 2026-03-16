@@ -19,3 +19,6 @@ jobs:
 
       - name: Smoke test
         run: python tests/smoke_test.py
+
+      - name: Stress test
+        run: python tests/stress_test.py

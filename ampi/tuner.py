@@ -20,8 +20,6 @@ Usage
 import math
 import time
 import numpy as np
-import faiss
-
 from .affine_fan import AMPIAffineFanIndex
 
 
@@ -88,6 +86,45 @@ class _GP1D:
         f_best  = self._y.max()
         z       = (mu - f_best - xi) / sigma
         return np.maximum((mu - f_best - xi) * _norm_cdf(z) + sigma * _norm_pdf(z), 0.0)
+
+
+# ── brute-force kNN (no external deps) ─────────────────────────────────────
+
+def _brute_knn(data, queries, k):
+    """Exact kNN via BLAS gemm.  No faiss required.
+
+    ‖x−q‖² = ‖x‖² + ‖q‖² − 2x·q.  The dot-product term is a single gemm.
+    Uses argpartition (O(n) per query) rather than a full sort.
+
+    Parameters
+    ----------
+    data    : (n, d) float32
+    queries : (q, d) float32
+    k       : int
+
+    Returns
+    -------
+    indices : (q, k) int32  — not sorted within each row
+    """
+    data    = np.asarray(data,    dtype=np.float32)
+    queries = np.asarray(queries, dtype=np.float32)
+    n, d    = data.shape
+    q       = queries.shape[0]
+    k       = min(k, n)
+
+    data_sq = np.sum(data    ** 2, axis=1)          # (n,)
+    q_sq    = np.sum(queries ** 2, axis=1)           # (q,)
+
+    out  = np.empty((q, k), dtype=np.int32)
+    step = 256                                        # chunk queries to cap RAM
+    for i in range(0, q, step):
+        qc   = queries[i:i + step]                   # (step, d)
+        dots = qc @ data.T                           # (step, n)
+        d2   = data_sq[None, :] + q_sq[i:i+step, None] - 2.0 * dots
+        out[i:i + step] = np.argpartition(
+            d2, k - 1, axis=1
+        )[:, :k].astype(np.int32)
+    return out
 
 
 # ── utilities ──────────────────────────────────────────────────────────────
@@ -194,9 +231,7 @@ class AFanTuner:
         sidx             = rng.choice(self.n, n_sample, replace=False)
         self.data_sample = self.data[sidx]
         bo_qs            = self.queries[:self.N_BO_QUERIES]
-        flat             = faiss.IndexFlatL2(self.d)
-        flat.add(self.data_sample)
-        _, gt_s          = flat.search(bo_qs, k)
+        gt_s             = _brute_knn(self.data_sample, bo_qs, k)
         self.bo_qs       = bo_qs
         self.gt_sample   = gt_s.astype(np.int32)
 

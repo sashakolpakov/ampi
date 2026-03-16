@@ -1,108 +1,123 @@
 # AMPI — Architecture & Roadmap
 
-## 1. Bayesian Streaming Insertion
+## 1. Streaming Insertion (Phase 1 — complete)
 
-### Motivation
-Batch rebuild of the full index (k-means + fan axes) is O(n·F) and impractical for live systems. We want O(F·log n_cone) amortised insertion with correctness guarantees.
-
-### Cluster Assignment — Dirichlet-Process Mixture
-- Maintain a soft Dirichlet-process prior over cluster memberships.
-- For a new point x, compute responsibilities r_c ∝ N_c · p(x | μ_c, Σ_c).
-- Assign to top-K clusters (consistent with cone_top_k=K for the query path).
-- Periodically merge clusters whose centroids drift within ε of each other (Bayesian model comparison on marginal likelihoods).
+### Cluster Assignment — Nearest-Centroid (top-K)
+- [x] Assign new point to top-K clusters by L2 distance to centroids.
+- [x] Within each cluster, assign to top-K cones by |normalised projection|.
+- [x] Update cluster centroid via EMA: μ_c ← (N_c·μ_c + x) / (N_c + 1).
+- [x] Pre-allocated capacity buffer for `self.data` and `self._deleted_mask`:
+      doubling buffer in `add()`, amortised O(1) per insert.
+- [ ] Periodic cluster merge: after every `merge_interval` inserts, check pairs of
+      clusters whose centroids are within ε_merge; merge if it reduces mean
+      quantisation error (no full DP model comparison needed).
 
 ### Direction Drift Detection
-- Per cluster, maintain an exponential moving average of outer products of nearest-neighbour pairs: Σ_drift ← (1-β)·Σ_drift + β·(x-y)(x-y)^T.
-- When the leading eigenvector of Σ_drift rotates more than θ_drift degrees from the current fan axis, flag the cluster for fan-axis refresh.
-- Fan-axis refresh is local (one cluster, one set of F axes) — O(n_cluster · F) not O(n · F).
+- [x] Per cluster, maintain EMA of outer products: Σ_drift ← (1−β)·Σ_drift + β·v·vᵀ
+      where v = x − y and y is the approximate NN of x found from the just-inserted
+      cones (window=8); falls back to v = x − μ_c when the cone has only one point.
+- [x] Power iteration (5 steps) to find leading eigenvector of Σ_drift.
+- [x] If leading eigenvector is > θ_drift degrees from all fan axes, trigger _local_refresh.
+- [x] _local_refresh: rebuild all cones for cluster c from current live points + current
+      global axes, evict tombstones, reset Σ_drift and tombstone counter.
+- [ ] Per-cluster fan axes (instead of global): recompute F axes from Σ_drift eigenvectors
+      on refresh. Currently kept global (random ≈ geometry-guided at F=128).
 
 ### Sorted-Array Insert
-- Each cone stores a sorted array of (projection_value, global_id) pairs.
-- Insert is `bisect_left` + `list.insert` → O(log n_cone + n_cone) amortised, or O(log n_cone) with a skip-list / B-tree per cone.
-- Total per-point cost: K cones × O(F · log n_cone) = O(K·F·log n_cone).
+- [x] SortedCone C++ class: F sorted `std::vector<std::pair<float,uint32_t>>` per cone.
+- [x] `insert(proj_values, global_id)` — O(F·(log n + n)) via `std::lower_bound` + vector shift.
+- [x] `remove(global_id)` — O(1) tombstone in `std::unordered_set`.
+- [x] `compact()` — O(F·n) physical eviction of tombstoned entries.
+- [x] `query(q_projs, window_size)` — union-window, returns sorted global IDs.
+- [x] `is_covered(q_projs, w, kth_proj)` — early-stopping coverage check.
+- [ ] Replace `std::vector` with B-tree or skip-list per cone when n_cone > 10k to get
+      O(log n) insert instead of O(n) shift.
 
 ### Delete / Update
-- Mark-and-sweep: logical delete with tombstone bit; physical removal during next cluster refresh.
-- Update = delete + insert.
+- [x] `delete(global_id)` — tombstones in all cones via `_point_cones` inverse index;
+      fires `_local_refresh` when cluster tombstone fraction ≥ 10 %.
+- [x] `update(global_id, x)` — delete + insert.
+- [x] `_deleted_mask` boolean array filters tombstoned entries from query fast-path
+      (when fan_probes ≥ F and cluster_global is returned directly).
 
 See **DATABASE_PLAN.md** for the concrete phased implementation plan.
 
 ---
 
-## 2. Distributed Vector Database
+## 2. Persistence Layer (Phase 2 — not started)
 
-### Sharding Strategy
-- Each k-means cluster maps to exactly one shard.
-- Shard owns: raw vectors, cone sorted arrays, fan axes, centroid.
-- Number of shards = number of clusters (or multiple clusters per shard for small datasets).
+### Write-Ahead Log
+- [ ] Append-only binary WAL: one record per mutation (INSERT|DELETE, global_id,
+      vector, timestamp, checksum).
+- [ ] Flush on every insert (or micro-batches of 64 for throughput).
+- [ ] Replay WAL on startup to rebuild in-memory state from last checkpoint.
 
-### Coordinator
-- Holds replicated centroid table (one centroid per cluster, tiny footprint).
-- Holds replicated fan axes per cluster (F · d floats per cluster).
-- Routes queries: find top-K_route nearest centroids, fan-out to those shards.
-- K=2 soft assignment at insert time means boundary points live on 2 shards → recall is preserved across shard boundaries without a separate replication layer.
+### Checkpointing
+- [ ] Checkpoint serializer: header + centroids + axes + per-cluster cone pairs.
+- [ ] mmap-friendly layout for read-only serving while new checkpoint is being written.
+- [ ] Truncate WAL after successful checkpoint.
 
-### Query Fan-In
-- Coordinator sends (query, fp, w) to each selected shard.
-- Shards return their local candidate lists (sorted by projection distance).
-- Coordinator merges with a k-way heap, applies global reranking if needed.
-- Early termination: once merged candidate pool has stable top-K for two rounds, stop fan-in.
+---
 
-### Writes
-- WAL per shard for durability.
-- Insertion hits coordinator → coordinate cluster assignment → forwarded to 1 or 2 shards.
-- Coordinator applies drift-detection heuristic; schedules local fan-axis refresh on the owning shard when triggered.
+## 3. Distributed Architecture (Phase 3 — not started)
 
-### Cluster Splits
-- When a shard's cluster grows beyond N_max, split locally (mini k-means on the shard).
-- Coordinator updates centroid table and fan-axis table atomically (epoch bump).
-- No global IVF rebuild required; other shards are unaffected.
+### Sharding
+- [ ] One cluster per shard; shard owns raw vectors, cone arrays, fan axes, centroid, WAL.
+- [ ] Coordinator holds centroid table + fan-axis table + shard map (tiny footprint).
+- [ ] K=2 soft assignment means boundary points live on 2 shards — cross-shard recall
+      without a separate replication layer.
 
-### Rebalancing
-- Periodic background task compares shard sizes; migrates whole clusters (not individual vectors) between shard hosts.
-- Cluster migration = ship sorted arrays + fan axes + WAL tail, then atomic centroid-table update.
+### Coordinator & Query Fan-Out
+- [ ] Coordinator routes inserts: find top-K_route nearest centroids, forward to shards.
+- [ ] Query fan-out: coordinator fans to cp shards in parallel; shards return local
+      top-k candidates; coordinator k-way heap merge with early termination.
+
+### Cluster Splits & Rebalancing
+- [ ] Cluster split when N_c > N_max: shard runs mini k-means (k=2) locally, ships
+      new centroid pair to coordinator for atomic epoch bump.
+- [ ] Rebalancing: background task migrates whole clusters (not vectors) between shards.
 
 See **DATABASE_PLAN.md** for the phased build sequence and default constants.
 
 ---
 
-## 3. C++ Port
+## 4. C++ Port
 
 ### Done
-- [x] Hot-path kernels ported to C++ with pybind11: `project_data`, `l2_distances`,
-      `union_query` (`ampi/_ext.cpp`, compiled to `_ampi_ext.so`).
+- [x] Hot-path kernels: `project_data`, `l2_distances`, `union_query`
+      (`ampi/_ext.cpp`, compiled to `_ampi_ext.so`).
 - [x] `_kernels.py` transparently falls back to numba JIT if the extension is absent.
+- [x] `SortedCone` class: mutable sorted cone with `insert`, `remove`, `compact`,
+      `query`, `is_covered`, `all_ids`, `from_arrays` — replaces immutable NumPy dicts.
 
 ### Remaining
-- [ ] Mutable cone structures in C++: replace immutable NumPy sorted arrays with
-      `std::vector<std::pair<float,uint32_t>>` + `std::lower_bound` insert.
-      Required for Phase 1 streaming insertion.
 - [ ] SIMD projection: AVX2 dot products over all F axes at once in `project_data`.
-- [ ] Move cluster centroid EMA and drift-check into C++ for insert hot-path.
+- [ ] Move centroid EMA, drift-covariance update, and power iteration into C++ for the
+      insert hot-path (currently Python + numpy, adequate for Phase 1 throughput).
+- [ ] Replace `std::vector` cone with B-tree / skip-list when n_cone > 10k.
 
 ### Notes
 - K=2 QPS collapse on SIFT (0.5–6 vs K=1's 3–19) is a Python/NumPy cache artifact:
   K=2 doubles memory footprint (2×nlist×F sorted arrays), thrashing L3 at 1M×128-D.
-  The algorithmic recall improvement is real (K=2 tops 0.977 vs K=1's 0.973 at equal
-  candidates). The mutable C++ cone layout will close this gap.
+  The algorithmic recall improvement is real (K=2: 0.977 vs K=1: 0.973 at equal
+  candidates). The mutable C++ cone layout will reduce this gap.
 - Python API surface stays identical; tuner.py and benchmark.py unchanged.
 
 ---
 
-## 4. Benchmarking TODOs
+## 5. Benchmarking TODOs
 
 - [x] Fashion-MNIST (60k, d=784)
 - [x] SIFT-128 full 1M
 - [x] Recall@1 / Recall@100 curves (benchmark.py now reports all three)
 - [ ] GIST (1M, d=960) — high-d stress test
 - [ ] Profile per-cluster fan-axis variance to validate drift-detection threshold θ_drift
-- [ ] ann-benchmarks wrapper: `module.py` with `fit` / `set_query_arguments` / `query`, `Dockerfile`, `config.yml`
-- [ ] Target: competitive on MNIST and SIFT before opening ann-benchmarks PR
 
 ---
 
-## 5. Packaging
+## 6. Packaging & Testing
 
 - [x] CI: smoke test on every push/PR (`.github/workflows/ci.yml`)
-- [ ] Pin numba/numpy versions in pyproject.toml
+- [x] CI: stress test covering adversarial add/delete/update scenarios (`tests/stress_test.py`)
+- [x] Pin numba/numpy versions in `pyproject.toml`
 - [ ] Publish to PyPI once recall is competitive and streaming insert is stable
