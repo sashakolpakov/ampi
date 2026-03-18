@@ -91,7 +91,9 @@ See **DATABASE_PLAN.md** for the phased build sequence and default constants.
       `query`, `is_covered`, `all_ids`, `from_arrays` — replaces immutable NumPy dicts.
 
 ### Remaining
-- [ ] SIMD projection: AVX2 dot products over all F axes at once in `project_data`.
+- [x] BLAS-accelerated `project_data`: `ampi/_gemm.hpp` dispatches to Accelerate /
+      OpenBLAS / MKL at compile time; AVX2 / NEON tiled micro-kernel fallback.
+      Measured 20–112× speedup over the old scalar loop (`benchmarks/_bench_sgemm.py`).
 - [ ] Move centroid EMA, drift-covariance update, and power iteration into C++ for the
       insert hot-path (currently Python + numpy, adequate for Phase 1 throughput).
 - [ ] Replace `std::vector` cone with B-tree / skip-list when n_cone > 10k.
@@ -101,7 +103,8 @@ See **DATABASE_PLAN.md** for the phased build sequence and default constants.
   K=2 doubles memory footprint (2×nlist×F sorted arrays), thrashing L3 at 1M×128-D.
   The algorithmic recall improvement is real (K=2: 0.977 vs K=1: 0.973 at equal
   candidates). The mutable C++ cone layout will reduce this gap.
-- Python API surface stays identical; tuner.py and benchmark.py unchanged.
+- Python API surface stays identical; tuner.py unchanged.
+- `benchmark.py` moved to `benchmarks/`.
 
 ---
 
@@ -109,7 +112,7 @@ See **DATABASE_PLAN.md** for the phased build sequence and default constants.
 
 - [x] Fashion-MNIST (60k, d=784)
 - [x] SIFT-128 full 1M
-- [x] Recall@1 / Recall@100 curves (benchmark.py now reports all three)
+- [x] Recall@1 / Recall@100 curves (benchmarks/benchmark.py reports all three)
 - [ ] GIST (1M, d=960) — high-d stress test
 - [ ] Profile per-cluster fan-axis variance to validate drift-detection threshold θ_drift
 

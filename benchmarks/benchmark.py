@@ -23,7 +23,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, ".")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 from ampi import (
     AMPIBinaryIndex,
     AMPIAffineFanIndex,

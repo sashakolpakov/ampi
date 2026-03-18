@@ -209,7 +209,10 @@ P = (X_c − μ_c) · Aᵀ    ∈ ℝ^{N_c × F}
 
 where X_c ∈ ℝ^{N_c × d} is the submatrix of cluster points and
 A ∈ ℝ^{F × d} is the axis matrix.  Cost: O(N_c · F · d) (one GEMM per
-cluster, embarrassingly parallel across clusters).
+cluster, embarrassingly parallel across clusters).  Implemented via
+`ampi::sgemm` (`ampi/_gemm.hpp`), which dispatches to `cblas_sgemm`
+(Accelerate on macOS, OpenBLAS / MKL on Linux/Windows) or a tiled
+AVX2/NEON micro-kernel fallback — 20–112× faster than the prior scalar loop.
 
 **Step 3.** Compute normalised absolute projections:
 
@@ -932,7 +935,7 @@ evaluations, 10 BO steps are run with Expected Improvement acquisition.
 
 **`_scale_params(n, d)`** returns the analytically-derived default query
 parameters (probes, fan_probes, window_size) as a function of (n, d), used
-as the evaluation point during tuning and as the default for `benchmark.py`.
+as the evaluation point during tuning and as the default for `benchmarks/benchmark.py`.
 
 ---
 
