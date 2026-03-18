@@ -48,6 +48,9 @@ regardless of local density). Equivalent to AffineFan with a single cluster.
 
 Hot-path kernels (`project_data`, `l2_distances`, `union_query`) and the mutable
 `SortedCone` data structure are implemented in C++ via pybind11 (`ampi/_ext.cpp`).
+`project_data` dispatches to `cblas_sgemm` via `ampi/_gemm.hpp` (Accelerate on macOS,
+OpenBLAS / MKL on Linux/Windows, or a tiled AVX2/NEON micro-kernel fallback) —
+20–112× faster than a scalar loop at practical dataset sizes.
 A numba JIT fallback is used automatically when the compiled extension is absent.
 
 ---
@@ -138,9 +141,9 @@ per-cluster local refreshes (O(N_c·F·log N_c)) — see [ALGORITHM.md §10](ALG
 for the formal comparison.
 
 ```bash
-python benchmark.py sift
-python benchmark.py mnist
-python benchmark.py all
+python benchmarks/benchmark.py sift
+python benchmarks/benchmark.py mnist
+python benchmarks/benchmark.py all
 ```
 
 Benchmark output includes Recall@1, Recall@10, Recall@100, QPS, and distance ratio for
@@ -192,19 +195,22 @@ ampi/
 │   ├── __init__.py
 │   ├── _kernels.py       # C++ ext wrapper + numba fallback
 │   ├── _ext.cpp          # pybind11 C++ kernels + SortedCone class
+│   ├── _gemm.hpp         # portable SGEMM dispatcher (Accelerate/OpenBLAS/MKL/AVX2/NEON)
 │   ├── affine_fan.py     # AMPIAffineFanIndex (streaming insert/delete/update)
 │   ├── binary.py         # AMPIBinaryIndex
 │   ├── tuner.py          # AFanTuner (GP-BO over alpha, Pareto knee detection)
 │   └── README.md         # package-level pointer to this document
+├── benchmarks/
+│   ├── benchmark.py      # recall@1/10/100 vs FAISS IVF
+│   └── _bench_sgemm.py   # project_data microbenchmark (scalar loop vs SGEMM)
 ├── tests/
 │   ├── smoke_test.py     # fast unit test, no datasets needed
 │   └── stress_test.py    # adversarial add/delete/update/churn scenarios
-├── figures/              # Pareto frontier plots saved by benchmark.py
+├── figures/              # Pareto frontier plots saved by benchmarks/benchmark.py
 ├── .github/workflows/
 │   └── ci.yml            # CI: lint + smoke test on push
-├── benchmark.py          # recall@1/10/100 vs FAISS IVF
 ├── demo.ipynb            # interactive walkthrough
-├── setup.py              # C++ extension build (called by pip)
+├── setup.py              # C++ extension build + BLAS detection
 ├── pyproject.toml        # project metadata and dependencies
 ├── ALGORITHM.md          # full mathematical algorithm description
 ├── DATABASE_PLAN.md      # phased implementation plan (persistence + distributed DB)

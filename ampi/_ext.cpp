@@ -18,6 +18,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 
+#include "_gemm.hpp"   // portable SGEMM dispatcher (Accelerate / OpenBLAS / MKL / native SIMD)
+
 #include <algorithm>   // std::max, std::min, std::lower_bound, std::sort, std::remove_if
 #include <cstdint>
 #include <limits>
@@ -40,28 +42,31 @@ static inline int64_t lb_float(const float* arr, int64_t n, float val) {
 }
 
 // ── project_data ─────────────────────────────────────────────────────────────
+//
+// Computes out (L×n) = proj_dirs (L×d) @ data (n×d)^T.
+// Delegated to ampi::sgemm which dispatches to the best available backend:
+//   Accelerate / OpenBLAS / MKL → cblas_sgemm
+//   fallback                    → tiled AVX2 / NEON / scalar micro-kernel
 
 py::array_t<float> project_data(
     py::array_t<float, py::array::c_style | py::array::forcecast> data,
     py::array_t<float, py::array::c_style | py::array::forcecast> proj_dirs)
 {
-    auto D  = data.unchecked<2>();
-    auto P  = proj_dirs.unchecked<2>();
-    const int64_t n = D.shape(0), d = D.shape(1), L = P.shape(0);
+    auto D = data.unchecked<2>();
+    auto P = proj_dirs.unchecked<2>();
+    const int n = static_cast<int>(D.shape(0));
+    const int d = static_cast<int>(D.shape(1));
+    const int L = static_cast<int>(P.shape(0));
 
-    auto out     = py::array_t<float>({L, n});
-    auto out_buf = out.mutable_unchecked<2>();
+    auto out = py::array_t<float>({(py::ssize_t)L, (py::ssize_t)n});
 
-    for (int64_t i = 0; i < L; ++i) {
-        const float* dir = &P(i, 0);
-        for (int64_t k = 0; k < n; ++k) {
-            const float* row = &D(k, 0);
-            float dot = 0.f;
-            for (int64_t j = 0; j < d; ++j)
-                dot += dir[j] * row[j];
-            out_buf(i, k) = dot;
-        }
-    }
+    // C (L×n) = P (L×d) @ D^T (d×n)   →  transA=false, transB=true
+    ampi::sgemm(L, n, d,
+                &P(0, 0), d,    // A = proj_dirs, lda = d
+                &D(0, 0), d,    // B = data,      ldb = d  (transposed)
+                out.mutable_data(), n,
+                /*transA=*/false, /*transB=*/true);
+
     return out;
 }
 
