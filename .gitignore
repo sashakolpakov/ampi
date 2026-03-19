@@ -217,3 +217,8 @@ Thumbs.db
 
 # Data folder
 data/
+
+# PNGs everywhere except /figures (benchmark output lives there)
+*.png
+!figures/*.png
+

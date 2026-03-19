@@ -1,10 +1,23 @@
-# AMPI — Affine Multi-Projection Index
+# AMPI — Adaptive Multi-Projection Index
 
-Approximate nearest-neighbour search via k-means partition + random affine fan cones
-+ sorted-projection candidate selection.  Supports streaming `add` / `delete` /
-`update` without a full rebuild.
+ANN index for **live, mutable vector collections**.  Insert, delete, and update
+individual vectors at any time — no rebuild required.
 
-For a full mathematical treatment of the algorithm see **[ALGORITHM.md](ALGORITHM.md)**.
+Most ANN indexes assume the dataset is static or nearly so.  HNSW requires a full
+rebuild (minutes to hours) to recover quality after significant churn, and has no
+true delete — only a `mark_deleted` that leaves ghost nodes polluting every search
+path.  FAISS IVF drifts silently as data shifts and eventually needs a full global
+retrain.  AMPI is designed around the assumption that your data changes continuously.
+
+**How AMPI stays fresh without rebuilding:**
+- Inserts and deletes are O(1) amortised — no sorted arrays are rebuilt globally.
+- Per-cluster covariance drift detection (EMA + power iteration) triggers a
+  *local* cone refresh only for the affected cluster — O(N_c · F · d) vs
+  O(T · n · M · d) for a full IVF retrain.
+- Tombstone compaction is automatic when a cluster's delete fraction exceeds 10%.
+
+For a full mathematical treatment see **[ALGORITHM.md](ALGORITHM.md)**.
+For benchmark results see **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ---
 
@@ -24,25 +37,22 @@ The main index. Three-level structure:
    select `fp` best-aligned cones per cluster, collect candidates from a window of
    `w` entries around the query's projection rank on each axis, L2-rerank the union.
    A Cauchy-Schwarz coverage certificate (`‖x−q‖ ≥ |proj_a(x) − proj_a(q)|`) allows
-   early stopping: when the window boundary gap on any axis exceeds the current k-th
-   distance, no unvisited point can improve the result.
+   early stopping when the window boundary gap exceeds the current k-th distance.
 
-**Streaming mutations** are fully supported without rebuilding the global index:
+**Streaming mutations** (no global rebuild at any step):
 
-- `add(x)` — insert one vector; returns its `global_id`.
-- `delete(global_id)` — logical tombstone; auto-compacts when the cluster's tombstone
-  fraction exceeds 10%.
-- `update(global_id, x)` — delete + insert.
-
-Per-cluster drift detection (covariance EMA + power iteration) triggers a local cone
-refresh when the dominant displacement direction rotates > 15° from all fan axes.
+| Operation | Cost | Notes |
+|---|---|---|
+| `add(x)` | O(M·d + K·F·n_f) | inserts into sorted arrays in affected cluster |
+| `delete(global_id)` | O(K·F) | tombstone; auto-compacts at 10% threshold |
+| `update(global_id, x)` | delete + add | returns new global_id |
+| local refresh | O(N_c·F·d) | triggered by drift or compaction; one cluster only |
 
 ### AMPIBinaryIndex
 
 Simpler baseline: `L` random projections over the full dataset, sorted. Query collects
 a window of `w` points around the query's rank on each projection, returns the union.
-No partition; density-adaptive (window always covers exactly `2w` points per projection
-regardless of local density). Equivalent to AffineFan with a single cluster.
+No partition; density-adaptive. Equivalent to AffineFan with a single cluster.
 
 ### Backend
 
@@ -122,32 +132,63 @@ of `(probes, fan_probes, window_size)` configs — one per target recall level.
 
 ## Benchmark
 
-SIFT-1M (n=1M, d=128) and MNIST (n=60k, d=784), 200 held-out queries, Recall@10.
+Full results and analysis: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
-| Method | Recall@10 | Recall@100 | Candidates |
+### Static recall (single build, no mutations)
+
+AMPI is competitive with FAISS IVF on candidate efficiency and beats it on GloVe.
+HNSW is faster in raw QPS — but only on a freshly built, static index.
+
+| Dataset | IVF R@10 | IVF cands | AFan R@10 | AFan cands |
+|---|---:|---:|---:|---:|
+| MNIST 60k | 0.996 | 6,125 | 0.981 | **2,120** (3× fewer) |
+| Fashion-MNIST 60k | 1.000 | 6,125 | 1.000 | **3,055** (2× fewer) |
+| SIFT 1M | 0.992 | 50,000 | 0.990 | **39,703** (20% fewer) |
+| GloVe 1.18M | 0.879 | 54,400 | **0.897** | 59,929 (wins on recall) |
+
+### The rebuild problem
+
+HNSW's headline QPS numbers assume a freshly-built, never-modified index.
+In a live system, this assumption breaks quickly:
+
+| Operation | HNSW | FAISS IVF | AMPI |
 |---|---|---|---|
-| IVF nprobe=50 (SIFT) | 0.994 | 0.986 | 50,000 |
-| AFan K=1 cp=10 fp=128 (SIFT) | 0.992 | 0.984 | 109,468 |
-| AFan K=1 cp=20 fp=128 (SIFT) | 0.999 | 0.999 | 209,880 |
-| IVF nprobe=50 (MNIST) | 0.998 | 0.999 | 12,250 |
-| AFan K=1 cp=20 fp=64 (MNIST) | 0.994 | 0.991 | 10,139 |
+| Insert | graph degrades silently | O(1) append, no quality loss | O(1) amortised, guaranteed membership |
+| Delete | `mark_deleted` only — ghost nodes pollute graph | unsupported or full scan | O(1) tombstone, auto-compacted |
+| Update | mark + insert, compounding both problems | unsupported | delete + insert |
+| Recovery from drift | **full rebuild** (4–6 min at 1M vectors) | **full global retrain** | per-cluster local refresh only |
 
-AFan matches IVF recall on both datasets. On MNIST it does so with *fewer* candidates
-than IVF. On SIFT it requires ~2× more candidates.
+HNSW's speed is real — if you build once and never touch it again.  If your dataset
+has any churn, you are either accepting silent quality degradation or paying full
+rebuild costs on a schedule.
 
-Both support cheap inserts without a global rebuild. As the data distribution shifts,
-IVF eventually needs a full global retrain (O(T·n·M·d)), while AFan triggers only
-per-cluster local refreshes (O(N_c·F·log N_c)) — see [ALGORITHM.md §10](ALGORITHM.md)
-for the formal comparison.
+### Running the benchmarks
+
+Dataset files are downloaded automatically on first run.
 
 ```bash
-python benchmarks/benchmark.py sift
-python benchmarks/benchmark.py mnist
-python benchmarks/benchmark.py all
+python benchmarks/benchmark_vs_faiss.py all   # vs FAISS Flat L2 + IVF
+python benchmarks/benchmark_vs_hnsw.py all    # vs hnswlib HNSW M=16
+python benchmarks/benchmark_vs_faiss.py all --force  # re-download data
 ```
 
-Benchmark output includes Recall@1, Recall@10, Recall@100, QPS, and distance ratio for
-each method, with Pareto frontier plots saved to `figures/`.
+**Datasets** (downloaded automatically from [ann-benchmarks.com](http://ann-benchmarks.com)):
+
+| Key | Description | Size |
+|---|---|---|
+| `gauss` | Synthetic N(0,1), n=10k, d=128 | — (generated) |
+| `mnist` | MNIST digits, n=60k, d=784, Euclidean | ~55 MB |
+| `fashion` | Fashion-MNIST, n=60k, d=784, Euclidean | ~55 MB |
+| `sift` | SIFT descriptors, n=1M, d=128, Euclidean | ~350 MB |
+| `glove` | GloVe Twitter, n=1.18M, d=100, cosine | ~500 MB |
+
+To download manually or inspect which files are present:
+
+```bash
+python benchmarks/download_data.py           # download all (~1 GB)
+python benchmarks/download_data.py mnist     # specific dataset
+python benchmarks/download_data.py --list    # check status without downloading
+```
 
 ---
 
@@ -201,18 +242,22 @@ ampi/
 │   ├── tuner.py          # AFanTuner (GP-BO over alpha, Pareto knee detection)
 │   └── README.md         # package-level pointer to this document
 ├── benchmarks/
-│   ├── benchmark.py      # recall@1/10/100 vs FAISS IVF
-│   └── _bench_sgemm.py   # project_data microbenchmark (scalar loop vs SGEMM)
+│   ├── benchmark_vs_faiss.py  # recall@1/10/100 vs FAISS (Flat L2 + IVF)
+│   ├── benchmark_vs_hnsw.py   # recall@1/10/100 vs hnswlib
+│   ├── _bench_common.py       # shared dataset loaders, evaluation, AMPI builder
+│   ├── download_data.py       # dataset downloader (auto-called by benchmarks)
+│   └── _bench_sgemm.py        # project_data microbenchmark (scalar loop vs SGEMM)
 ├── tests/
 │   ├── smoke_test.py     # fast unit test, no datasets needed
 │   └── stress_test.py    # adversarial add/delete/update/churn scenarios
-├── figures/              # Pareto frontier plots saved by benchmarks/benchmark.py
+├── figures/              # Pareto frontier plots saved by benchmark scripts (gitignored)
 ├── .github/workflows/
 │   └── ci.yml            # CI: lint + smoke test on push
 ├── demo.ipynb            # interactive walkthrough
 ├── setup.py              # C++ extension build + BLAS detection
 ├── pyproject.toml        # project metadata and dependencies
 ├── ALGORITHM.md          # full mathematical algorithm description
+├── BENCHMARKS.md         # full benchmark results (FAISS + hnswlib)
 ├── DATABASE_PLAN.md      # phased implementation plan (persistence + distributed DB)
 ├── TODO.md               # task tracking
 └── LICENSE               # MIT

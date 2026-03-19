@@ -24,8 +24,10 @@ max_{x ∈ S} ‖x − q‖₂  ≤  (1 + ε) · min_{x ∈ X\S} ‖x − q‖�
 ```
 
 for some approximation ratio ε > 0.  AMPI targets recall-at-k rather than
-a per-query worst-case ε guarantee; empirically recall@10 ≥ 0.95 on SIFT-1M
-at ~25× speedup over exhaustive search.
+a per-query worst-case ε guarantee; empirically recall@10 = 0.990 on SIFT-1M
+at ~25× fewer candidates than exhaustive search (39 703 vs 1 000 000),
+and recall@10 = 0.981 on MNIST-60k with ~3× fewer candidates than IVF.
+See [BENCHMARKS.md](BENCHMARKS.md) for full results.
 
 ### 1.2 Cosine similarity variant
 
@@ -901,6 +903,21 @@ n = 10k–1M.
 | Distribution shift | full global retrain | per-cluster local refresh |
 | Memory overhead | n/M avg list pointers | K·n·F × 8 bytes |
 
+**Empirical candidate comparison (FAISS IVF nprobe=50 vs AFan K=1 best recall,
+200 queries, single-threaded):**
+
+| Dataset | IVF R@10 | IVF cands | AFan R@10 | AFan cands | Cand ratio |
+|---|---:|---:|---:|---:|---:|
+| MNIST 60k | 0.996 | 6,125 | 0.981 | 2,120 | **2.9× fewer** |
+| Fashion-MNIST 60k | 1.000 | 6,125 | 1.000 | 3,055 | **2.0× fewer** |
+| SIFT 1M | 0.992 | 50,000 | 0.990 | 39,703 | **1.26× fewer** |
+| GloVe 1.18M (cosine) | 0.879 | 54,400 | **0.897** | 59,929 | AFan wins on recall |
+
+On MNIST and Fashion-MNIST, AFan achieves near-equivalent recall with 2–3× fewer
+distance computations.  On GloVe (cosine, non-uniform density), AFan's geometric
+partitioning outperforms IVF's Voronoi assignment by ~2% R@10.  Full results in
+[BENCHMARKS.md](BENCHMARKS.md).
+
 The extra memory for sorted arrays (K·F×8 bytes/point = 1 KB/point at
 K=1, F=128) is the price of the second filtering stage, which reduces
 candidates by factor ≈ F/(fp·2w·M/n) relative to IVF.
@@ -935,7 +952,9 @@ evaluations, 10 BO steps are run with Expected Improvement acquisition.
 
 **`_scale_params(n, d)`** returns the analytically-derived default query
 parameters (probes, fan_probes, window_size) as a function of (n, d), used
-as the evaluation point during tuning and as the default for `benchmarks/benchmark.py`.
+as the evaluation point during tuning and as the default starting point for
+the parameter sweep in `benchmarks/benchmark_vs_faiss.py` and
+`benchmarks/benchmark_vs_hnsw.py`.
 
 ---
 
