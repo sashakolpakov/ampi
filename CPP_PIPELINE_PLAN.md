@@ -5,32 +5,28 @@ Created: 2026-03-19
 
 ---
 
-## Current State
+## Current State (as of 2026-03-19)
 
-### Already in C++ (`ampi/_ext.cpp`)
+### In C++ (`ampi/_ext.cpp`) — completed
 
-| Symbol | What it does |
-|--------|-------------|
-| `project_data(data, proj_dirs)` | BLAS-dispatched SGEMM: (n,d)×(F,d)ᵀ → (F,n) |
-| `l2_distances(data, query, cands)` | Squared L2 from query to m candidates |
-| `union_query(sorted_idxs, sorted_projs, q_projs, w)` | Binary-search + window union on static sorted arrays |
-| `SortedCone` class | Mutable per-cone sorted structure: `insert`, `remove`, `compact`, `size`, `all_ids`, `query`, `is_covered` |
+| Symbol | What it does | Phase |
+|--------|-------------|-------|
+| `project_data(data, proj_dirs)` | BLAS-dispatched SGEMM: (n,d)×(F,d)ᵀ → (F,n) | pre-1 |
+| `l2_distances(data, query, cands)` | Squared L2 from query to m candidates | pre-1 |
+| `union_query(sorted_idxs, sorted_projs, q_projs, w)` | Binary-search + window union on static sorted arrays | pre-1 |
+| `SortedCone` class | Mutable per-cone sorted structure: `insert`, `remove`, `compact`, `size`, `all_ids`, `query`, `is_covered` | pre-1 |
+| `best_clusters(centroids, q, probes)` | Nearest-centroid top-K via nth_element | 1 ✅ |
+| `best_fan_cones(axes, q_centered, fan_probes)` | Top-K cones by \|norm proj\| via nth_element | 1 ✅ |
+| `update_drift_and_check(sigma, axes, v, beta, theta)` | Fused EMA + 5-step power iteration; returns refresh flag | 2 ✅ |
+| `AMPIIndex` class | Owns all mutable state; `add()`, `remove()`, `_local_refresh()`, `_build_cones()` fully in C++ | 3 ✅ |
 
 ### Still in Python (`ampi/affine_fan.py`)
 
-Everything that orchestrates the pipeline across clusters and cones:
-
-| Python code | Lines | Hot? |
-|-------------|-------|------|
-| `_best_clusters(q, probes)` — nearest-centroid top-K | 342–344 | Every query |
-| `_best_fan_cones(q_centered, fan_probes)` — top-K cones by |norm proj| | 346–351 | Every query |
-| `query()` — adaptive window expansion loop + coverage check | 628–705 | Every query |
-| `query_candidates()` — candidate pool before rerank | 573–626 | Every query |
-| `add(x)` — buffer growth, cluster assign, project, cone insert, centroid EMA, drift EMA | 418–517 | Every insert |
-| `delete(global_id)` — tombstone + compaction trigger | 519–554 | Every delete |
-| `_local_refresh(c)` — rebuild cluster cones from live points | 370–414 | Occasional |
-| `_check_drift(c)` — 5-step power iteration on Σ_drift | 353–368 | Every insert |
-| `_mini_batch_kmeans` + `_build_cones_for_cluster` | 134–238 | Build-time only |
+| Python code | Hot? | Target phase |
+|-------------|------|-------------|
+| `query()` — adaptive window expansion loop + coverage check | Every query | 4 |
+| `query_candidates()` — candidate pool before rerank | Every query | 4 |
+| `_mini_batch_kmeans` + `_build_cones_for_cluster` | Build-time only | 5 (partial) |
 
 ---
 
@@ -75,7 +71,7 @@ State moved from Python dicts/lists to C++ structs:
 
 ---
 
-### Phase 1 — Move `_best_clusters` and `_best_fan_cones` to C++
+### Phase 1 — Move `_best_clusters` and `_best_fan_cones` to C++ ✅ DONE
 
 **Goal:** Eliminate the two NumPy calls on every query.
 **Scope:** Add two standalone C++ functions; no class yet.
@@ -110,7 +106,7 @@ new C++ functions when `_HAS_EXT` is True, keep NumPy fallback otherwise.
 
 ---
 
-### Phase 2 — Move drift covariance EMA and power iteration to C++
+### Phase 2 — Move drift covariance EMA and power iteration to C++ ✅ DONE
 
 **Goal:** Eliminate the d×d NumPy outer product + 5-step matrix-vector product
 on every `add()`.  At d=128 this is 128²=16k multiplications per insert, all in
@@ -165,7 +161,7 @@ without copy.
 
 ---
 
-### Phase 3 — C++ `AMPIIndex` class: `add` and `delete`
+### Phase 3 — C++ `AMPIIndex` class: `add` and `delete` ✅ DONE
 
 **Goal:** Move the full `add()` and `delete()` orchestration into a C++ class,
 eliminating all per-insert Python overhead (GIL, dict lookups, np.append, etc.).
