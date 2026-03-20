@@ -428,6 +428,78 @@ def heavy_churn_recall():
         assert not bad, f"deleted ids {bad} returned during churn"
 
 
+# ── buffer / compaction / drift ───────────────────────────────────────────────
+
+@test
+def buffer_grows_past_initial_capacity():
+    """Insert enough points to exceed the 1024-point initial headroom."""
+    rng  = np.random.default_rng(3)
+    data = rng.standard_normal((50, 32)).astype('float32')
+    idx  = AMPIAffineFanIndex(data, nlist=4, num_fans=8, seed=0)
+    n0   = idx.n
+    for _ in range(1100):
+        idx.add(rng.standard_normal(32).astype('float32'))
+    assert idx.n == n0 + 1100, f"n mismatch: {idx.n} != {n0 + 1100}"
+    if idx._cpp is not None:
+        assert idx._cpp.n == n0 + 1100, "C++ n mismatch after buffer growth"
+
+
+@test
+def compaction_triggers_on_high_tombstone_fraction():
+    """Delete >threshold% of a cluster; cluster_global must contain only live points."""
+    from ampi.affine_fan import _TOMBSTONE_THRESHOLD as _TT
+    rng  = np.random.default_rng(4)
+    data = rng.standard_normal((1000, 32)).astype('float32')
+    idx  = AMPIAffineFanIndex(data, nlist=4, num_fans=8, seed=0)
+
+    if idx._cpp is not None:
+        c0_ids = idx._cpp.get_cluster_global(0)
+    else:
+        c0_ids = np.array(idx.cluster_global[0])
+    n_c0 = len(c0_ids)
+    if n_c0 < 15:
+        print("[SKIP] compaction_triggers_on_high_tombstone_fraction: cluster 0 too small")
+        return
+
+    n_del = int(n_c0 * _TT) + 1
+    for gid in c0_ids[:n_del]:
+        idx.delete(int(gid))
+
+    if idx._cpp is not None:
+        c0_after = idx._cpp.get_cluster_global(0)
+        for gid in c0_after:
+            assert not idx._deleted_mask[int(gid)], \
+                f"deleted point {gid} still in cluster_global after compaction"
+        assert len(c0_after) == n_c0 - n_del, \
+            f"cluster_global size after compaction: {len(c0_after)} != {n_c0 - n_del}"
+
+
+@test
+def drift_detection_fires():
+    """Insert many points along e_0; index must remain queryable after drift refresh."""
+    rng  = np.random.default_rng(99)
+    data = rng.standard_normal((1000, 32)).astype('float32')
+    idx  = AMPIAffineFanIndex(data, nlist=10, num_fans=16, seed=99)
+
+    e0       = np.zeros(32, dtype='float32')
+    e0[0]    = 1.0
+    # Build a direction with low cosine to all fan axes
+    axes = idx.axes
+    perp = rng.standard_normal(32).astype('float32')
+    for _ in range(20):
+        for ax in axes:
+            perp -= float(perp @ ax) * ax
+        perp /= np.linalg.norm(perp)
+
+    for _ in range(300):
+        x = perp * float(rng.uniform(0.5, 2.0)) + rng.standard_normal(32).astype('float32') * 0.05
+        idx.add(x.astype('float32'))
+
+    q = perp + rng.standard_normal(32).astype('float32') * 0.1
+    _, _, ids = idx.query(q.astype('float32'), k=5, window_size=200, probes=10, fan_probes=8)
+    assert len(ids) == 5, "query after drift inserts returned wrong number of results"
+
+
 # ── runner ────────────────────────────────────────────────────────────────────
 
 def main():
