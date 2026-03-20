@@ -322,6 +322,73 @@ public:
     }
 };
 
+// ── update_drift_and_check ────────────────────────────────────────────────────
+//
+// Fused drift EMA + 5-step power iteration.
+//
+// sigma        : (d*d,) float64, modified in-place (row-major flattened d×d)
+// axes         : (F, d)  float32
+// displacement : (d,)    float64
+// beta         : EMA decay (e.g. 0.01)
+// theta_deg    : angle threshold in degrees (e.g. 15.0)
+//
+// Performs:  Σ ← (1-β)Σ + β·v·vᵀ   then 5 power-iteration steps.
+// Returns true if the leading eigenvector is > theta_deg from all fan axes,
+// meaning _local_refresh should be triggered.
+
+bool update_drift_and_check(
+    py::array_t<double, py::array::c_style | py::array::forcecast> sigma,
+    py::array_t<float,  py::array::c_style | py::array::forcecast> axes,
+    py::array_t<double, py::array::c_style | py::array::forcecast> displacement,
+    double beta, double theta_deg)
+{
+    auto S  = sigma.mutable_unchecked<1>();
+    auto A  = axes.unchecked<2>();
+    auto V  = displacement.unchecked<1>();
+    const int64_t d = A.shape(1);
+    const int64_t F = A.shape(0);
+
+    // Σ ← (1-β)Σ + β·v·vᵀ  (in-place, row-major)
+    const double omB = 1.0 - beta;
+    for (int64_t i = 0; i < d; ++i) {
+        double vi = V(i);
+        for (int64_t j = 0; j < d; ++j)
+            S(i * d + j) = omB * S(i * d + j) + beta * vi * V(j);
+    }
+
+    // Power iteration — warm-start with axes[0]
+    std::vector<double> v(d), tmp(d);
+    for (int64_t j = 0; j < d; ++j)
+        v[j] = static_cast<double>(A(0, j));
+
+    for (int iter = 0; iter < 5; ++iter) {
+        for (int64_t i = 0; i < d; ++i) {
+            double acc = 0.0;
+            for (int64_t j = 0; j < d; ++j)
+                acc += S(i * d + j) * v[j];
+            tmp[i] = acc;
+        }
+        double norm2 = 0.0;
+        for (int64_t j = 0; j < d; ++j) norm2 += tmp[j] * tmp[j];
+        if (norm2 < 1e-24) return false;
+        double inv_norm = 1.0 / std::sqrt(norm2);
+        for (int64_t j = 0; j < d; ++j) v[j] = tmp[j] * inv_norm;
+    }
+
+    // cos_max = max |axis_l · v| over all axes
+    double cos_max = 0.0;
+    for (int64_t l = 0; l < F; ++l) {
+        double dot = 0.0;
+        for (int64_t j = 0; j < d; ++j)
+            dot += static_cast<double>(A(l, j)) * v[j];
+        double ab = std::abs(dot);
+        if (ab > cos_max) cos_max = ab;
+    }
+
+    const double cos_theta = std::cos(theta_deg * (3.14159265358979323846 / 180.0));
+    return cos_max < cos_theta;
+}
+
 // ── best_clusters ─────────────────────────────────────────────────────────────
 //
 // Returns (probes,) int32 — indices of the `probes` nearest centroids to q,
@@ -433,6 +500,16 @@ PYBIND11_MODULE(_ampi_ext, m) {
           "Union-mode candidate selection via sorted projections",
           py::arg("sorted_idxs"), py::arg("sorted_projs"),
           py::arg("q_projs"), py::arg("window_size"));
+    m.def("update_drift_and_check", &update_drift_and_check,
+          "Fused drift EMA + power iteration.\n\n"
+          "  sigma        : (d*d,) float64, modified in-place\n"
+          "  axes         : (F, d)  float32\n"
+          "  displacement : (d,)    float64\n"
+          "  beta         : float   EMA decay\n"
+          "  theta_deg    : float   refresh threshold in degrees\n"
+          "Returns True if _local_refresh should be triggered.",
+          py::arg("sigma"), py::arg("axes"), py::arg("displacement"),
+          py::arg("beta"), py::arg("theta_deg"));
     m.def("best_clusters", &best_clusters,
           "Indices of the `probes` nearest centroids to q, sorted nearest-first.\n\n"
           "  centroids : (nlist, d) float32\n"

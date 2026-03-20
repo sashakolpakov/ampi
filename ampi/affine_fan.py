@@ -40,9 +40,10 @@ from ._kernels import jit_union_query, l2_distances
 
 try:
     from ampi._ampi_ext import (
-        SortedCone     as _SortedCone,
-        best_clusters  as _cpp_best_clusters,
-        best_fan_cones as _cpp_best_fan_cones,
+        SortedCone             as _SortedCone,
+        best_clusters          as _cpp_best_clusters,
+        best_fan_cones         as _cpp_best_fan_cones,
+        update_drift_and_check as _cpp_update_drift_and_check,
     )
     _HAS_SORTED_CONE = True
     _HAS_EXT = True
@@ -255,13 +256,17 @@ class AMPIAffineFanIndex:
     seed         : RNG seed
     cone_top_k   : K — soft assignment multiplicity (1 = hard argmax)
     metric       : 'l2' or 'cosine'
+    drift_theta  : angle threshold in degrees at which a cluster's cones are
+                   rebuilt (default: 15.0).  Lower values = more frequent
+                   rebuilds; higher values = more drift tolerance.
     """
 
     def __init__(self, data, nlist=None, num_fans=16, seed=0, cone_top_k=1,
-                 metric='l2'):
+                 metric='l2', drift_theta=_DRIFT_THETA):
         if metric not in ('l2', 'cosine'):
             raise ValueError(f"metric must be 'l2' or 'cosine', got {metric!r}")
         self.metric = metric
+        self.drift_theta = float(drift_theta)
 
         self.data = np.ascontiguousarray(data, dtype=np.float32)
         if metric == 'cosine':
@@ -331,9 +336,9 @@ class AMPIAffineFanIndex:
                                             dtype=np.int64)
         self._cluster_tombstones = np.zeros(self.nlist, dtype=np.int64)
 
-        # Per-cluster drift covariance EMA (d×d, float64).
-        self._sigma_drift = [np.zeros((self.d, self.d), dtype=np.float64)
-                             for _ in range(self.nlist)]
+        # Per-cluster drift covariance EMA — flat (nlist, d*d) float64.
+        # Each row is a row-major flattened d×d covariance matrix.
+        self._sigma_drift = np.zeros((self.nlist, self.d * self.d), dtype=np.float64)
 
     # ── internal helpers ──────────────────────────────────────────────────────
 
@@ -362,8 +367,9 @@ class AMPIAffineFanIndex:
 
     def _check_drift(self, c):
         """Power iteration on Σ_drift[c]; trigger _local_refresh if the
-        leading eigenvector is > _DRIFT_THETA degrees from all fan axes."""
-        sig = self._sigma_drift[c]
+        leading eigenvector is > _DRIFT_THETA degrees from all fan axes.
+        Python fallback — only called when C++ ext is unavailable."""
+        sig = self._sigma_drift[c].reshape(self.d, self.d)
         # Warm-start with the first axis (likely already well-aligned).
         v = sig @ self.axes[0].astype(np.float64)
         for _ in range(5):
@@ -374,7 +380,7 @@ class AMPIAffineFanIndex:
             v /= norm
         # Maximum cosine similarity between v and any current fan axis.
         cos_max = float(np.max(np.abs(self.axes.astype(np.float64) @ v)))
-        if cos_max < np.cos(np.radians(_DRIFT_THETA)):
+        if cos_max < np.cos(np.radians(self.drift_theta)):
             self._local_refresh(c)
 
     def _local_refresh(self, c):
@@ -518,11 +524,17 @@ class AMPIAffineFanIndex:
 
                 displacement = (x - approx_nn) if approx_nn is not None else centered
                 v = displacement.astype(np.float64)
-                self._sigma_drift[c] = (
-                    (1.0 - _DRIFT_BETA) * self._sigma_drift[c]
-                    + _DRIFT_BETA * np.outer(v, v)
-                )
-                self._check_drift(c)
+                if _HAS_EXT:
+                    if _cpp_update_drift_and_check(
+                            self._sigma_drift[c], self.axes, v,
+                            _DRIFT_BETA, self.drift_theta):
+                        self._local_refresh(c)
+                else:
+                    self._sigma_drift[c] = (
+                        (1.0 - _DRIFT_BETA) * self._sigma_drift[c]
+                        + _DRIFT_BETA * np.outer(v, v).ravel()
+                    )
+                    self._check_drift(c)
 
         return global_id
 
