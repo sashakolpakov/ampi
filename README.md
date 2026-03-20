@@ -56,13 +56,15 @@ No partition; density-adaptive. Equivalent to AffineFan with a single cluster.
 
 ### Backend
 
-Hot-path kernels (`project_data`, `l2_distances`, `union_query`), the mutable
-`SortedCone` data structure, and the full streaming-mutation class `AMPIIndex`
-(add, delete, drift EMA, compaction) are implemented in C++ via pybind11 (`ampi/_ext.cpp`).
-`project_data` dispatches to `cblas_sgemm` via `ampi/_gemm.hpp` (Accelerate on macOS,
-OpenBLAS / MKL on Linux/Windows, or a tiled AVX2/NEON micro-kernel fallback) —
-20–112× faster than a scalar loop at practical dataset sizes.
-A numba JIT fallback is used automatically when the compiled extension is absent.
+The entire hot path is implemented in C++ via pybind11 (`ampi/_ext.cpp`):
+`SortedCone`, `AMPIIndex` (owns all mutable state — data buffer, cones, drift
+covariance), `add`, `remove`, `batch_add`, `batch_delete`, the full adaptive
+query loop, cone build, and local refresh.  A `std::shared_mutex` allows
+concurrent reads with serialised writes.  `project_data` dispatches to
+`cblas_sgemm` via `ampi/_gemm.hpp` (Accelerate on macOS, OpenBLAS / MKL on
+Linux/Windows, or a tiled AVX2/NEON micro-kernel fallback) — 20–112× faster
+than a scalar loop.  A numba JIT fallback is used automatically when the
+compiled extension is absent.
 
 ---
 
@@ -259,7 +261,6 @@ ampi/
 ├── pyproject.toml        # project metadata and dependencies
 ├── ALGORITHM.md          # full mathematical algorithm description
 ├── BENCHMARKS.md         # full benchmark results (FAISS + hnswlib)
-├── CPP_PIPELINE_PLAN.md  # phased plan for moving the full pipeline to C++ (branch: cpp-pipeline)
 ├── DATABASE_PLAN.md      # phased implementation plan (persistence + distributed DB)
 ├── TODO.md               # task tracking
 └── LICENSE               # MIT
@@ -267,13 +268,11 @@ ampi/
 
 ## Roadmap
 
-Streaming insert/delete/update is complete. The C++ pipeline (routing, drift EMA, mutable
-index class) is complete through Phase 3; the query loop moves to C++ next.
+The full hot path is in C++: routing, drift EMA, mutable index state, query loop,
+`batch_add`/`batch_delete`, and concurrent reader/writer locking (`std::shared_mutex`).
 
 Near-term milestones:
 
-- **C++ Phase 4** — move `query()` into `AMPIIndex::query()` in C++; eliminate the
-  Python adaptive-window loop. See `CPP_PIPELINE_PLAN.md`.
 - **Persistence** — WAL + checkpoint serializer for single-node durability.
 - **Distributed** — coordinator + multi-shard query fan-out, cluster splits, rebalancing.
 

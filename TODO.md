@@ -81,42 +81,32 @@ See **DATABASE_PLAN.md** for the phased build sequence and default constants.
 
 ---
 
-## 4. C++ Port
+## 4. C++ Port — complete
 
-See `CPP_PIPELINE_PLAN.md` (branch `cpp-pipeline`) for the detailed phased plan.
+All phases merged (branch `cpp-pipeline`).
 
-### Done
-- [x] Hot-path kernels: `project_data`, `l2_distances`, `union_query`
-      (`ampi/_ext.cpp`, compiled to `_ampi_ext.so`).
-- [x] `_kernels.py` transparently falls back to numba JIT if the extension is absent.
-- [x] `SortedCone` class: mutable sorted cone with `insert`, `remove`, `compact`,
-      `query`, `is_covered`, `all_ids`, `from_arrays`.
-- [x] BLAS-accelerated `project_data`: `ampi/_gemm.hpp` dispatches to Accelerate /
-      OpenBLAS / MKL at compile time; AVX2 / NEON tiled micro-kernel fallback.
-      Measured 20–112× speedup over the old scalar loop (`benchmarks/_bench_sgemm.py`).
-- [x] `best_clusters`, `best_fan_cones`: nearest-centroid and cone selection via
-      C++ nth_element — replaces NumPy argsort on every query (Phase 1).
-- [x] `update_drift_and_check`: fused EMA + 5-step power iteration in C++;
-      operates in-place on flat (nlist, d×d) sigma buffer (Phase 2).
-- [x] `AMPIIndex` C++ class: owns all mutable index state; `add()`, `remove()`,
-      `_local_refresh()`, `_build_cones()` fully in C++. Python
-      `AMPIAffineFanIndex` delegates add/delete/update to C++ (Phase 3).
+- [x] Hot-path kernels: `project_data`, `l2_distances`, `union_query`.
+- [x] `_kernels.py` falls back to numba JIT when the extension is absent.
+- [x] `SortedCone`: mutable sorted cone with `insert`, `remove`, `compact`, `query`, `is_covered`.
+- [x] BLAS-accelerated `project_data` via `ampi/_gemm.hpp` (Accelerate / OpenBLAS / MKL /
+      AVX2 / NEON); 20–112× over scalar loop.
+- [x] `best_clusters`, `best_fan_cones`: C++ nth_element replaces NumPy argsort per query.
+- [x] `update_drift_and_check`: fused EMA + 5-step power iteration in C++.
+- [x] `AMPIIndex` C++ class: owns all mutable state; `add`, `remove`, `local_refresh`,
+      `build_cones`, full adaptive query loop, `batch_add`, `batch_delete`.
+- [x] `std::shared_mutex` — concurrent reads, serialised writes; GIL released on hot paths.
+- [x] `_CppConesProxy` / `_CppClusterCones` — Python `cluster_cones[c][f]` proxies to live
+      C++ `SortedCone` objects (no `None` stubs).
 
-### Remaining
-- [ ] Phase 4: move `query()` and `query_candidates()` into `AMPIIndex::query()` in C++;
-      eliminate the Python adaptive-window loop.
-- [ ] Phase 5: `_build_cones_for_cluster` fully in C++ so `_local_refresh` never
-      re-acquires the GIL (`py::gil_scoped_release`).
-- [ ] Phase 6: `std::shared_mutex` for concurrent reads; `batch_add` / `batch_delete` API.
+### Open
 - [ ] Replace `std::vector` per-cone sorted array with B-tree / skip-list when
       n_cone > 10k (reduces insert from O(n_cone) shift to O(log n_cone)).
 
 ### Notes
-- K=2 QPS collapse on SIFT (0.5–6 vs K=1's 3–19) is a Python/NumPy cache artifact:
-  K=2 doubles memory footprint (2×nlist×F sorted arrays), thrashing L3 at 1M×128-D.
-  The algorithmic recall improvement is real (K=2: 0.977 vs K=1: 0.973 at equal
-  candidates). The C++ query loop (Phase 4) will reduce this gap.
-- Python API surface stays identical; tuner.py unchanged.
+- K=2 QPS collapse on SIFT (0.5–6 vs K=1's 3–19) is a memory cache artifact:
+  K=2 doubles footprint (2×nlist×F arrays), thrashing L3 at 1M×128-D.
+  Recall improvement is real (K=2: 0.977 vs K=1: 0.973). Now mitigated by the C++ query loop.
+- Python API surface unchanged; tuner.py unchanged.
 
 ---
 

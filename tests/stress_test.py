@@ -21,6 +21,8 @@ No external dependencies beyond numpy (brute-force ground truth used throughout)
 """
 
 import sys
+import time
+import threading
 import traceback
 import numpy as np
 from ampi import AMPIAffineFanIndex
@@ -498,6 +500,91 @@ def drift_detection_fires():
     q = perp + rng.standard_normal(32).astype('float32') * 0.1
     _, _, ids = idx.query(q.astype('float32'), k=5, window_size=200, probes=10, fan_probes=8)
     assert len(ids) == 5, "query after drift inserts returned wrong number of results"
+
+
+# ── concurrent access ─────────────────────────────────────────────────────────
+
+@test
+def concurrent_rw_no_crash():
+    """2 reader threads + 1 writer + 1 deleter for 2 s — no crashes or exceptions."""
+    idx, _, _ = _small_index(n=3000, d=32, nlist=10, F=8)
+    cpp = idx._cpp
+    if cpp is None:
+        return  # skip if C++ ext not built
+
+    N0 = idx.n
+    stop = threading.Event()
+    errors = []
+
+    def reader():
+        rng_l = np.random.default_rng()
+        try:
+            while not stop.is_set():
+                q = rng_l.standard_normal(idx.d).astype(np.float32)
+                sq, ids = cpp.query(q, 5, 100, 4, 4)
+                assert sq.shape == ids.shape
+        except Exception as e:
+            errors.append(("reader", e))
+
+    def writer():
+        rng_l = np.random.default_rng()
+        try:
+            while not stop.is_set():
+                pts = rng_l.standard_normal((5, idx.d)).astype(np.float32)
+                cpp.batch_add(pts)
+        except Exception as e:
+            errors.append(("writer", e))
+
+    def deleter():
+        rng_l = np.random.default_rng()
+        try:
+            while not stop.is_set():
+                n_cur = cpp.n
+                if n_cur > N0 + 20:
+                    lo, hi = int(N0), int(n_cur)
+                    sample = rng_l.integers(lo, hi, size=min(5, hi - lo), dtype=np.int32)
+                    cpp.batch_delete(sample)
+                else:
+                    time.sleep(0.001)
+        except Exception as e:
+            errors.append(("deleter", e))
+
+    threads = [
+        threading.Thread(target=reader, daemon=True),
+        threading.Thread(target=reader, daemon=True),
+        threading.Thread(target=writer, daemon=True),
+        threading.Thread(target=deleter, daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    time.sleep(2.0)
+    stop.set()
+    for t in threads:
+        t.join(timeout=3.0)
+        assert not t.is_alive(), "thread did not stop in time"
+    assert not errors, f"thread errors: {errors}"
+
+
+@test
+def batch_correctness_after_mutations():
+    """batch_add then batch_delete: deleted IDs must never appear in queries."""
+    idx, _, rng = _small_index(n=2000, d=32, nlist=8, F=8)
+    if idx._cpp is None:
+        return
+
+    pts = rng.standard_normal((200, idx.d)).astype(np.float32)
+    ids = idx.batch_add(pts)
+
+    to_del = ids[:100].astype(np.int32)
+    idx.batch_delete(to_del)
+    deleted_set = set(to_del.tolist())
+
+    qs = rng.standard_normal((20, idx.d)).astype(np.float32)
+    for q in qs:
+        _, _, found = idx.query(q.astype(np.float32), k=10, window_size=200,
+                                probes=idx.nlist, fan_probes=idx.F)
+        leaked = deleted_set & set(found.tolist())
+        assert not leaked, f"batch-deleted ids {leaked} appeared in query"
 
 
 # ── runner ────────────────────────────────────────────────────────────────────

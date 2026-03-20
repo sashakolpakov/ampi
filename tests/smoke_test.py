@@ -2,6 +2,7 @@
 Smoke test: build small indexes, verify exact NN is found at high recall.
 Runs in ~10s on a laptop, no datasets required.
 """
+import threading
 import numpy as np
 import faiss
 
@@ -104,9 +105,59 @@ if _HAS_CPP:
     assert isinstance(gid, int), "add() did not return int"
     cpp.remove(gid)
 
+    # ── cone population after from_build ─────────────────────────────────────
+    total_live = sum(
+        cpp.get_cone(c, f).size()
+        for c in range(cpp.nlist) if cpp.has_cones(c)
+        for f in range(cpp.F)
+    )
+    n_live = cpp.n - cpp.n_deleted
+    assert total_live >= n_live, \
+        f"too few cone entries after from_build: {total_live} < {n_live}"
+
+    # ── batch_add / batch_delete ──────────────────────────────────────────────
+    _batch = np.random.default_rng(6).standard_normal((20, cpp.d)).astype(np.float32)
+    _bids  = idx_a.batch_add(_batch)
+    assert _bids.shape == (20,) and len(set(_bids.tolist())) == 20, \
+        "batch_add did not return 20 unique IDs"
+    idx_a.batch_delete(_bids)
+    _, _, _found = idx_a.query(
+        _batch[0], k=5, window_size=200, probes=idx_a.nlist, fan_probes=idx_a.F)
+    assert not (set(_bids.tolist()) & set(_found.tolist())), \
+        "batch-deleted points appeared in query"
+
     print("AMPIIndex accessor compatibility: OK")
 else:
     print("AMPIIndex accessor compatibility: SKIPPED (C++ ext not built)")
+
+
+# ── C++ query correctness ─────────────────────────────────────────────────────
+# 1. C++ and Python-path must agree when both use full-cluster scan (fan_probes=F).
+# 2. query_candidates() must be a superset of query() top-k IDs.
+
+if _HAS_CPP:
+    _fp = idx_a.F  # fan_probes == F triggers cluster-level fallback in both paths
+    _cpp_ids, _py_ids = [], []
+    for _q in qs:
+        _, _, _ic = idx_a.query(_q, k=10, window_size=200, probes=5, fan_probes=_fp)
+        _, _, _ip = idx_a._py_query(_q, k=10, window_size=200, probes=5, fan_probes=_fp)
+        _cpp_ids.append(set(_ic.tolist()))
+        _py_ids.append(set(_ip.tolist()))
+
+    _agree = sum(len(a & b) for a, b in zip(_cpp_ids, _py_ids)) / (len(qs) * 10)
+    assert _agree >= 0.99, f"C++ vs Python recall agreement too low: {_agree:.3f}"
+
+    for _q in qs[:20]:
+        _, _, _ids = idx_a.query(_q, k=10, window_size=200, probes=5, fan_probes=_fp)
+        _cands = idx_a.query_candidates(_q, window_size=200, probes=5, fan_probes=_fp)
+        _cand_set = set(_cands.tolist())
+        for _gid in _ids.tolist():
+            assert _gid in _cand_set, \
+                f"top-k id {_gid} missing from query_candidates output"
+
+    print("C++ query correctness: OK")
+else:
+    print("C++ query correctness: SKIPPED (C++ ext not built)")
 
 
 # ── Metric alias testing ───────────────────────────────────────────────────────
@@ -246,6 +297,31 @@ if _HAS_CPP:
     print("C++ drift EMA (update_drift_and_check): OK")
 else:
     print("C++ drift EMA: SKIPPED (C++ ext not built)")
+
+
+# ── local_refresh GIL safety ──────────────────────────────────────────────────
+# local_refresh() releases the GIL; it must not deadlock when a Python thread
+# calls it while the main thread holds the GIL.
+
+if _HAS_CPP:
+    _cpp_r = idx_a._cpp
+    _c_r = next(c for c in range(_cpp_r.nlist) if _cpp_r.has_cones(c))
+    _errors_r = []
+
+    def _refresh_worker():
+        try:
+            _cpp_r.local_refresh(_c_r)
+        except Exception as e:
+            _errors_r.append(e)
+
+    _t = threading.Thread(target=_refresh_worker)
+    _t.start()
+    _t.join(timeout=5.0)
+    assert not _t.is_alive(), "local_refresh timed out — possible GIL deadlock"
+    assert not _errors_r, f"local_refresh raised: {_errors_r}"
+    print("local_refresh GIL safety: OK")
+else:
+    print("local_refresh GIL safety: SKIPPED (C++ ext not built)")
 
 
 # ── add / delete / update API ──────────────────────────────────────────────────
