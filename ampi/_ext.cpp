@@ -322,6 +322,102 @@ public:
     }
 };
 
+// ── best_clusters ─────────────────────────────────────────────────────────────
+//
+// Returns (probes,) int32 — indices of the `probes` nearest centroids to q,
+// sorted nearest-first.  Uses nth_element (O(nlist)) + sort of the top slice.
+
+py::array_t<int32_t> best_clusters(
+    py::array_t<float, py::array::c_style | py::array::forcecast> centroids,
+    py::array_t<float, py::array::c_style | py::array::forcecast> q,
+    int probes)
+{
+    auto C  = centroids.unchecked<2>();
+    auto Q  = q.unchecked<1>();
+    const int64_t nlist = C.shape(0);
+    const int64_t d     = C.shape(1);
+
+    probes = static_cast<int>(std::min((int64_t)probes, nlist));
+
+    std::vector<std::pair<float, int32_t>> dists(nlist);
+    const float* qptr = &Q(0);
+    for (int64_t i = 0; i < nlist; ++i) {
+        float acc = 0.f;
+        const float* row = &C(i, 0);
+        for (int64_t j = 0; j < d; ++j) {
+            float diff = row[j] - qptr[j];
+            acc += diff * diff;
+        }
+        dists[i] = {acc, static_cast<int32_t>(i)};
+    }
+
+    std::nth_element(dists.begin(), dists.begin() + probes, dists.end(),
+                     [](const std::pair<float,int32_t>& a,
+                        const std::pair<float,int32_t>& b) {
+                         return a.first < b.first;
+                     });
+    std::sort(dists.begin(), dists.begin() + probes,
+              [](const std::pair<float,int32_t>& a,
+                 const std::pair<float,int32_t>& b) {
+                  return a.first < b.first;
+              });
+
+    auto out = py::array_t<int32_t>(probes);
+    auto buf = out.mutable_unchecked<1>();
+    for (int i = 0; i < probes; ++i)
+        buf(i) = dists[i].second;
+    return out;
+}
+
+// ── best_fan_cones ────────────────────────────────────────────────────────────
+//
+// Returns (fan_probes,) int32 — indices of cones with highest
+// |axis_l · q_centered| / ||q_centered||, sorted highest-first.
+
+py::array_t<int32_t> best_fan_cones(
+    py::array_t<float, py::array::c_style | py::array::forcecast> axes,
+    py::array_t<float, py::array::c_style | py::array::forcecast> q_centered,
+    int fan_probes)
+{
+    auto A  = axes.unchecked<2>();
+    auto QC = q_centered.unchecked<1>();
+    const int64_t F = A.shape(0);
+    const int64_t d = A.shape(1);
+
+    fan_probes = static_cast<int>(std::min((int64_t)fan_probes, F));
+
+    float qnorm2 = 0.f;
+    const float* qptr = &QC(0);
+    for (int64_t j = 0; j < d; ++j) qnorm2 += qptr[j] * qptr[j];
+    const float qnorm = (qnorm2 > 1e-20f) ? std::sqrt(qnorm2) : 1.f;
+
+    // Store negated score so nth_element brings the best (largest |proj|) first.
+    std::vector<std::pair<float, int32_t>> scores(F);
+    for (int64_t l = 0; l < F; ++l) {
+        float dot = 0.f;
+        const float* row = &A(l, 0);
+        for (int64_t j = 0; j < d; ++j) dot += row[j] * qptr[j];
+        scores[l] = {-std::abs(dot) / qnorm, static_cast<int32_t>(l)};
+    }
+
+    std::nth_element(scores.begin(), scores.begin() + fan_probes, scores.end(),
+                     [](const std::pair<float,int32_t>& a,
+                        const std::pair<float,int32_t>& b) {
+                         return a.first < b.first;
+                     });
+    std::sort(scores.begin(), scores.begin() + fan_probes,
+              [](const std::pair<float,int32_t>& a,
+                 const std::pair<float,int32_t>& b) {
+                  return a.first < b.first;
+              });
+
+    auto out = py::array_t<int32_t>(fan_probes);
+    auto buf = out.mutable_unchecked<1>();
+    for (int i = 0; i < fan_probes; ++i)
+        buf(i) = scores[i].second;
+    return out;
+}
+
 // ── module ────────────────────────────────────────────────────────────────────
 
 PYBIND11_MODULE(_ampi_ext, m) {
@@ -337,6 +433,20 @@ PYBIND11_MODULE(_ampi_ext, m) {
           "Union-mode candidate selection via sorted projections",
           py::arg("sorted_idxs"), py::arg("sorted_projs"),
           py::arg("q_projs"), py::arg("window_size"));
+    m.def("best_clusters", &best_clusters,
+          "Indices of the `probes` nearest centroids to q, sorted nearest-first.\n\n"
+          "  centroids : (nlist, d) float32\n"
+          "  q         : (d,)       float32\n"
+          "  probes    : int\n"
+          "Returns (probes,) int32.",
+          py::arg("centroids"), py::arg("q"), py::arg("probes"));
+    m.def("best_fan_cones", &best_fan_cones,
+          "Indices of the `fan_probes` cones with highest |normed projection|.\n\n"
+          "  axes       : (F, d) float32\n"
+          "  q_centered : (d,)   float32\n"
+          "  fan_probes : int\n"
+          "Returns (fan_probes,) int32, sorted highest-first.",
+          py::arg("axes"), py::arg("q_centered"), py::arg("fan_probes"));
 
     py::class_<SortedCone>(m, "SortedCone",
         "Mutable sorted-projection cone supporting streaming insert/delete.\n\n"

@@ -39,10 +39,16 @@ import numpy as np
 from ._kernels import jit_union_query, l2_distances
 
 try:
-    from ampi._ampi_ext import SortedCone as _SortedCone
+    from ampi._ampi_ext import (
+        SortedCone     as _SortedCone,
+        best_clusters  as _cpp_best_clusters,
+        best_fan_cones as _cpp_best_fan_cones,
+    )
     _HAS_SORTED_CONE = True
+    _HAS_EXT = True
 except ImportError:
     _HAS_SORTED_CONE = False
+    _HAS_EXT = False
 
 # ── Phase-1 constants (from DATABASE_PLAN.md §Key Constants) ─────────────────
 
@@ -340,10 +346,14 @@ class AMPIAffineFanIndex:
         return q
 
     def _best_clusters(self, q, probes):
+        if _HAS_EXT:
+            return _cpp_best_clusters(self.centroids, q, probes)
         d2 = np.sum((self.centroids - q) ** 2, axis=1)
         return np.argsort(d2)[:probes]
 
     def _best_fan_cones(self, q_centered, fan_probes):
+        if _HAS_EXT:
+            return _cpp_best_fan_cones(self.axes, q_centered, fan_probes)
         q_norm = float(np.linalg.norm(q_centered))
         if q_norm < 1e-10:
             return np.arange(min(fan_probes, self.F), dtype=np.int32)
