@@ -185,7 +185,10 @@ def boundary_insert_cone_top_k2():
     x   = rng.standard_normal(d).astype('float32')
     gid = idx.add(x)
 
-    n_cones = len(idx._point_cones.get(gid, []))
+    if idx._cpp is not None:
+        n_cones = len(idx._cpp.get_point_cones(gid))
+    else:
+        n_cones = len(idx._point_cones.get(gid, []))
     assert n_cones >= 1, "cone_top_k=2 point not registered in any cone"
 
     idx.delete(gid)
