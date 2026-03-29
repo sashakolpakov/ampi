@@ -39,10 +39,46 @@ import numpy as np
 from ._kernels import jit_union_query, l2_distances
 
 try:
-    from ampi._ampi_ext import SortedCone as _SortedCone
+    from ampi._ampi_ext import (
+        SortedCone             as _SortedCone,
+        best_clusters          as _cpp_best_clusters,
+        best_fan_cones         as _cpp_best_fan_cones,
+        update_drift_and_check as _cpp_update_drift_and_check,
+        AMPIIndex              as _AMPIIndex,
+    )
     _HAS_SORTED_CONE = True
+    _HAS_EXT = True
 except ImportError:
     _HAS_SORTED_CONE = False
+    _HAS_EXT = False
+
+# ── Metric selector ───────────────────────────────────────────────────────────
+
+_METRIC_MAP: dict = {
+    'l2':          'l2',
+    'L2':          'l2',
+    'euclidean':   'l2',
+    'sqeuclidean': 'sqeuclidean',
+    'cosine':      'cosine',
+}
+
+def _normalize_metric(metric: str) -> str:
+    """Map a metric alias to its canonical name.
+
+    Accepted aliases
+    ----------------
+    l2 / L2 / euclidean  →  'l2'          (Euclidean; query returns sqrt distances)
+    sqeuclidean          →  'sqeuclidean'  (squared L2; faster, not a true metric)
+    cosine               →  'cosine'       (index normalises vectors internally; returns 1 − cos_sim)
+    """
+    canon = _METRIC_MAP.get(metric)
+    if canon is None:
+        valid = sorted(set(_METRIC_MAP.keys()))
+        raise ValueError(
+            f"unknown metric {metric!r}. Valid aliases: {valid}"
+        )
+    return canon
+
 
 # ── Phase-1 constants (from DATABASE_PLAN.md §Key Constants) ─────────────────
 
@@ -50,6 +86,56 @@ _DRIFT_BETA           = 0.01   # EMA decay for per-cluster drift covariance
 _DRIFT_THETA          = 15.0   # degrees — fan-axis refresh trigger
 _TOMBSTONE_THRESHOLD  = 0.10   # compact when tombstones > 10 % of cluster size
 _NN_PROBE_W           = 8      # half-window for approx-NN lookup in drift EMA
+
+
+# ── C++ cone proxy ────────────────────────────────────────────────────────────
+#
+# When _HAS_EXT is True the cones live inside AMPIIndex (C++).
+# These two thin wrappers expose them through the same list-of-lists interface
+# that the Python path uses, so _py_query and all Python code keep working
+# without any None-stub hacks.
+
+class _CppClusterCones:
+    """List-like view of the F SortedCone objects for one cluster."""
+    __slots__ = ('_cpp', '_c')
+
+    def __init__(self, cpp, c):
+        self._cpp = cpp
+        self._c   = c
+
+    def __len__(self):
+        return self._cpp.F
+
+    def __getitem__(self, f):
+        return self._cpp.get_cone(self._c, f)
+
+    def __iter__(self):
+        return (self._cpp.get_cone(self._c, f) for f in range(self._cpp.F))
+
+
+class _CppConesProxy:
+    """List-like view of per-cluster cones backed by AMPIIndex.get_cone().
+
+    cluster_cones[c] returns None when the cluster has no cones yet
+    (fewer than 2 points), otherwise a _CppClusterCones accessor.
+    """
+    __slots__ = ('_cpp',)
+
+    def __init__(self, cpp):
+        self._cpp = cpp
+
+    def __len__(self):
+        return self._cpp.nlist
+
+    def __getitem__(self, c):
+        if not self._cpp.has_cones(c):
+            return None
+        return _CppClusterCones(self._cpp, c)
+
+    def __setitem__(self, c, value):
+        # Only called by the Python-path _local_refresh; ignored when C++
+        # owns the cones (C++ refresh updates cones in-place via local_refresh).
+        pass
 
 
 # ── fallback cone (numba / no C++ ext) ───────────────────────────────────────
@@ -248,14 +334,17 @@ class AMPIAffineFanIndex:
     num_fans     : F — fan cones per cluster (also = sort directions)
     seed         : RNG seed
     cone_top_k   : K — soft assignment multiplicity (1 = hard argmax)
-    metric       : 'l2' or 'cosine'
+    metric       : distance metric — 'l2'/'L2'/'euclidean', 'sqeuclidean', or 'cosine'
+                   (cosine normalises all vectors internally)
+    drift_theta  : angle threshold in degrees at which a cluster's cones are
+                   rebuilt (default: 15.0).  Lower values = more frequent
+                   rebuilds; higher values = more drift tolerance.
     """
 
     def __init__(self, data, nlist=None, num_fans=16, seed=0, cone_top_k=1,
-                 metric='l2'):
-        if metric not in ('l2', 'cosine'):
-            raise ValueError(f"metric must be 'l2' or 'cosine', got {metric!r}")
-        self.metric = metric
+                 metric='l2', drift_theta=_DRIFT_THETA):
+        self.metric = _normalize_metric(metric)
+        self.drift_theta = float(drift_theta)
 
         self.data = np.ascontiguousarray(data, dtype=np.float32)
         if metric == 'cosine':
@@ -284,27 +373,32 @@ class AMPIAffineFanIndex:
         # ── Per-cluster: affine fan cones ─────────────────────────────────
         self.cluster_global = []
         self.cluster_cones  = []
+        self._point_cones   = {}
 
-        # _point_cones: global_id -> [(cluster_c, cone_f), ...]
-        # Built here so delete() works on initial points without a scan.
-        self._point_cones = {}
+        if _HAS_EXT:
+            # C++ builds cones internally in from_build().
+            # Only populate cluster_global here; cluster_cones will be set to
+            # a _CppConesProxy after the C++ index is constructed below.
+            for c in range(nlist):
+                c_idx = np.where(assignments == c)[0].astype(np.int32)
+                self.cluster_global.append(c_idx)
+        else:
+            for c in range(nlist):
+                c_idx = np.where(assignments == c)[0].astype(np.int32)
+                self.cluster_global.append(c_idx)
 
-        for c in range(nlist):
-            c_idx = np.where(assignments == c)[0].astype(np.int32)
-            self.cluster_global.append(c_idx)
+                if len(c_idx) < 2:
+                    self.cluster_cones.append(None)
+                    continue
 
-            if len(c_idx) < 2:
-                self.cluster_cones.append(None)
-                continue
-
-            cones, pc = _build_cones_for_cluster(
-                c_idx, self.data[c_idx], self.centroids[c],
-                self.axes, self.F, self.cone_top_k,
-            )
-            self.cluster_cones.append(cones)
-            for global_id, fs in pc.items():
-                for f in fs:
-                    self._point_cones.setdefault(global_id, []).append((c, f))
+                cones, pc = _build_cones_for_cluster(
+                    c_idx, self.data[c_idx], self.centroids[c],
+                    self.axes, self.F, self.cone_top_k,
+                )
+                self.cluster_cones.append(cones)
+                for global_id, fs in pc.items():
+                    for f in fs:
+                        self._point_cones.setdefault(global_id, []).append((c, f))
 
         # ── Phase-1 streaming state ───────────────────────────────────────
         # Pre-allocated capacity buffers for data and deleted-mask.
@@ -325,11 +419,35 @@ class AMPIAffineFanIndex:
                                             dtype=np.int64)
         self._cluster_tombstones = np.zeros(self.nlist, dtype=np.int64)
 
-        # Per-cluster drift covariance EMA (d×d, float64).
-        self._sigma_drift = [np.zeros((self.d, self.d), dtype=np.float64)
-                             for _ in range(self.nlist)]
+        # Per-cluster drift covariance EMA — flat (nlist, d*d) float64.
+        # Each row is a row-major flattened d×d covariance matrix.
+        self._sigma_drift = np.zeros((self.nlist, self.d * self.d), dtype=np.float64)
+
+        # ── C++ index (Phase 3+) ──────────────────────────────────────────────
+        if _HAS_EXT:
+            self._cpp = _AMPIIndex.from_build(
+                self.d, self.F, self.nlist, self.cone_top_k,
+                self.drift_theta, self.metric == 'cosine',
+                self.axes, self.centroids,
+                self._cluster_counts, self._sigma_drift,
+                self._data_buf, self._del_mask_buf.astype(np.uint8),
+                self.n,
+                self.cluster_global,
+            )
+            self._refresh_views()
+            self.cluster_cones = _CppConesProxy(self._cpp)
+        else:
+            self._cpp = None
 
     # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _refresh_views(self):
+        """Refresh Python references to C++ memory after any mutation."""
+        self.data          = self._cpp.get_data_view()
+        self._deleted_mask = self._cpp.get_deleted_mask().astype(bool)
+        self.n             = self._cpp.n
+        self._n_deleted    = self._cpp.n_deleted
+        self.centroids     = self._cpp.get_centroids()
 
     def _prepare_query(self, q):
         q = np.ascontiguousarray(q, dtype=np.float32)
@@ -340,10 +458,14 @@ class AMPIAffineFanIndex:
         return q
 
     def _best_clusters(self, q, probes):
+        if _HAS_EXT:
+            return _cpp_best_clusters(self.centroids, q, probes)
         d2 = np.sum((self.centroids - q) ** 2, axis=1)
         return np.argsort(d2)[:probes]
 
     def _best_fan_cones(self, q_centered, fan_probes):
+        if _HAS_EXT:
+            return _cpp_best_fan_cones(self.axes, q_centered, fan_probes)
         q_norm = float(np.linalg.norm(q_centered))
         if q_norm < 1e-10:
             return np.arange(min(fan_probes, self.F), dtype=np.int32)
@@ -352,8 +474,9 @@ class AMPIAffineFanIndex:
 
     def _check_drift(self, c):
         """Power iteration on Σ_drift[c]; trigger _local_refresh if the
-        leading eigenvector is > _DRIFT_THETA degrees from all fan axes."""
-        sig = self._sigma_drift[c]
+        leading eigenvector is > _DRIFT_THETA degrees from all fan axes.
+        Python fallback — only called when C++ ext is unavailable."""
+        sig = self._sigma_drift[c].reshape(self.d, self.d)
         # Warm-start with the first axis (likely already well-aligned).
         v = sig @ self.axes[0].astype(np.float64)
         for _ in range(5):
@@ -364,7 +487,7 @@ class AMPIAffineFanIndex:
             v /= norm
         # Maximum cosine similarity between v and any current fan axis.
         cos_max = float(np.max(np.abs(self.axes.astype(np.float64) @ v)))
-        if cos_max < np.cos(np.radians(_DRIFT_THETA)):
+        if cos_max < np.cos(np.radians(self.drift_theta)):
             self._local_refresh(c)
 
     def _local_refresh(self, c):
@@ -429,6 +552,14 @@ class AMPIAffineFanIndex:
         x = np.ascontiguousarray(x, dtype=np.float32).ravel()
         if x.shape[0] != self.d:
             raise ValueError(f"expected d={self.d}, got {x.shape[0]}")
+        if self._cpp is not None:
+            gid = self._cpp.add(x)
+            self._refresh_views()
+            return gid
+        return self._py_add(x)
+
+    def _py_add(self, x):
+        """Python-path add (used when C++ ext unavailable)."""
         if self.metric == 'cosine':
             xnorm = float(np.linalg.norm(x))
             if xnorm > 1e-10:
@@ -508,11 +639,17 @@ class AMPIAffineFanIndex:
 
                 displacement = (x - approx_nn) if approx_nn is not None else centered
                 v = displacement.astype(np.float64)
-                self._sigma_drift[c] = (
-                    (1.0 - _DRIFT_BETA) * self._sigma_drift[c]
-                    + _DRIFT_BETA * np.outer(v, v)
-                )
-                self._check_drift(c)
+                if _HAS_EXT:
+                    if _cpp_update_drift_and_check(
+                            self._sigma_drift[c], self.axes, v,
+                            _DRIFT_BETA, self.drift_theta):
+                        self._local_refresh(c)
+                else:
+                    self._sigma_drift[c] = (
+                        (1.0 - _DRIFT_BETA) * self._sigma_drift[c]
+                        + _DRIFT_BETA * np.outer(v, v).ravel()
+                    )
+                    self._check_drift(c)
 
         return global_id
 
@@ -530,6 +667,50 @@ class AMPIAffineFanIndex:
         global_id = int(global_id)
         if global_id < 0 or global_id >= self.n:
             raise IndexError(f"global_id {global_id} out of range [0, {self.n})")
+        if self._cpp is not None:
+            self._cpp.remove(global_id)
+            self._refresh_views()
+            return
+        self._py_delete(global_id)
+
+    def batch_add(self, data):
+        """Insert multiple vectors at once (single exclusive lock).
+
+        Parameters
+        ----------
+        data : (m, d) array_like, float32
+
+        Returns
+        -------
+        global_ids : (m,) int32 array
+        """
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        if data.ndim != 2 or data.shape[1] != self.d:
+            raise ValueError(f"expected (m, {self.d}), got {data.shape}")
+        if self._cpp is not None:
+            ids = self._cpp.batch_add(data)
+            self._refresh_views()
+            return ids
+        # Python fallback: loop
+        return np.array([self._py_add(data[i]) for i in range(len(data))], dtype=np.int32)
+
+    def batch_delete(self, global_ids):
+        """Tombstone multiple points at once (single exclusive lock).
+
+        Parameters
+        ----------
+        global_ids : (m,) int array
+        """
+        global_ids = np.asarray(global_ids, dtype=np.int32).ravel()
+        if self._cpp is not None:
+            self._cpp.batch_delete(global_ids)
+            self._refresh_views()
+            return
+        for gid in global_ids.tolist():
+            self._py_delete(int(gid))
+
+    def _py_delete(self, global_id):
+        """Python-path delete (used when C++ ext unavailable)."""
         if self._deleted_mask[global_id]:
             return   # already deleted
 
@@ -585,19 +766,24 @@ class AMPIAffineFanIndex:
         candidates : (m,) int32 — unique live data indices
         """
         q = self._prepare_query(q)
+        if self._cpp is not None:
+            return self._cpp.query_candidates(q, window_size, probes, fan_probes)
+        return self._py_query_candidates(q, window_size, probes, fan_probes)
+
+    def _py_query_candidates(self, q, window_size=50, probes=10, fan_probes=2):
+        """Pure Python query_candidates (fallback when C++ ext unavailable)."""
         clusters = self._best_clusters(q, probes)
 
         parts = []
         for c in clusters:
             c = int(c)
-            cones = self.cluster_cones[c]
-            gi = self.cluster_global[c]
-            if cones is None or len(gi) == 0:
+            gi        = self.cluster_global[c]
+            has_cones = self.cluster_cones[c] is not None
+            if not has_cones or len(gi) == 0:
                 if len(gi) > 0:
                     parts.append(gi)
                 continue
 
-            # Fast path: probe all cones → return whole cluster.
             if fan_probes >= self.F:
                 parts.append(gi)
                 continue
@@ -610,9 +796,9 @@ class AMPIAffineFanIndex:
             best_cones = self._best_fan_cones(q_centered, fan_probes)
             for f in best_cones:
                 f = int(f)
-                if f >= len(cones) or cones[f] is None:
+                if f >= len(self.cluster_cones[c]) or self.cluster_cones[c][f] is None:
                     continue
-                cone = cones[f]
+                cone = self.cluster_cones[c][f]
                 if cone.size() <= 2 * window_size:
                     parts.append(cone.all_ids())
                 else:
@@ -637,16 +823,31 @@ class AMPIAffineFanIndex:
         for any unit vector l, those unvisited points cannot enter the top-k.
         """
         q = self._prepare_query(q)
+        if self._cpp is not None:
+            sq_dists, ids = self._cpp.query(q, k, window_size, probes, fan_probes)
+            if self.metric == 'l2':
+                dists = np.sqrt(np.maximum(0.0, sq_dists))
+            elif self.metric == 'sqeuclidean':
+                dists = sq_dists
+            else:  # cosine: vectors are already normalised; sq_l2 = 2*(1 - cos_sim)
+                dists = sq_dists * 0.5
+            # Use a fresh data view so results are correct even if add() was
+            # called after the last _refresh_views() (e.g. via batch_add).
+            data_view = self._cpp.get_data_view()
+            return data_view[ids], dists, ids
+        return self._py_query(q, k, window_size, probes, fan_probes)
 
+    def _py_query(self, q, k=10, window_size=200, probes=10, fan_probes=2):
+        """Pure Python query (fallback when C++ ext unavailable)."""
         cone_ctxs      = []
         fallback_parts = []
 
         for c in map(int, self._best_clusters(q, probes)):
-            cones = self.cluster_cones[c]
-            gi    = self.cluster_global[c]
+            gi        = self.cluster_global[c]
+            has_cones = self.cluster_cones[c] is not None
             if not len(gi):
                 continue
-            if cones is None or fan_probes >= self.F:
+            if not has_cones or fan_probes >= self.F:
                 fallback_parts.append(gi)
                 continue
             centroid   = self.centroids[c]
@@ -655,8 +856,8 @@ class AMPIAffineFanIndex:
                 (q_centered @ self.axes.T).astype(np.float32)
             )
             for f in map(int, self._best_fan_cones(q_centered, fan_probes)):
-                if f < len(cones) and cones[f] is not None:
-                    cone_ctxs.append((cones[f], q_proj))
+                if f < len(self.cluster_cones[c]) and self.cluster_cones[c][f] is not None:
+                    cone_ctxs.append((self.cluster_cones[c][f], q_proj))
 
         w     = max(k, 8)
         cands = np.zeros(0, dtype=np.int32)
@@ -672,7 +873,6 @@ class AMPIAffineFanIndex:
             cands = (np.unique(np.concatenate(parts))
                      if parts else np.zeros(0, dtype=np.int32))
 
-            # Filter tombstoned entries that leaked through the fast path.
             if self._n_deleted and len(cands):
                 cands = cands[~self._deleted_mask[cands]]
 
@@ -700,6 +900,12 @@ class AMPIAffineFanIndex:
             cands = np.arange(min(k, self.n), dtype=np.int32)
             if self._n_deleted:
                 cands = cands[~self._deleted_mask[cands]]
-        dists = l2_distances(self.data, q, cands)
-        top   = np.argsort(dists)[:k]
-        return self.data[cands[top]], dists[top], cands[top]
+        sq_dists = l2_distances(self.data, q, cands)
+        top      = np.argsort(sq_dists)[:k]
+        if self.metric == 'l2':
+            out_dists = np.sqrt(np.maximum(0.0, sq_dists[top]))
+        elif self.metric == 'sqeuclidean':
+            out_dists = sq_dists[top]
+        else:  # cosine: vectors are already normalised; sq_l2 = 2*(1 - cos_sim)
+            out_dists = sq_dists[top] * 0.5
+        return self.data[cands[top]], out_dists, cands[top]

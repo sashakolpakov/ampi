@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ampi"
-version = "0.5.0"
+version = "0.6.0"
 description = "Adaptive Multi-Projection Index — approximate nearest-neighbour search via sorted projections and affine fans"
 readme = "README.md"
 requires-python = ">=3.8"

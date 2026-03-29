@@ -56,12 +56,15 @@ No partition; density-adaptive. Equivalent to AffineFan with a single cluster.
 
 ### Backend
 
-Hot-path kernels (`project_data`, `l2_distances`, `union_query`) and the mutable
-`SortedCone` data structure are implemented in C++ via pybind11 (`ampi/_ext.cpp`).
-`project_data` dispatches to `cblas_sgemm` via `ampi/_gemm.hpp` (Accelerate on macOS,
-OpenBLAS / MKL on Linux/Windows, or a tiled AVX2/NEON micro-kernel fallback) —
-20–112× faster than a scalar loop at practical dataset sizes.
-A numba JIT fallback is used automatically when the compiled extension is absent.
+The entire hot path is implemented in C++ via pybind11 (`ampi/_ext.cpp`):
+`SortedCone`, `AMPIIndex` (owns all mutable state — data buffer, cones, drift
+covariance), `add`, `remove`, `batch_add`, `batch_delete`, the full adaptive
+query loop, cone build, and local refresh.  A `std::shared_mutex` allows
+concurrent reads with serialised writes.  `project_data` dispatches to
+`cblas_sgemm` via `ampi/_gemm.hpp` (Accelerate on macOS, OpenBLAS / MKL on
+Linux/Windows, or a tiled AVX2/NEON micro-kernel fallback) — 20–112× faster
+than a scalar loop.  A numba JIT fallback is used automatically when the
+compiled extension is absent.
 
 ---
 
@@ -103,7 +106,7 @@ binary_cands = binary.query_candidates(q, window_size=200)   # (m,) int32 indice
 | `nlist` | cluster count | `alpha × sqrt(n)`, tune alpha ∈ [0.25, 3.0] |
 | `num_fans` F | cones per cluster | largest F s.t. `n/(nlist×F) ≥ w_base` |
 | `cone_top_k` K | soft assignment | K=1 fast; K=2 better recall at cluster boundaries |
-| `metric` | distance function | `'l2'` (default) or `'cosine'` (normalises data internally) |
+| `metric` | distance function | `'l2'`/`'L2'`/`'euclidean'` (Euclidean), `'sqeuclidean'` (squared L2), `'cosine'` (normalises internally) |
 | `probes` cp | clusters probed per query | 5–20 |
 | `fan_probes` fp | cones probed per cluster | F/4 … F |
 | `window_size` w | candidates per cone per axis | scales with `sqrt(n)` |
@@ -265,11 +268,13 @@ ampi/
 
 ## Roadmap
 
-Phase 1 (streaming insert/delete/update) is complete. The next milestones are:
+The full hot path is in C++: routing, drift EMA, mutable index state, query loop,
+`batch_add`/`batch_delete`, and concurrent reader/writer locking (`std::shared_mutex`).
 
-- **Phase 2** — persistence: WAL + checkpoint serializer for single-node durability.
-- **Phase 3** — distributed: coordinator + multi-shard query fan-out, cluster splits,
-  rebalancing.
+Near-term milestones:
 
-See `DATABASE_PLAN.md` for the phased implementation plan and `TODO.md` for current
+- **Persistence** — WAL + checkpoint serializer for single-node durability.
+- **Distributed** — coordinator + multi-shard query fan-out, cluster splits, rebalancing.
+
+See `DATABASE_PLAN.md` for the persistence/distributed plan and `TODO.md` for current
 task status.

@@ -23,6 +23,9 @@
 #include <algorithm>   // std::max, std::min, std::lower_bound, std::sort, std::remove_if
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <numeric>     // std::iota
+#include <shared_mutex>
 #include <unordered_set>
 #include <vector>
 
@@ -289,6 +292,68 @@ public:
         return out;
     }
 
+    // ── internal raw methods (no numpy overhead, called from AMPIIndex) ──────
+
+    void insert_raw(const float* proj_values, uint32_t global_id) {
+        tombstones.erase(global_id);
+        for (int l = 0; l < F; ++l) {
+            auto& ax = axes[l];
+            float pv = proj_values[l];
+            auto it = std::lower_bound(ax.begin(), ax.end(),
+                          std::make_pair(pv, uint32_t(0)),
+                          [](const std::pair<float,uint32_t>& a,
+                             const std::pair<float,uint32_t>& b) {
+                              return a.first < b.first;
+                          });
+            ax.insert(it, {pv, global_id});
+        }
+    }
+
+    std::vector<uint32_t> query_raw(const float* q_projs, int64_t window_size) const {
+        std::unordered_set<uint32_t> seen;
+        for (int l = 0; l < F; ++l) {
+            const auto& ax = axes[l];
+            int64_t n_ax = (int64_t)ax.size();
+            if (n_ax == 0) continue;
+            float qp = q_projs[l];
+            int64_t lo = 0, hi = n_ax;
+            while (lo < hi) {
+                int64_t mid = (lo + hi) >> 1;
+                if (ax[mid].first < qp) lo = mid + 1; else hi = mid;
+            }
+            int64_t start = std::max(int64_t(0), lo - window_size);
+            int64_t end   = std::min(n_ax, lo + window_size);
+            for (int64_t i = start; i < end; ++i) {
+                uint32_t gid = ax[i].second;
+                if (!tombstones.count(gid)) seen.insert(gid);
+            }
+        }
+        std::vector<uint32_t> result(seen.begin(), seen.end());
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+
+    bool is_covered_raw(const float* q_projs, int64_t w, float kth_proj) const {
+        const float inf = std::numeric_limits<float>::infinity();
+        for (int l = 0; l < F; ++l) {
+            const auto& ax = axes[l];
+            int64_t n_ax = (int64_t)ax.size();
+            if (n_ax == 0) continue;
+            float qp = q_projs[l];
+            int64_t lo = 0, hi = n_ax;
+            while (lo < hi) {
+                int64_t mid = (lo + hi) >> 1;
+                if (ax[mid].first < qp) lo = mid + 1; else hi = mid;
+            }
+            int64_t win_lo = std::max(int64_t(0), lo - w);
+            int64_t win_hi = std::min(n_ax, lo + w);
+            float gap_right = (win_hi < n_ax) ? (ax[win_hi].first - qp)     : inf;
+            float gap_left  = (win_lo > 0)    ? (qp - ax[win_lo-1].first)   : inf;
+            if (std::min(gap_right, gap_left) >= kth_proj) return true;
+        }
+        return false;
+    }
+
     // Early-stopping coverage check (used by the adaptive query loop).
     // Returns true if any axis l has both window boundaries >= kth_proj away
     // from the query projection, guaranteeing no unvisited point can improve
@@ -322,6 +387,1007 @@ public:
     }
 };
 
+// ── AMPIIndex ─────────────────────────────────────────────────────────────────
+//
+// Owns all mutable index state: data buffer, centroid table, per-cluster
+// SortedCones, drift covariance, and the inverse (global_id → cone) map.
+//
+// Phase 3: add() and remove() are pure C++.
+// Phase 4 will add query() here.
+
+class AMPIIndex {
+public:
+    int d, F, nlist, cone_top_k;
+    double drift_theta;
+    bool cosine_metric;
+
+    std::vector<float>   data_buf;   // capacity * d, row-major
+    std::vector<uint8_t> del_mask;   // capacity (0 = live, 1 = deleted)
+    uint32_t n, capacity, n_deleted;
+
+    // Phase 6: reader-writer lock.  query/query_candidates hold shared lock;
+    // add/remove/batch_add/batch_delete/local_refresh hold exclusive lock.
+    // Stored behind unique_ptr so AMPIIndex remains movable (shared_mutex is not).
+    std::unique_ptr<std::shared_mutex> p_mutex = std::make_unique<std::shared_mutex>();
+
+    std::vector<float> axes;       // F * d (immutable after build)
+    std::vector<float> centroids;  // nlist * d (EMA-updated)
+
+    std::vector<int64_t>  cluster_counts;
+    std::vector<int64_t>  cluster_tombstones;
+    std::vector<bool>     cluster_has_cones;
+    std::vector<std::vector<uint32_t>>   cluster_global;
+    std::vector<std::vector<SortedCone>> cluster_cones;   // [nlist][F]
+    std::vector<std::vector<double>>     sigma_drift;     // [nlist][d*d]
+
+    // point_cones[gid] = {(cluster, fan), ...}
+    std::vector<std::vector<std::pair<uint16_t,uint16_t>>> point_cones;
+
+    AMPIIndex() = default;
+
+    // ── construction ─────────────────────────────────────────────────────────
+
+    static AMPIIndex from_build(
+        int d, int F, int nlist, int cone_top_k,
+        double drift_theta, bool cosine,
+        py::array_t<float,   py::array::c_style | py::array::forcecast> axes_np,
+        py::array_t<float,   py::array::c_style | py::array::forcecast> centroids_np,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> cluster_counts_np,
+        py::array_t<double,  py::array::c_style | py::array::forcecast> sigma_drift_np,
+        py::array_t<float,   py::array::c_style | py::array::forcecast> data_np,
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> del_mask_np,
+        int n_init,
+        py::list  cluster_global_list)  // [nlist] of int32 numpy arrays
+    {
+        AMPIIndex idx;
+        idx.d             = d;
+        idx.F             = F;
+        idx.nlist         = nlist;
+        idx.cone_top_k    = cone_top_k;
+        idx.drift_theta   = drift_theta;
+        idx.cosine_metric = cosine;
+        idx.n             = (uint32_t)n_init;
+        idx.n_deleted     = 0;
+
+        const int64_t cap = (int64_t)data_np.shape(0);
+        idx.capacity = (uint32_t)cap;
+
+        // axes
+        auto AX = axes_np.unchecked<2>();
+        idx.axes.resize((size_t)F * d);
+        for (int l = 0; l < F; ++l)
+            for (int j = 0; j < d; ++j)
+                idx.axes[l * d + j] = AX(l, j);
+
+        // centroids
+        auto CN = centroids_np.unchecked<2>();
+        idx.centroids.resize((size_t)nlist * d);
+        for (int c = 0; c < nlist; ++c)
+            for (int j = 0; j < d; ++j)
+                idx.centroids[c * d + j] = CN(c, j);
+
+        // data buffer (full pre-allocated capacity)
+        idx.data_buf.resize((size_t)cap * d);
+        auto DN = data_np.unchecked<2>();
+        for (int64_t i = 0; i < cap; ++i)
+            for (int j = 0; j < d; ++j)
+                idx.data_buf[i * d + j] = DN(i, j);
+
+        // deleted mask
+        idx.del_mask.resize((size_t)cap, 0);
+        auto DM = del_mask_np.unchecked<1>();
+        int64_t dm_len = del_mask_np.shape(0);
+        for (int64_t i = 0; i < dm_len; ++i)
+            idx.del_mask[i] = DM(i);
+
+        // per-cluster counts
+        auto CC = cluster_counts_np.unchecked<1>();
+        idx.cluster_counts.resize(nlist);
+        for (int c = 0; c < nlist; ++c)
+            idx.cluster_counts[c] = CC(c);
+        idx.cluster_tombstones.assign(nlist, 0);
+
+        // sigma drift
+        idx.sigma_drift.resize(nlist);
+        auto SD = sigma_drift_np.unchecked<2>();
+        for (int c = 0; c < nlist; ++c) {
+            idx.sigma_drift[c].resize((size_t)d * d);
+            for (int j = 0; j < d * d; ++j)
+                idx.sigma_drift[c][j] = SD(c, j);
+        }
+
+        // cluster_global
+        idx.cluster_global.resize(nlist);
+        for (int c = 0; c < nlist; ++c) {
+            py::object obj = cluster_global_list[c];
+            if (obj.is_none()) continue;
+            auto arr = obj.cast<py::array_t<int32_t>>();
+            auto buf = arr.unchecked<1>();
+            idx.cluster_global[c].reserve((size_t)buf.shape(0));
+            for (int64_t i = 0; i < buf.shape(0); ++i)
+                idx.cluster_global[c].push_back((uint32_t)buf(i));
+        }
+
+        // Build cones entirely in C++ (Phase 5: no Python cone objects passed in).
+        idx.cluster_cones.resize(nlist);
+        idx.cluster_has_cones.assign(nlist, false);
+        idx.point_cones.resize((size_t)cap);
+        for (int c = 0; c < nlist; ++c) {
+            idx.cluster_cones[c].assign(F, SortedCone(F));
+            if (!idx.cluster_global[c].empty())
+                idx._build_cones(c, idx.cluster_global[c]);
+        }
+
+        return idx;
+    }
+
+    // ── add ──────────────────────────────────────────────────────────────────
+
+    uint32_t add(py::array_t<float, py::array::c_style | py::array::forcecast> x_np) {
+        auto X = x_np.unchecked<1>();
+        std::vector<float> x(d);
+        if (cosine_metric) {
+            float norm2 = 0.f;
+            for (int j = 0; j < d; ++j) norm2 += X(j) * X(j);
+            float inv = (norm2 > 1e-20f) ? 1.f / std::sqrt(norm2) : 1.f;
+            for (int j = 0; j < d; ++j) x[j] = X(j) * inv;
+        } else {
+            for (int j = 0; j < d; ++j) x[j] = X(j);
+        }
+        std::unique_lock<std::shared_mutex> lk(*p_mutex);
+        return _add_raw(x.data());
+    }
+
+    // ── batch_add ─────────────────────────────────────────────────────────────
+    //
+    // Insert m points at once under a single exclusive lock.
+    // Returns (m,) int32 array of assigned global IDs.
+    // Allocates numpy output and normalises rows while holding the GIL, then
+    // releases the GIL for the locked insertion loop.
+
+    py::array_t<int32_t> batch_add(
+        py::array_t<float, py::array::c_style | py::array::forcecast> data_np)
+    {
+        auto D2 = data_np.unchecked<2>();  // GIL held: safe pointer extraction
+        int m = (int)D2.shape(0);
+
+        // Normalise all rows while GIL is held (pure arithmetic, no lock needed)
+        std::vector<float> xs((size_t)m * d);
+        for (int i = 0; i < m; ++i) {
+            float* xi = &xs[i * d];
+            if (cosine_metric) {
+                float norm2 = 0.f;
+                for (int j = 0; j < d; ++j) norm2 += D2(i, j) * D2(i, j);
+                float inv = (norm2 > 1e-20f) ? 1.f / std::sqrt(norm2) : 1.f;
+                for (int j = 0; j < d; ++j) xi[j] = D2(i, j) * inv;
+            } else {
+                for (int j = 0; j < d; ++j) xi[j] = D2(i, j);
+            }
+        }
+
+        // Allocate output while GIL is held (numpy requires the GIL)
+        auto out    = py::array_t<int32_t>(m);
+        int32_t* op = out.mutable_data();
+
+        {
+            py::gil_scoped_release release;  // release GIL for the insertion loop
+            std::unique_lock<std::shared_mutex> lk(*p_mutex);
+            for (int i = 0; i < m; ++i)
+                op[i] = (int32_t)_add_raw(&xs[i * d]);
+        }
+        return out;
+    }
+
+    // ── _add_raw (private, called under unique_lock) ──────────────────────────
+
+    uint32_t _add_raw(const float* x) {
+        uint32_t global_id = n;
+        if (n >= capacity) _grow_buffers();
+
+        std::copy(x, x + d, &data_buf[n * d]);
+        del_mask[n] = 0;
+        ++n;
+
+        if (point_cones.size() <= global_id)
+            point_cones.resize(global_id + 1);
+        point_cones[global_id].clear();
+
+        // Top-K cluster assignment
+        int K_c = std::min(cone_top_k, nlist);
+        std::vector<std::pair<float,int>> cdists(nlist);
+        for (int c = 0; c < nlist; ++c) {
+            float acc = 0.f;
+            const float* cent = &centroids[c * d];
+            for (int j = 0; j < d; ++j) {
+                float diff = cent[j] - x[j]; acc += diff * diff;
+            }
+            cdists[c] = {acc, c};
+        }
+        std::nth_element(cdists.begin(), cdists.begin() + K_c, cdists.end());
+        std::sort(cdists.begin(), cdists.begin() + K_c);
+
+        for (int ki = 0; ki < K_c; ++ki) {
+            int c = cdists[ki].second;
+            const float* cent = &centroids[c * d];
+
+            std::vector<float> centered(d);
+            float cn2 = 0.f;
+            for (int j = 0; j < d; ++j) {
+                centered[j] = x[j] - cent[j];
+                cn2 += centered[j] * centered[j];
+            }
+            float cn = (cn2 > 1e-20f) ? std::sqrt(cn2) : 0.f;
+
+            // Project onto all F axes
+            std::vector<float> proj(F, 0.f);
+            for (int l = 0; l < F; ++l)
+                for (int j = 0; j < d; ++j)
+                    proj[l] += centered[j] * axes[l * d + j];
+
+            // Top-K fan cones by |normed proj|
+            int K_f = std::min(cone_top_k, F);
+            std::vector<std::pair<float,int>> fsc(F);
+            float inv_cn = (cn > 1e-10f) ? 1.f / cn : 1.f;
+            for (int l = 0; l < F; ++l)
+                fsc[l] = {-std::abs(proj[l]) * inv_cn, l};
+            std::nth_element(fsc.begin(), fsc.begin() + K_f, fsc.end());
+
+            std::vector<int> top_f;
+            top_f.reserve(K_f);
+            for (int k = 0; k < K_f; ++k) top_f.push_back(fsc[k].second);
+
+            // Insert into selected cones
+            if (cluster_has_cones[c]) {
+                for (int f : top_f) {
+                    cluster_cones[c][f].insert_raw(proj.data(), global_id);
+                    point_cones[global_id].push_back({(uint16_t)c, (uint16_t)f});
+                }
+            } else {
+                // Cluster had no cones; cones are already empty-initialised
+                // in from_build — just insert and mark active once >= 2 points.
+                for (int f : top_f) {
+                    cluster_cones[c][f].insert_raw(proj.data(), global_id);
+                    point_cones[global_id].push_back({(uint16_t)c, (uint16_t)f});
+                }
+                // After this push_back, cluster_global[c] will have size+1.
+                if (cluster_global[c].size() >= 1)
+                    cluster_has_cones[c] = true;
+            }
+
+            cluster_global[c].push_back(global_id);
+
+            // Centroid EMA: μ ← (N·μ + x) / (N+1)
+            int64_t N = cluster_counts[c];
+            float inv_Np1 = 1.f / float(N + 1);
+            float* cp = &centroids[c * d];
+            for (int j = 0; j < d; ++j)
+                cp[j] = (float(N) * cp[j] + x[j]) * inv_Np1;
+            cluster_counts[c] = N + 1;
+
+            // Drift EMA + power iteration
+            if (cn > 1e-10f) {
+                // Approx NN from cones
+                std::unordered_set<uint32_t> nn_set;
+                for (int f : top_f) {
+                    auto ids = cluster_cones[c][f].query_raw(proj.data(), 8);
+                    for (uint32_t gid2 : ids)
+                        if (gid2 != global_id && !del_mask[gid2])
+                            nn_set.insert(gid2);
+                }
+                std::vector<double> v(d);
+                if (!nn_set.empty()) {
+                    float best_d2 = std::numeric_limits<float>::max();
+                    const float* best_ptr = nullptr;
+                    for (uint32_t gid2 : nn_set) {
+                        const float* p2 = &data_buf[gid2 * d];
+                        float d2 = 0.f;
+                        for (int j = 0; j < d; ++j) { float dj = x[j]-p2[j]; d2 += dj*dj; }
+                        if (d2 < best_d2) { best_d2 = d2; best_ptr = p2; }
+                    }
+                    for (int j = 0; j < d; ++j) v[j] = x[j] - best_ptr[j];
+                } else {
+                    for (int j = 0; j < d; ++j) v[j] = centered[j];
+                }
+                if (_update_drift_and_check(c, v.data()))
+                    _local_refresh(c);
+            }
+        }
+
+        return global_id;
+    }
+
+    // ── remove ───────────────────────────────────────────────────────────────
+
+    void remove(uint32_t global_id) {
+        std::unique_lock<std::shared_mutex> lk(*p_mutex);
+        _remove_raw(global_id);
+    }
+
+    // ── batch_delete ──────────────────────────────────────────────────────────
+    //
+    // Tombstone m points under a single exclusive lock.
+    // Copies IDs into a plain vector while holding the GIL, then releases it.
+
+    void batch_delete(
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> ids_np)
+    {
+        auto IDS = ids_np.unchecked<1>();  // GIL held: safe
+        int m = (int)IDS.shape(0);
+        std::vector<uint32_t> ids_vec(m);
+        for (int i = 0; i < m; ++i) ids_vec[i] = (uint32_t)IDS(i);
+
+        py::gil_scoped_release release;
+        std::unique_lock<std::shared_mutex> lk(*p_mutex);
+        for (int i = 0; i < m; ++i)
+            _remove_raw(ids_vec[i]);
+    }
+
+    // ── _remove_raw (private, called under unique_lock) ───────────────────────
+
+    void _remove_raw(uint32_t global_id) {
+        if (global_id >= n || del_mask[global_id]) return;
+
+        del_mask[global_id] = 1;
+        ++n_deleted;
+
+        std::unordered_set<int> seen;
+        for (auto& cf : point_cones[global_id]) {
+            int c = cf.first, f = cf.second;
+            cluster_cones[c][f].remove(global_id);
+            seen.insert(c);
+        }
+        for (int c : seen) {
+            ++cluster_tombstones[c];
+            if (cluster_counts[c] > 0) {
+                double frac = double(cluster_tombstones[c]) / double(cluster_counts[c]);
+                if (frac >= 0.10) _local_refresh(c);
+            }
+        }
+    }
+
+    // ── numpy views (call _refresh_views() in Python after any add/remove) ──
+
+    py::array_t<float> get_data_view() {
+        py::capsule dummy(data_buf.data(), [](void*){});
+        return py::array_t<float>(
+            {(py::ssize_t)n, (py::ssize_t)d},
+            {(py::ssize_t)(d * sizeof(float)), (py::ssize_t)sizeof(float)},
+            data_buf.data(), dummy);
+    }
+
+    py::array_t<uint8_t> get_deleted_mask() {
+        py::capsule dummy(del_mask.data(), [](void*){});
+        return py::array_t<uint8_t>(
+            {(py::ssize_t)n},
+            {(py::ssize_t)sizeof(uint8_t)},
+            del_mask.data(), dummy);
+    }
+
+    py::array_t<float> get_centroids() {
+        py::capsule dummy(centroids.data(), [](void*){});
+        return py::array_t<float>(
+            {(py::ssize_t)nlist, (py::ssize_t)d},
+            {(py::ssize_t)(d * sizeof(float)), (py::ssize_t)sizeof(float)},
+            centroids.data(), dummy);
+    }
+
+    bool has_cones(int c) const {
+        return c >= 0 && c < nlist && cluster_has_cones[c];
+    }
+
+    py::array_t<int32_t> get_cluster_global(int c) {
+        auto& cg = cluster_global[c];
+        auto out = py::array_t<int32_t>((py::ssize_t)cg.size());
+        auto buf = out.mutable_unchecked<1>();
+        for (py::ssize_t i = 0; i < (py::ssize_t)cg.size(); ++i)
+            buf(i) = (int32_t)cg[i];
+        return out;
+    }
+
+    SortedCone& get_cone(int c, int f) { return cluster_cones[c][f]; }
+
+    py::array_t<float> get_axes() const {
+        py::capsule dummy(const_cast<float*>(axes.data()), [](void*){});
+        return py::array_t<float>(
+            {(py::ssize_t)F, (py::ssize_t)d},
+            {(py::ssize_t)(d * sizeof(float)), (py::ssize_t)sizeof(float)},
+            axes.data(), dummy);
+    }
+
+    py::array_t<int64_t> get_cluster_counts() const {
+        auto out = py::array_t<int64_t>((py::ssize_t)nlist);
+        auto buf = out.mutable_unchecked<1>();
+        for (int c = 0; c < nlist; ++c) buf(c) = cluster_counts[c];
+        return out;
+    }
+
+    py::array_t<int64_t> get_cluster_tombstones() const {
+        auto out = py::array_t<int64_t>((py::ssize_t)nlist);
+        auto buf = out.mutable_unchecked<1>();
+        for (int c = 0; c < nlist; ++c) buf(c) = cluster_tombstones[c];
+        return out;
+    }
+
+    // Returns the (cluster, fan) pairs that contain global_id.
+    py::list get_point_cones(uint32_t gid) const {
+        py::list result;
+        if (gid < (uint32_t)point_cones.size()) {
+            for (auto& cf : point_cones[gid])
+                result.append(py::make_tuple((int)cf.first, (int)cf.second));
+        }
+        return result;
+    }
+
+    // ── query ─────────────────────────────────────────────────────────────────
+    //
+    // Full adaptive window-expansion query entirely in C++.
+    // Returns py::tuple(sq_dists float32[k], ids int32[k]) sorted nearest-first.
+    // Python wrapper applies metric conversion (sqrt / *0.5 / identity).
+
+    py::tuple query(
+        py::array_t<float, py::array::c_style | py::array::forcecast> q_np,
+        int k, int window_size, int probes, int fan_probes)
+    {
+        auto Q = q_np.unchecked<1>();
+        const float* qptr = &Q(0);
+        std::shared_lock<std::shared_mutex> lk(*p_mutex);
+
+        // ── Step 1: top probes clusters ───────────────────────────────────────
+        int K_c = std::min(probes, nlist);
+        std::vector<std::pair<float,int>> cdists(nlist);
+        for (int c = 0; c < nlist; ++c) {
+            float acc = 0.f;
+            const float* cent = &centroids[c * d];
+            for (int j = 0; j < d; ++j) { float diff = cent[j]-qptr[j]; acc += diff*diff; }
+            cdists[c] = {acc, c};
+        }
+        std::nth_element(cdists.begin(), cdists.begin() + K_c, cdists.end());
+        std::sort(cdists.begin(), cdists.begin() + K_c);
+
+        // ── Step 2: build cone contexts and fallback parts ────────────────────
+        struct ConeCtx {
+            const SortedCone* cone;
+            std::vector<float> q_proj;  // (F,) projection for this cluster
+        };
+        std::vector<ConeCtx> cone_ctxs;
+        std::vector<const std::vector<uint32_t>*> fallback_parts;
+
+        for (int ki = 0; ki < K_c; ++ki) {
+            int c = cdists[ki].second;
+            const auto& cg = cluster_global[c];
+            if (cg.empty()) continue;
+
+            if (!cluster_has_cones[c] || fan_probes >= F) {
+                fallback_parts.push_back(&cg);
+                continue;
+            }
+
+            const float* cent = &centroids[c * d];
+            std::vector<float> q_centered(d);
+            float qnorm2 = 0.f;
+            for (int j = 0; j < d; ++j) {
+                q_centered[j] = qptr[j] - cent[j];
+                qnorm2 += q_centered[j] * q_centered[j];
+            }
+            float inv_qnorm = (qnorm2 > 1e-20f) ? 1.f / std::sqrt(qnorm2) : 1.f;
+
+            std::vector<float> q_proj(F, 0.f);
+            for (int l = 0; l < F; ++l) {
+                const float* al = &axes[l * d];
+                float dot = 0.f;
+                for (int j = 0; j < d; ++j) dot += q_centered[j] * al[j];
+                q_proj[l] = dot;
+            }
+
+            int K_f = std::min(fan_probes, F);
+            std::vector<std::pair<float,int>> fsc(F);
+            for (int l = 0; l < F; ++l)
+                fsc[l] = {-std::abs(q_proj[l]) * inv_qnorm, l};
+            std::nth_element(fsc.begin(), fsc.begin() + K_f, fsc.end());
+
+            for (int ki2 = 0; ki2 < K_f; ++ki2) {
+                int f = fsc[ki2].second;
+                if (cluster_cones[c][f].size() > 0)
+                    cone_ctxs.push_back({&cluster_cones[c][f], q_proj});
+            }
+        }
+
+        // ── Step 3: adaptive window expansion ─────────────────────────────────
+        int w = std::max(k, 8);
+        std::vector<uint8_t> mask(n, 0);  // reused across iterations
+        std::vector<uint32_t> cands;
+
+        while (true) {
+            std::fill(mask.begin(), mask.end(), 0);
+
+            // Fallback: all live points in cluster
+            for (const auto* part : fallback_parts)
+                for (uint32_t gid : *part)
+                    if (gid < n && !del_mask[gid]) mask[gid] = 1;
+
+            // Cone candidates
+            for (const auto& ctx : cone_ctxs) {
+                if (ctx.cone->size() <= 2 * w) {
+                    if (!ctx.cone->axes.empty())
+                        for (const auto& p : ctx.cone->axes[0])
+                            if (!ctx.cone->tombstones.count(p.second) && p.second < n)
+                                mask[p.second] = 1;
+                } else {
+                    auto ids = ctx.cone->query_raw(ctx.q_proj.data(), w);
+                    for (uint32_t gid : ids) if (gid < n) mask[gid] = 1;
+                }
+            }
+
+            cands.clear();
+            for (uint32_t i = 0; i < n; ++i)
+                if (mask[i] && !del_mask[i]) cands.push_back(i);
+
+            if (w >= window_size || (int)cands.size() < k) break;
+
+            // Compute kth squared distance for coverage check
+            int m = (int)cands.size();
+            std::vector<float> dists_tmp(m);
+            for (int i = 0; i < m; ++i) {
+                const float* p = &data_buf[cands[i] * d];
+                float acc = 0.f;
+                for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
+                dists_tmp[i] = acc;
+            }
+            std::nth_element(dists_tmp.begin(), dists_tmp.begin() + k - 1, dists_tmp.end());
+            float kth_sq   = dists_tmp[k - 1];
+            float kth_proj = std::sqrt(std::max(0.f, kth_sq));
+
+            // Coverage check
+            bool all_covered = true;
+            for (const auto& ctx : cone_ctxs) {
+                if (ctx.cone->size() <= 2 * w) continue;
+                if (!ctx.cone->is_covered_raw(ctx.q_proj.data(), w, kth_proj)) {
+                    all_covered = false;
+                    break;
+                }
+            }
+            if (all_covered) break;
+
+            w = std::min(w * 2, window_size);
+        }
+
+        // Fallback: not enough candidates — return first k live points
+        if ((int)cands.size() < k) {
+            cands.clear();
+            for (uint32_t i = 0; i < n && (int)cands.size() < k; ++i)
+                if (!del_mask[i]) cands.push_back(i);
+        }
+
+        // Final L2 rerank
+        int m = (int)cands.size();
+        std::vector<float> sq_dists(m);
+        for (int i = 0; i < m; ++i) {
+            const float* p = &data_buf[cands[i] * d];
+            float acc = 0.f;
+            for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
+            sq_dists[i] = acc;
+        }
+
+        int actual_k = std::min(k, m);
+        std::vector<int> top_idx(m);
+        std::iota(top_idx.begin(), top_idx.end(), 0);
+        std::nth_element(top_idx.begin(), top_idx.begin() + actual_k, top_idx.end(),
+            [&](int a, int b) { return sq_dists[a] < sq_dists[b]; });
+        std::sort(top_idx.begin(), top_idx.begin() + actual_k,
+            [&](int a, int b) { return sq_dists[a] < sq_dists[b]; });
+
+        auto out_sq  = py::array_t<float>(actual_k);
+        auto out_ids = py::array_t<int32_t>(actual_k);
+        auto od = out_sq.mutable_unchecked<1>();
+        auto oi = out_ids.mutable_unchecked<1>();
+        for (int i = 0; i < actual_k; ++i) {
+            od(i) = sq_dists[top_idx[i]];
+            oi(i) = (int32_t)cands[top_idx[i]];
+        }
+        return py::make_tuple(out_sq, out_ids);
+    }
+
+    // ── query_candidates ──────────────────────────────────────────────────────
+    //
+    // Single-pass candidate collection (no adaptive loop, no rerank).
+    // Returns sorted int32 array of unique live global IDs.
+
+    py::array_t<int32_t> query_candidates(
+        py::array_t<float, py::array::c_style | py::array::forcecast> q_np,
+        int window_size, int probes, int fan_probes)
+    {
+        auto Q = q_np.unchecked<1>();
+        const float* qptr = &Q(0);
+        std::shared_lock<std::shared_mutex> lk(*p_mutex);
+
+        int K_c = std::min(probes, nlist);
+        std::vector<std::pair<float,int>> cdists(nlist);
+        for (int c = 0; c < nlist; ++c) {
+            float acc = 0.f;
+            const float* cent = &centroids[c * d];
+            for (int j = 0; j < d; ++j) { float diff = cent[j]-qptr[j]; acc += diff*diff; }
+            cdists[c] = {acc, c};
+        }
+        std::nth_element(cdists.begin(), cdists.begin() + K_c, cdists.end());
+        std::sort(cdists.begin(), cdists.begin() + K_c);
+
+        std::vector<uint8_t> mask(n, 0);
+
+        for (int ki = 0; ki < K_c; ++ki) {
+            int c = cdists[ki].second;
+            const auto& cg = cluster_global[c];
+            if (cg.empty()) continue;
+
+            if (!cluster_has_cones[c] || fan_probes >= F) {
+                for (uint32_t gid : cg)
+                    if (gid < n && !del_mask[gid]) mask[gid] = 1;
+                continue;
+            }
+
+            const float* cent = &centroids[c * d];
+            std::vector<float> q_centered(d);
+            float qnorm2 = 0.f;
+            for (int j = 0; j < d; ++j) {
+                q_centered[j] = qptr[j] - cent[j];
+                qnorm2 += q_centered[j] * q_centered[j];
+            }
+            float inv_qnorm = (qnorm2 > 1e-20f) ? 1.f / std::sqrt(qnorm2) : 1.f;
+
+            std::vector<float> q_proj(F, 0.f);
+            for (int l = 0; l < F; ++l) {
+                const float* al = &axes[l * d];
+                float dot = 0.f;
+                for (int j = 0; j < d; ++j) dot += q_centered[j] * al[j];
+                q_proj[l] = dot;
+            }
+
+            int K_f = std::min(fan_probes, F);
+            std::vector<std::pair<float,int>> fsc(F);
+            for (int l = 0; l < F; ++l)
+                fsc[l] = {-std::abs(q_proj[l]) * inv_qnorm, l};
+            std::nth_element(fsc.begin(), fsc.begin() + K_f, fsc.end());
+
+            for (int ki2 = 0; ki2 < K_f; ++ki2) {
+                int f = fsc[ki2].second;
+                const SortedCone& cone = cluster_cones[c][f];
+                int cone_sz = cone.size();
+                if (cone_sz == 0) continue;
+                if (cone_sz <= 2 * window_size) {
+                    if (!cone.axes.empty())
+                        for (const auto& p : cone.axes[0])
+                            if (!cone.tombstones.count(p.second) && p.second < n)
+                                mask[p.second] = 1;
+                } else {
+                    auto ids = cone.query_raw(q_proj.data(), window_size);
+                    for (uint32_t gid : ids) if (gid < n) mask[gid] = 1;
+                }
+            }
+        }
+
+        std::vector<uint32_t> cands;
+        for (uint32_t i = 0; i < n; ++i)
+            if (mask[i] && !del_mask[i]) cands.push_back(i);
+
+        auto out = py::array_t<int32_t>((py::ssize_t)cands.size());
+        auto buf = out.mutable_unchecked<1>();
+        for (size_t i = 0; i < cands.size(); ++i)
+            buf((py::ssize_t)i) = (int32_t)cands[i];
+        return out;
+    }
+
+    // ── local_refresh (public, GIL-free) ──────────────────────────────────────
+    //
+    // Rebuilds all cones for cluster c in-place using only C++ memory.
+    // The GIL is released by the pybind11 call_guard on the binding — this
+    // method itself contains no Python object accesses.
+
+    void local_refresh(int c) {
+        std::unique_lock<std::shared_mutex> lk(*p_mutex);
+        if (c >= 0 && c < nlist)
+            _local_refresh(c);
+    }
+
+private:
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    void _grow_buffers() {
+        uint32_t new_cap = capacity * 2;
+        data_buf.resize((size_t)new_cap * d, 0.f);
+        del_mask.resize(new_cap, 0);
+        point_cones.resize(new_cap);
+        capacity = new_cap;
+    }
+
+    bool _update_drift_and_check(int c, const double* v) {
+        double* s = sigma_drift[c].data();
+        const double omB = 1.0 - 0.01;   // _DRIFT_BETA = 0.01
+        for (int i = 0; i < d; ++i)
+            for (int j = 0; j < d; ++j)
+                s[i * d + j] = omB * s[i * d + j] + 0.01 * v[i] * v[j];
+
+        std::vector<double> ev(d), tmp(d);
+        const float* ax0 = &axes[0];
+        for (int j = 0; j < d; ++j) ev[j] = ax0[j];
+
+        for (int iter = 0; iter < 5; ++iter) {
+            for (int i = 0; i < d; ++i) {
+                double acc = 0.0;
+                for (int j = 0; j < d; ++j) acc += s[i * d + j] * ev[j];
+                tmp[i] = acc;
+            }
+            double norm2 = 0.0;
+            for (int j = 0; j < d; ++j) norm2 += tmp[j] * tmp[j];
+            if (norm2 < 1e-24) return false;
+            double inv = 1.0 / std::sqrt(norm2);
+            for (int j = 0; j < d; ++j) ev[j] = tmp[j] * inv;
+        }
+
+        double cos_max = 0.0;
+        for (int l = 0; l < F; ++l) {
+            const float* al = &axes[l * d];
+            double dot = 0.0;
+            for (int j = 0; j < d; ++j) dot += al[j] * ev[j];
+            double ab = std::abs(dot);
+            if (ab > cos_max) cos_max = ab;
+        }
+        const double cos_theta = std::cos(drift_theta * (3.14159265358979323846 / 180.0));
+        return cos_max < cos_theta;
+    }
+
+    void _build_cones(int c, const std::vector<uint32_t>& live_ids) {
+        int n_c = (int)live_ids.size();
+        cluster_cones[c].assign(F, SortedCone(F));
+        cluster_has_cones[c] = false;
+        if (n_c < 2) return;
+
+        const float* cent = &centroids[c * d];
+
+        // Step 1: gather centered vectors x_c (n_c × d) and compute norms.
+        std::vector<float> x_c((size_t)n_c * d);
+        std::vector<float> norms(n_c, 0.f);
+        for (int i = 0; i < n_c; ++i) {
+            const float* xi = &data_buf[live_ids[i] * d];
+            float s2 = 0.f;
+            for (int j = 0; j < d; ++j) {
+                float cj = xi[j] - cent[j];
+                x_c[i * d + j] = cj;
+                s2 += cj * cj;
+            }
+            norms[i] = (s2 > 1e-20f) ? std::sqrt(s2) : 1.f;
+        }
+
+        // Step 2: projs (n_c × F) = x_c (n_c × d) @ axes^T (F × d).
+        // ampi::sgemm(M, N, K, A, lda, B, ldb, C, ldc, transA=false, transB=true)
+        std::vector<float> projs((size_t)n_c * F, 0.f);
+        ampi::sgemm(n_c, F, d,
+                    x_c.data(), d,
+                    axes.data(), d,
+                    projs.data(), F,
+                    /*transA=*/false, /*transB=*/true);
+
+        // Top-K cone assignment per point
+        int K_f = std::min(cone_top_k, F);
+        std::vector<std::vector<int>> cone_pts(F);
+        std::vector<std::pair<float,int>> tmp(F);
+        for (int i = 0; i < n_c; ++i) {
+            float inv_n = 1.f / norms[i];
+            for (int l = 0; l < F; ++l)
+                tmp[l] = {-std::abs(projs[i * F + l]) * inv_n, l};
+            std::nth_element(tmp.begin(), tmp.begin() + K_f, tmp.end());
+            for (int k = 0; k < K_f; ++k) cone_pts[tmp[k].second].push_back(i);
+        }
+
+        // Clear old (c, *) entries from point_cones for these IDs
+        for (uint32_t gid : live_ids) {
+            auto& pc = point_cones[gid];
+            pc.erase(std::remove_if(pc.begin(), pc.end(),
+                [c](const std::pair<uint16_t,uint16_t>& p) {
+                    return p.first == (uint16_t)c;
+                }), pc.end());
+        }
+
+        // Build sorted cone arrays
+        for (int f = 0; f < F; ++f) {
+            auto& pts = cone_pts[f];
+            if (pts.empty()) continue;
+            cluster_has_cones[c] = true;
+            SortedCone& cone = cluster_cones[c][f];
+            for (int l = 0; l < F; ++l) {
+                auto& ax_l = cone.axes[l];
+                ax_l.clear();
+                ax_l.reserve(pts.size());
+                for (int local_i : pts)
+                    ax_l.push_back({projs[local_i * F + l], live_ids[local_i]});
+                std::sort(ax_l.begin(), ax_l.end());
+            }
+            for (int local_i : pts)
+                point_cones[live_ids[local_i]].push_back({(uint16_t)c, (uint16_t)f});
+        }
+    }
+
+    void _local_refresh(int c) {
+        auto& cg = cluster_global[c];
+        std::vector<uint32_t> live;
+        live.reserve(cg.size());
+        for (uint32_t gid : cg)
+            if (!del_mask[gid]) live.push_back(gid);
+
+        if (live.size() < 2) {
+            cluster_has_cones[c] = false;
+            cluster_cones[c].assign(F, SortedCone(F));
+        } else {
+            _build_cones(c, live);
+        }
+        cluster_global[c]       = std::move(live);
+        cluster_counts[c]       = (int64_t)cluster_global[c].size();
+        cluster_tombstones[c]   = 0;
+        std::fill(sigma_drift[c].begin(), sigma_drift[c].end(), 0.0);
+    }
+};
+
+// ── update_drift_and_check ────────────────────────────────────────────────────
+//
+// Fused drift EMA + 5-step power iteration.
+//
+// sigma        : (d*d,) float64, modified in-place (row-major flattened d×d)
+// axes         : (F, d)  float32
+// displacement : (d,)    float64
+// beta         : EMA decay (e.g. 0.01)
+// theta_deg    : angle threshold in degrees (e.g. 15.0)
+//
+// Performs:  Σ ← (1-β)Σ + β·v·vᵀ   then 5 power-iteration steps.
+// Returns true if the leading eigenvector is > theta_deg from all fan axes,
+// meaning _local_refresh should be triggered.
+
+bool update_drift_and_check(
+    py::array_t<double, py::array::c_style | py::array::forcecast> sigma,
+    py::array_t<float,  py::array::c_style | py::array::forcecast> axes,
+    py::array_t<double, py::array::c_style | py::array::forcecast> displacement,
+    double beta, double theta_deg)
+{
+    auto S  = sigma.mutable_unchecked<1>();
+    auto A  = axes.unchecked<2>();
+    auto V  = displacement.unchecked<1>();
+    const int64_t d = A.shape(1);
+    const int64_t F = A.shape(0);
+
+    // Σ ← (1-β)Σ + β·v·vᵀ  (in-place, row-major)
+    const double omB = 1.0 - beta;
+    for (int64_t i = 0; i < d; ++i) {
+        double vi = V(i);
+        for (int64_t j = 0; j < d; ++j)
+            S(i * d + j) = omB * S(i * d + j) + beta * vi * V(j);
+    }
+
+    // Power iteration — warm-start with axes[0]
+    std::vector<double> v(d), tmp(d);
+    for (int64_t j = 0; j < d; ++j)
+        v[j] = static_cast<double>(A(0, j));
+
+    for (int iter = 0; iter < 5; ++iter) {
+        for (int64_t i = 0; i < d; ++i) {
+            double acc = 0.0;
+            for (int64_t j = 0; j < d; ++j)
+                acc += S(i * d + j) * v[j];
+            tmp[i] = acc;
+        }
+        double norm2 = 0.0;
+        for (int64_t j = 0; j < d; ++j) norm2 += tmp[j] * tmp[j];
+        if (norm2 < 1e-24) return false;
+        double inv_norm = 1.0 / std::sqrt(norm2);
+        for (int64_t j = 0; j < d; ++j) v[j] = tmp[j] * inv_norm;
+    }
+
+    // cos_max = max |axis_l · v| over all axes
+    double cos_max = 0.0;
+    for (int64_t l = 0; l < F; ++l) {
+        double dot = 0.0;
+        for (int64_t j = 0; j < d; ++j)
+            dot += static_cast<double>(A(l, j)) * v[j];
+        double ab = std::abs(dot);
+        if (ab > cos_max) cos_max = ab;
+    }
+
+    const double cos_theta = std::cos(theta_deg * (3.14159265358979323846 / 180.0));
+    return cos_max < cos_theta;
+}
+
+// ── best_clusters ─────────────────────────────────────────────────────────────
+//
+// Returns (probes,) int32 — indices of the `probes` nearest centroids to q,
+// sorted nearest-first.  Uses nth_element (O(nlist)) + sort of the top slice.
+
+py::array_t<int32_t> best_clusters(
+    py::array_t<float, py::array::c_style | py::array::forcecast> centroids,
+    py::array_t<float, py::array::c_style | py::array::forcecast> q,
+    int probes)
+{
+    auto C  = centroids.unchecked<2>();
+    auto Q  = q.unchecked<1>();
+    const int64_t nlist = C.shape(0);
+    const int64_t d     = C.shape(1);
+
+    probes = static_cast<int>(std::min((int64_t)probes, nlist));
+
+    std::vector<std::pair<float, int32_t>> dists(nlist);
+    const float* qptr = &Q(0);
+    for (int64_t i = 0; i < nlist; ++i) {
+        float acc = 0.f;
+        const float* row = &C(i, 0);
+        for (int64_t j = 0; j < d; ++j) {
+            float diff = row[j] - qptr[j];
+            acc += diff * diff;
+        }
+        dists[i] = {acc, static_cast<int32_t>(i)};
+    }
+
+    std::nth_element(dists.begin(), dists.begin() + probes, dists.end(),
+                     [](const std::pair<float,int32_t>& a,
+                        const std::pair<float,int32_t>& b) {
+                         return a.first < b.first;
+                     });
+    std::sort(dists.begin(), dists.begin() + probes,
+              [](const std::pair<float,int32_t>& a,
+                 const std::pair<float,int32_t>& b) {
+                  return a.first < b.first;
+              });
+
+    auto out = py::array_t<int32_t>(probes);
+    auto buf = out.mutable_unchecked<1>();
+    for (int i = 0; i < probes; ++i)
+        buf(i) = dists[i].second;
+    return out;
+}
+
+// ── best_fan_cones ────────────────────────────────────────────────────────────
+//
+// Returns (fan_probes,) int32 — indices of cones with highest
+// |axis_l · q_centered| / ||q_centered||, sorted highest-first.
+
+py::array_t<int32_t> best_fan_cones(
+    py::array_t<float, py::array::c_style | py::array::forcecast> axes,
+    py::array_t<float, py::array::c_style | py::array::forcecast> q_centered,
+    int fan_probes)
+{
+    auto A  = axes.unchecked<2>();
+    auto QC = q_centered.unchecked<1>();
+    const int64_t F = A.shape(0);
+    const int64_t d = A.shape(1);
+
+    fan_probes = static_cast<int>(std::min((int64_t)fan_probes, F));
+
+    float qnorm2 = 0.f;
+    const float* qptr = &QC(0);
+    for (int64_t j = 0; j < d; ++j) qnorm2 += qptr[j] * qptr[j];
+    const float qnorm = (qnorm2 > 1e-20f) ? std::sqrt(qnorm2) : 1.f;
+
+    // Store negated score so nth_element brings the best (largest |proj|) first.
+    std::vector<std::pair<float, int32_t>> scores(F);
+    for (int64_t l = 0; l < F; ++l) {
+        float dot = 0.f;
+        const float* row = &A(l, 0);
+        for (int64_t j = 0; j < d; ++j) dot += row[j] * qptr[j];
+        scores[l] = {-std::abs(dot) / qnorm, static_cast<int32_t>(l)};
+    }
+
+    std::nth_element(scores.begin(), scores.begin() + fan_probes, scores.end(),
+                     [](const std::pair<float,int32_t>& a,
+                        const std::pair<float,int32_t>& b) {
+                         return a.first < b.first;
+                     });
+    std::sort(scores.begin(), scores.begin() + fan_probes,
+              [](const std::pair<float,int32_t>& a,
+                 const std::pair<float,int32_t>& b) {
+                  return a.first < b.first;
+              });
+
+    auto out = py::array_t<int32_t>(fan_probes);
+    auto buf = out.mutable_unchecked<1>();
+    for (int i = 0; i < fan_probes; ++i)
+        buf(i) = scores[i].second;
+    return out;
+}
+
 // ── module ────────────────────────────────────────────────────────────────────
 
 PYBIND11_MODULE(_ampi_ext, m) {
@@ -337,6 +1403,110 @@ PYBIND11_MODULE(_ampi_ext, m) {
           "Union-mode candidate selection via sorted projections",
           py::arg("sorted_idxs"), py::arg("sorted_projs"),
           py::arg("q_projs"), py::arg("window_size"));
+    py::class_<AMPIIndex>(m, "AMPIIndex",
+        "C++ index owning all mutable state: data, cones, drift covariance.\n\n"
+        "Construct via AMPIIndex.from_build(...).  Call add()/remove() for "
+        "streaming mutations.  Use get_data_view() / get_deleted_mask() / "
+        "get_centroids() to get zero-copy numpy views (refresh after add/remove).")
+        .def_static("from_build", &AMPIIndex::from_build,
+             py::arg("d"), py::arg("F"), py::arg("nlist"), py::arg("cone_top_k"),
+             py::arg("drift_theta"), py::arg("cosine"),
+             py::arg("axes_np"), py::arg("centroids_np"),
+             py::arg("cluster_counts_np"), py::arg("sigma_drift_np"),
+             py::arg("data_np"), py::arg("del_mask_np"), py::arg("n_init"),
+             py::arg("cluster_global_list"))
+        .def("add",    &AMPIIndex::add,    py::arg("x"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Insert one (d,) float32 vector.  Returns int global_id.")
+        .def("remove", &AMPIIndex::remove, py::arg("global_id"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Logical-delete a point.  Triggers compaction if needed.")
+        .def("batch_add", &AMPIIndex::batch_add, py::arg("data"),
+             "Insert (m, d) float32 array under one exclusive lock.\n\n"
+             "Returns (m,) int32 array of assigned global IDs.")
+        .def("batch_delete", &AMPIIndex::batch_delete, py::arg("ids"),
+             "Tombstone all ids in (m,) int32 array under one exclusive lock.")
+        .def("get_data_view",      &AMPIIndex::get_data_view,
+             "Zero-copy (n, d) float32 numpy view into the data buffer.")
+        .def("get_deleted_mask",   &AMPIIndex::get_deleted_mask,
+             "Zero-copy (n,) uint8 numpy view (1 = deleted).")
+        .def("get_centroids",      &AMPIIndex::get_centroids,
+             "Zero-copy (nlist, d) float32 numpy view of centroids.")
+        .def("has_cones",          &AMPIIndex::has_cones, py::arg("c"),
+             "True if cluster c has initialised SortedCones.")
+        .def("get_cluster_global", &AMPIIndex::get_cluster_global, py::arg("c"),
+             "Return (m,) int32 array of global IDs belonging to cluster c.")
+        .def("get_cone",           &AMPIIndex::get_cone, py::arg("c"), py::arg("f"),
+             py::return_value_policy::reference_internal,
+             "Reference to SortedCone for cluster c, fan axis f.")
+        .def("get_point_cones",   &AMPIIndex::get_point_cones, py::arg("gid"),
+             "Returns list of (cluster, fan) tuples containing global_id.")
+        .def("get_axes",               &AMPIIndex::get_axes,
+             "Zero-copy (F, d) float32 numpy view of the fan axes.")
+        .def("get_cluster_counts",     &AMPIIndex::get_cluster_counts,
+             "Returns (nlist,) int64 array of live-point counts per cluster.")
+        .def("get_cluster_tombstones", &AMPIIndex::get_cluster_tombstones,
+             "Returns (nlist,) int64 array of tombstone counts per cluster.")
+        .def_readonly("n",             &AMPIIndex::n,
+             "Current total number of inserted points (live + deleted).")
+        .def_readonly("n_deleted",     &AMPIIndex::n_deleted,
+             "Number of logically deleted points.")
+        .def_readonly("capacity",      &AMPIIndex::capacity,
+             "Allocated data-buffer capacity.")
+        .def_readonly("nlist",         &AMPIIndex::nlist,
+             "Number of coarse clusters.")
+        .def_readonly("F",             &AMPIIndex::F,
+             "Number of fan axes (sort directions) per cluster.")
+        .def_readonly("d",             &AMPIIndex::d,
+             "Vector dimensionality.")
+        .def_readonly("cone_top_k",    &AMPIIndex::cone_top_k,
+             "Soft-assignment multiplicity (number of clusters/cones per point).")
+        .def_readonly("cosine_metric", &AMPIIndex::cosine_metric,
+             "True if the index uses cosine distance.")
+        .def_readwrite("drift_theta",  &AMPIIndex::drift_theta,
+             "Drift-angle threshold in degrees.  Writable — change at any time.")
+        .def("query", &AMPIIndex::query,
+             py::arg("q"), py::arg("k"), py::arg("window_size"),
+             py::arg("probes"), py::arg("fan_probes"),
+             "Adaptive sorted-projection query entirely in C++.\n\n"
+             "Returns (sq_dists float32[k], ids int32[k]) sorted nearest-first.\n"
+             "Python wrapper applies metric conversion (sqrt / *0.5 / identity).")
+        .def("query_candidates", &AMPIIndex::query_candidates,
+             py::arg("q"), py::arg("window_size"),
+             py::arg("probes"), py::arg("fan_probes"),
+             "Single-pass candidate collection without reranking.\n\n"
+             "Returns sorted int32 array of unique live global IDs.")
+        .def("local_refresh", &AMPIIndex::local_refresh,
+             py::arg("c"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Rebuild all cones for cluster c without holding the GIL.\n\n"
+             "Resets tombstone count and drift covariance for cluster c.\n"
+             "No-op if c is out of range.");
+
+    m.def("update_drift_and_check", &update_drift_and_check,
+          "Fused drift EMA + power iteration.\n\n"
+          "  sigma        : (d*d,) float64, modified in-place\n"
+          "  axes         : (F, d)  float32\n"
+          "  displacement : (d,)    float64\n"
+          "  beta         : float   EMA decay\n"
+          "  theta_deg    : float   refresh threshold in degrees\n"
+          "Returns True if _local_refresh should be triggered.",
+          py::arg("sigma"), py::arg("axes"), py::arg("displacement"),
+          py::arg("beta"), py::arg("theta_deg"));
+    m.def("best_clusters", &best_clusters,
+          "Indices of the `probes` nearest centroids to q, sorted nearest-first.\n\n"
+          "  centroids : (nlist, d) float32\n"
+          "  q         : (d,)       float32\n"
+          "  probes    : int\n"
+          "Returns (probes,) int32.",
+          py::arg("centroids"), py::arg("q"), py::arg("probes"));
+    m.def("best_fan_cones", &best_fan_cones,
+          "Indices of the `fan_probes` cones with highest |normed projection|.\n\n"
+          "  axes       : (F, d) float32\n"
+          "  q_centered : (d,)   float32\n"
+          "  fan_probes : int\n"
+          "Returns (fan_probes,) int32, sorted highest-first.",
+          py::arg("axes"), py::arg("q_centered"), py::arg("fan_probes"));
 
     py::class_<SortedCone>(m, "SortedCone",
         "Mutable sorted-projection cone supporting streaming insert/delete.\n\n"
