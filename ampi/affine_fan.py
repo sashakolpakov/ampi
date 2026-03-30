@@ -29,10 +29,11 @@ update(id, x)  — delete + insert.
 
 Cluster assignment uses nearest-centroid (top-K by L2).
 
-Drift detection: per cluster a d×d covariance EMA tracks the displacement
-(x − y) where y is the approximate NN of x found from the just-inserted
-cones.  When the leading eigenvector has rotated more than _DRIFT_THETA
-degrees from all fan axes, _local_refresh(c) rebuilds the cluster's cones.
+Drift detection: per cluster an Oja subspace sketch U_drift tracks the
+displacement (x − y) where y is the approximate NN of x found from the
+just-inserted cones.  When the leading eigenvector estimate has rotated
+more than _DRIFT_THETA degrees from all fan axes, _local_refresh(c)
+rebuilds the cluster's cones.
 """
 
 import numpy as np
@@ -86,6 +87,7 @@ _DRIFT_BETA           = 0.01   # EMA decay for per-cluster drift covariance
 _DRIFT_THETA          = 15.0   # degrees — fan-axis refresh trigger
 _TOMBSTONE_THRESHOLD  = 0.10   # compact when tombstones > 10 % of cluster size
 _NN_PROBE_W           = 8      # half-window for approx-NN lookup in drift EMA
+_U_REORTH_INTERVAL = 50   # QR re-orthonormalise every N inserts per cluster
 
 # ── Periodic cluster-merge constants ─────────────────────────────────────────
 _MERGE_INTERVAL       = 0      # 0 = disabled; set > 0 to enable periodic merge
@@ -434,13 +436,16 @@ class AMPIAffineFanIndex:
                                             dtype=np.int64)
         self._cluster_tombstones = np.zeros(self.nlist, dtype=np.int64)
 
-        # Per-cluster drift covariance EMA — flat (nlist, d*d) float64.
-        # Each row is a row-major flattened d×d covariance matrix.
-        self._sigma_drift = np.zeros((self.nlist, self.d * self.d), dtype=np.float64)
+        # Per-cluster Oja subspace sketch: top-F eigenvectors of the displacement
+        # covariance EMA.  Shape (nlist, d, F) float32 — ~60× smaller than the
+        # full d×d covariance at d=960 (120 MB vs 7.4 GB at nlist=1000).
+        self._U_drift = np.zeros((self.nlist, self.d, self.F), dtype=np.float32)
+        # Per-cluster insert counter for periodic QR re-orthonormalisation.
+        self._U_reorth_count = np.zeros(self.nlist, dtype=np.int32)
 
         # Per-cluster fan axes — list of nlist (F, d) float32 arrays, or None
         # meaning "use global self.axes".  Populated by _local_refresh via
-        # _compute_cluster_axes (deflated power iteration on Σ_drift).
+        # _compute_cluster_axes (from U_drift Oja sketch columns).
         self.cluster_axes = [None] * self.nlist
 
         # Insert counter for periodic merge; only used by the Python path.
@@ -453,7 +458,7 @@ class AMPIAffineFanIndex:
                 self.d, self.F, self.nlist, self.cone_top_k,
                 self.drift_theta, self.metric == 'cosine',
                 self.axes, self.centroids,
-                self._cluster_counts, self._sigma_drift,
+                self._cluster_counts, self._U_drift,
                 self._data_buf, self._del_mask_buf.astype(np.uint8),
                 self.n,
                 self.cluster_global,
@@ -499,52 +504,28 @@ class AMPIAffineFanIndex:
         return np.argsort(-np.abs(proj))[:fan_probes]
 
     def _compute_cluster_axes(self, c):
-        """Compute F fan axes for cluster c from Σ_drift via deflated power iteration.
+        """Return F fan axes for cluster c from the Oja sketch U_drift[c].
 
-        Returns an (F, d) float32 array of unit vectors.  Falls back to the
-        global random axes when Σ_drift[c] has insufficient signal
-        (Frobenius norm < 1e-10).  This is called by _local_refresh before
-        Σ_drift is reset, so the axes reflect accumulated drift direction.
+        Columns of U_drift[c] are the accumulated eigenvector estimates.
+        Falls back to global axes when the sketch has insufficient signal.
         """
-        sig = self._sigma_drift[c].reshape(self.d, self.d)
-        if np.linalg.norm(sig, 'fro') < 1e-10:
-            return self.axes   # share immutable global axes as fallback
-
-        S      = sig.astype(np.float64).copy()
-        result = np.empty((self.F, self.d), dtype=np.float32)
-
-        for l in range(self.F):
-            v = self.axes[l].astype(np.float64)   # warm start: global axis l
-            for _ in range(self.axes_power_iters):
-                vn   = S @ v
-                norm = float(np.linalg.norm(vn))
-                if norm < 1e-15:
-                    v = self.axes[l].astype(np.float64)
-                    break
-                v = vn / norm
-            result[l] = v.astype(np.float32)
-            # Deflation: S -= λ·vvᵀ  so next iteration finds the next eigenvector
-            lam  = float(v @ S @ v)
-            S   -= lam * np.outer(v, v)
-
-        return result
+        U = self._U_drift[c]          # (d, F)
+        norms = np.linalg.norm(U, axis=0)   # (F,)
+        if norms[0] < 1e-6:
+            return self.axes          # no signal yet — use global axes
+        U_norm = U / np.maximum(norms, 1e-12)
+        return U_norm.T.astype(np.float32)  # (F, d)
 
     def _check_drift(self, c):
-        """Power iteration on Σ_drift[c]; trigger _local_refresh if the
-        leading eigenvector is > _DRIFT_THETA degrees from all fan axes.
+        """Check if U_drift[:,0] has rotated > drift_theta from all fan axes.
         Python fallback — only called when C++ ext is unavailable."""
-        sig = self._sigma_drift[c].reshape(self.d, self.d)
-        # Warm-start with the first axis (likely already well-aligned).
-        v = sig @ self.axes[0].astype(np.float64)
-        for _ in range(5):
-            v = sig @ v
-            norm = float(np.linalg.norm(v))
-            if norm < 1e-12:
-                return
-            v /= norm
-        # Compare against per-cluster axes if available, else global.
-        axes_c  = self.cluster_axes[c] if self.cluster_axes[c] is not None else self.axes
-        cos_max = float(np.max(np.abs(axes_c.astype(np.float64) @ v)))
+        u0 = self._U_drift[c, :, 0]
+        norm = float(np.linalg.norm(u0))
+        if norm < 1e-6:
+            return          # no signal accumulated yet
+        u0 = u0 / norm
+        axes_c = self.cluster_axes[c] if self.cluster_axes[c] is not None else self.axes
+        cos_max = float(np.max(np.abs(axes_c.astype(np.float64) @ u0)))
         if cos_max < np.cos(np.radians(self.drift_theta)):
             self._local_refresh(c)
 
@@ -552,8 +533,8 @@ class AMPIAffineFanIndex:
         """Rebuild all cones for cluster c in-place.
 
         Evicts tombstoned entries, rebalances cone assignments using
-        per-cluster axes derived from Σ_drift (or global axes as fallback),
-        and resets the drift covariance.  O(N_c · F · log N_c).
+        per-cluster axes derived from U_drift (or global axes as fallback),
+        and resets the Oja sketch.  O(N_c · F · log N_c).
         """
         c_global = self.cluster_global[c]
         if len(c_global) == 0:
@@ -569,7 +550,8 @@ class AMPIAffineFanIndex:
             self.cluster_cones[c] = None
             self.cluster_global[c] = c_idx
             self._cluster_tombstones[c] = 0
-            self._sigma_drift[c][:] = 0
+            self._U_drift[c][:] = 0
+            self._U_reorth_count[c] = 0
             self.cluster_axes[c] = None
             return
 
@@ -581,7 +563,7 @@ class AMPIAffineFanIndex:
                     (cc, ff) for cc, ff in self._point_cones[gid_i] if cc != c
                 ]
 
-        # Derive per-cluster axes from accumulated Σ_drift before resetting it.
+        # Derive per-cluster axes from accumulated U_drift before resetting it.
         axes_c = self._compute_cluster_axes(c)
         self.cluster_axes[c] = axes_c
 
@@ -593,7 +575,8 @@ class AMPIAffineFanIndex:
         self.cluster_global[c]      = c_idx
         self._cluster_counts[c]     = len(c_idx)   # keep denominator in sync
         self._cluster_tombstones[c] = 0
-        self._sigma_drift[c][:]     = 0            # reset AFTER computing axes
+        self._U_drift[c][:]         = 0            # reset AFTER computing axes
+        self._U_reorth_count[c]     = 0
 
         for global_id, fs in pc.items():
             for f in fs:
@@ -650,10 +633,11 @@ class AMPIAffineFanIndex:
         self.cluster_global[fold]  = np.array([], dtype=np.int32)
         self.cluster_cones[fold]   = None
         self.cluster_axes[fold]    = None
-        self._sigma_drift[fold][:] = 0
+        self._U_drift[fold][:] = 0
+        self._U_reorth_count[fold] = 0
 
         # Rebuild cones for the merged cluster (also resets tombstone count,
-        # Σ_drift, and computes per-cluster axes).
+        # U_drift, and computes per-cluster axes).
         self._local_refresh(keep)
 
     def _py_periodic_merge(self):
@@ -818,7 +802,7 @@ class AMPIAffineFanIndex:
             self.centroids[c] = ((N * self.centroids[c] + x) / (N + 1)).astype(np.float32)
             self._cluster_counts[c] = N + 1
 
-            # §1.3  Drift covariance EMA: Σ ← (1-β)Σ + β·(x-y)(x-y)ᵀ
+            # §1.3  Oja subspace sketch: U ← (1-β)U + β·v·(vᵀU)ᵀ, then normalise columns
             # y = approx NN of x within this cluster, found from the cones
             # we just inserted into.  Falls back to centroid when the cone
             # is too small to provide a meaningful neighbour.
@@ -838,21 +822,26 @@ class AMPIAffineFanIndex:
                             approx_nn = self.data[nn_cands[int(np.argmin(nn_dists))]]
 
                 displacement = (x - approx_nn) if approx_nn is not None else centered
-                v = displacement.astype(np.float64)
-                if _HAS_EXT:
-                    # C++ update_drift_and_check compares against global axes;
-                    # if it triggers a refresh, _local_refresh will compute
-                    # per-cluster axes from the accumulated Σ_drift.
-                    if _cpp_update_drift_and_check(
-                            self._sigma_drift[c], self.axes, v,
-                            _DRIFT_BETA, self.drift_theta):
-                        self._local_refresh(c)
+                v = displacement.astype(np.float32)
+                # Oja's subspace rule: update U_drift then check angle.
+                U = self._U_drift[c]                 # (d, F) view
+                proj = v @ U                         # (F,)
+                U *= (1.0 - _DRIFT_BETA)
+                U += _DRIFT_BETA * np.outer(v, proj)
+                # Column normalisation (cheap; full QR every _U_REORTH_INTERVAL steps).
+                self._U_reorth_count[c] += 1
+                if self._U_reorth_count[c] >= _U_REORTH_INTERVAL:
+                    norms = np.linalg.norm(U, axis=0)
+                    mask = norms > 1e-12
+                    if mask.any():
+                        U[:, mask] /= norms[mask]
+                    self._U_reorth_count[c] = 0
                 else:
-                    self._sigma_drift[c] = (
-                        (1.0 - _DRIFT_BETA) * self._sigma_drift[c]
-                        + _DRIFT_BETA * np.outer(v, v).ravel()
-                    )
-                    self._check_drift(c)
+                    norms = np.linalg.norm(U, axis=0)
+                    mask = norms > 1e-12
+                    if mask.any():
+                        U[:, mask] /= norms[mask]
+                self._check_drift(c)
 
         # §Merge: after every merge_interval inserts, scan cluster pairs.
         if self.merge_interval > 0:

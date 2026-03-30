@@ -290,7 +290,7 @@ else:
     print("C++ routing: SKIPPED (C++ ext not built)")
 
 
-# ── C++ drift EMA: update_drift_and_check ─────────────────────────────────────
+# ── C++ Oja sketch: update_drift_and_check ────────────────────────────────────
 if _HAS_CPP:
     from ampi._ampi_ext import update_drift_and_check
 
@@ -298,42 +298,52 @@ if _HAS_CPP:
     _D2, _F2     = 32, 16
     _BETA2, _TH2 = 0.01, 15.0
 
-    def _py_drift(sigma_flat, axes, v, beta, theta_deg):
-        sig = sigma_flat.reshape(axes.shape[1], axes.shape[1])
-        sig = (1.0 - beta) * sig + beta * np.outer(v, v)
-        sigma_flat[:] = sig.ravel()
-        ev = sig @ axes[0].astype(np.float64)
-        for _ in range(5):
-            ev = sig @ ev
-            norm = float(np.linalg.norm(ev))
-            if norm < 1e-12:
-                return False
-            ev /= norm
-        cos_max = float(np.max(np.abs(axes.astype(np.float64) @ ev)))
+    def _py_oja(U, axes, v, beta, theta_deg):
+        """Python reference Oja update; mirrors C++ update_drift_and_check."""
+        v = v.astype(np.float32)
+        proj = v @ U                         # (F,)
+        U *= (1.0 - beta)
+        U += beta * np.outer(v, proj)
+        norms = np.linalg.norm(U, axis=0)
+        mask = norms > 1e-12
+        if mask.any():
+            U[:, mask] /= norms[mask]
+        u0 = U[:, 0].copy()
+        norm0 = float(np.linalg.norm(u0))
+        if norm0 < 1e-6:
+            return False
+        u0 /= norm0
+        cos_max = float(np.max(np.abs(axes.astype(np.float64) @ u0)))
         return cos_max < float(np.cos(np.radians(theta_deg)))
 
     _axes2  = _rng2.standard_normal((_F2, _D2)).astype(np.float32)
     _axes2 /= np.linalg.norm(_axes2, axis=1, keepdims=True)
 
-    _sc, _sr = np.zeros(_D2 * _D2, dtype=np.float64), np.zeros(_D2 * _D2, dtype=np.float64)
+    # Verify U_drift state tracks between C++ and Python after 1000 steps.
+    _Uc = np.zeros((_D2, _F2), dtype=np.float32)
+    _Ur = np.zeros((_D2, _F2), dtype=np.float32)
     for _ in range(1000):
-        _v2 = _rng2.standard_normal(_D2)
-        update_drift_and_check(_sc, _axes2, _v2, _BETA2, _TH2)
-        _py_drift(_sr, _axes2, _v2, _BETA2, _TH2)
-    np.testing.assert_allclose(_sc, _sr, atol=1e-10,
-        err_msg="sigma_drift C++ vs Python diverged after 1000 steps")
+        _v2 = _rng2.standard_normal(_D2).astype(np.float32)
+        update_drift_and_check(_Uc, _axes2, _v2, _BETA2, _TH2)
+        _py_oja(_Ur, _axes2, _v2.copy(), _BETA2, _TH2)
+    np.testing.assert_allclose(_Uc, _Ur, atol=1e-5,
+        err_msg="U_drift C++ vs Python diverged after 1000 steps")
 
-    _sc2, _sr2, _mm = np.zeros(_D2 * _D2, dtype=np.float64), np.zeros(_D2 * _D2, dtype=np.float64), 0
+    # Verify refresh flags match between C++ and Python.
+    _Uc2 = np.zeros((_D2, _F2), dtype=np.float32)
+    _Ur2 = np.zeros((_D2, _F2), dtype=np.float32)
+    _mm = 0
     for _ in range(500):
-        _v2 = _rng2.standard_normal(_D2)
-        if bool(update_drift_and_check(_sc2, _axes2, _v2, _BETA2, _TH2)) != \
-           _py_drift(_sr2, _axes2, _v2, _BETA2, _TH2):
+        _v2 = _rng2.standard_normal(_D2).astype(np.float32)
+        cpp_flag = bool(update_drift_and_check(_Uc2, _axes2, _v2, _BETA2, _TH2))
+        py_flag  = _py_oja(_Ur2, _axes2, _v2.copy(), _BETA2, _TH2)
+        if cpp_flag != py_flag:
             _mm += 1
     assert _mm == 0, f"{_mm} refresh-flag mismatches C++ vs Python"
 
-    print("C++ drift EMA (update_drift_and_check): OK")
+    print("C++ Oja sketch (update_drift_and_check): OK")
 else:
-    print("C++ drift EMA: SKIPPED (C++ ext not built)")
+    print("C++ Oja sketch: SKIPPED (C++ ext not built)")
 
 
 # ── local_refresh GIL safety ──────────────────────────────────────────────────

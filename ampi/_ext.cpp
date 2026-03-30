@@ -418,7 +418,7 @@ public:
     std::vector<bool>     cluster_has_cones;
     std::vector<std::vector<uint32_t>>   cluster_global;
     std::vector<std::vector<SortedCone>> cluster_cones;   // [nlist][F]
-    std::vector<std::vector<double>>     sigma_drift;     // [nlist][d*d]
+    std::vector<std::vector<float>>      U_drift;         // [nlist][d*F], row-major (d rows, F cols)
     // Per-cluster fan axes (F*d floats each); empty vector means use global axes.
     // Populated by _compute_cluster_axes() during _local_refresh.
     std::vector<std::vector<float>>      cluster_axes;    // [nlist]
@@ -444,7 +444,7 @@ public:
         py::array_t<float,   py::array::c_style | py::array::forcecast> axes_np,
         py::array_t<float,   py::array::c_style | py::array::forcecast> centroids_np,
         py::array_t<int64_t, py::array::c_style | py::array::forcecast> cluster_counts_np,
-        py::array_t<double,  py::array::c_style | py::array::forcecast> sigma_drift_np,
+        py::array_t<float,   py::array::c_style | py::array::forcecast> U_drift_np,
         py::array_t<float,   py::array::c_style | py::array::forcecast> data_np,
         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> del_mask_np,
         int n_init,
@@ -498,13 +498,14 @@ public:
             idx.cluster_counts[c] = CC(c);
         idx.cluster_tombstones.assign(nlist, 0);
 
-        // sigma drift
-        idx.sigma_drift.resize(nlist);
-        auto SD = sigma_drift_np.unchecked<2>();
+        // Oja sketch: U_drift[c] is (d*F) float32, row-major (d rows, F cols)
+        idx.U_drift.resize(nlist);
+        auto UD = U_drift_np.unchecked<3>();
         for (int c = 0; c < nlist; ++c) {
-            idx.sigma_drift[c].resize((size_t)d * d);
-            for (int j = 0; j < d * d; ++j)
-                idx.sigma_drift[c][j] = SD(c, j);
+            idx.U_drift[c].resize((size_t)d * F, 0.f);
+            for (int j = 0; j < d; ++j)
+                for (int l = 0; l < F; ++l)
+                    idx.U_drift[c][j * F + l] = UD(c, j, l);
         }
 
         // cluster_global
@@ -703,7 +704,7 @@ public:
                         if (gid2 != global_id && !del_mask[gid2])
                             nn_set.insert(gid2);
                 }
-                std::vector<double> v(d);
+                std::vector<float> v(d);
                 if (!nn_set.empty()) {
                     float best_d2 = std::numeric_limits<float>::max();
                     const float* best_ptr = nullptr;
@@ -1165,42 +1166,53 @@ private:
         capacity = new_cap;
     }
 
-    bool _update_drift_and_check(int c, const double* v) {
-        double* s = sigma_drift[c].data();
-        const double omB = 1.0 - 0.01;   // _DRIFT_BETA = 0.01
-        for (int i = 0; i < d; ++i)
-            for (int j = 0; j < d; ++j)
-                s[i * d + j] = omB * s[i * d + j] + 0.01 * v[i] * v[j];
+    bool _update_drift_and_check(int c, const float* v) {
+        float* U = U_drift[c].data();   // (d, F) row-major: U[j*F + l]
+        constexpr float beta  = 0.01f;
+        constexpr float omB   = 1.0f - beta;
 
-        std::vector<double> ev(d), tmp(d);
-        const float* ax0 = &axes[0];
-        for (int j = 0; j < d; ++j) ev[j] = ax0[j];
-
-        for (int iter = 0; iter < 5; ++iter) {
-            for (int i = 0; i < d; ++i) {
-                double acc = 0.0;
-                for (int j = 0; j < d; ++j) acc += s[i * d + j] * ev[j];
-                tmp[i] = acc;
-            }
-            double norm2 = 0.0;
-            for (int j = 0; j < d; ++j) norm2 += tmp[j] * tmp[j];
-            if (norm2 < 1e-24) return false;
-            double inv = 1.0 / std::sqrt(norm2);
-            for (int j = 0; j < d; ++j) ev[j] = tmp[j] * inv;
+        // proj[l] = Σ_j v[j] * U[j*F + l]
+        std::vector<float> proj(F, 0.f);
+        for (int j = 0; j < d; ++j) {
+            float vj = v[j];
+            for (int l = 0; l < F; ++l)
+                proj[l] += vj * U[j * F + l];
         }
 
-        // Compare against per-cluster axes if available, else global.
+        // U[j*F+l] = omB * U[j*F+l] + beta * v[j] * proj[l]
+        for (int j = 0; j < d; ++j) {
+            float vj = v[j];
+            for (int l = 0; l < F; ++l)
+                U[j * F + l] = omB * U[j * F + l] + beta * vj * proj[l];
+        }
+
+        // Normalise each column
+        for (int l = 0; l < F; ++l) {
+            float norm2 = 0.f;
+            for (int j = 0; j < d; ++j) norm2 += U[j * F + l] * U[j * F + l];
+            if (norm2 > 1e-24f) {
+                float inv = 1.f / std::sqrt(norm2);
+                for (int j = 0; j < d; ++j) U[j * F + l] *= inv;
+            }
+        }
+
+        // Drift check: compare U[:, 0] (leading eigenvec estimate) against fan axes.
+        float norm0 = 0.f;
+        for (int j = 0; j < d; ++j) norm0 += U[j * F] * U[j * F];
+        if (norm0 < 1e-12f) return false;   // no signal yet
+
         const float* cmp_axes = cluster_axes[c].empty()
                                 ? axes.data() : cluster_axes[c].data();
-        double cos_max = 0.0;
+        float cos_max = 0.f;
         for (int l = 0; l < F; ++l) {
-            const float* al = cmp_axes + l * d;
-            double dot = 0.0;
-            for (int j = 0; j < d; ++j) dot += al[j] * ev[j];
-            double ab = std::abs(dot);
+            const float* al = cmp_axes + (size_t)l * d;
+            float dot = 0.f;
+            for (int j = 0; j < d; ++j) dot += al[j] * U[j * F];
+            float ab = std::abs(dot);
             if (ab > cos_max) cos_max = ab;
         }
-        const double cos_theta = std::cos(drift_theta * (3.14159265358979323846 / 180.0));
+
+        const float cos_theta = std::cos((float)drift_theta * (3.14159265f / 180.f));
         return cos_max < cos_theta;
     }
 
@@ -1284,7 +1296,7 @@ private:
         for (uint32_t gid : cg)
             if (!del_mask[gid]) live.push_back(gid);
 
-        // Derive per-cluster axes from accumulated Σ_drift BEFORE resetting it.
+        // Derive per-cluster axes from accumulated U_drift BEFORE resetting it.
         _compute_cluster_axes(c);
 
         if (live.size() < 2) {
@@ -1296,68 +1308,37 @@ private:
         cluster_global[c]       = std::move(live);
         cluster_counts[c]       = (int64_t)cluster_global[c].size();
         cluster_tombstones[c]   = 0;
-        std::fill(sigma_drift[c].begin(), sigma_drift[c].end(), 0.0);
+        std::fill(U_drift[c].begin(), U_drift[c].end(), 0.f);
     }
 
-    // ── per-cluster axes (deflated power iteration on Σ_drift) ───────────────
+    // ── per-cluster axes (from Oja sketch U_drift) ───────────────────────────
     //
-    // Computes F leading eigenvectors of sigma_drift[c] and stores them in
-    // cluster_axes[c] as (F*d) floats.  Falls back to clearing cluster_axes[c]
-    // (= use global axes) when the Frobenius norm of Σ_drift is too small.
+    // Copies and normalises the F columns of U_drift[c] into cluster_axes[c]
+    // as (F*d) floats.  Falls back to clearing cluster_axes[c]
+    // (= use global axes) when the leading column has insufficient signal.
 
     void _compute_cluster_axes(int c) {
-        const auto& s = sigma_drift[c];
-        // Frobenius norm² check
-        double snorm2 = 0.0;
-        for (double v : s) snorm2 += v * v;
-        if (snorm2 < 1e-20) {
+        const float* U = U_drift[c].data();   // (d, F) row-major
+
+        // Check if the leading column has signal.
+        float norm0 = 0.f;
+        for (int j = 0; j < d; ++j) norm0 += U[j * F] * U[j * F];
+        if (norm0 < 1e-12f) {
             cluster_axes[c].clear();   // signal: use global axes
             return;
         }
 
-        // Working copy of Σ (double, row-major d×d)
-        std::vector<double> S(s.begin(), s.end());
+        // Copy and normalise columns → cluster_axes[c] as (F, d) float32.
         cluster_axes[c].resize((size_t)F * d, 0.f);
-
-        std::vector<double> v(d), tmp(d);
         for (int l = 0; l < F; ++l) {
-            // Warm start: global axis l
-            for (int j = 0; j < d; ++j) v[j] = (double)axes[l * d + j];
-
-            bool ok = false;
-            for (int iter = 0; iter < axes_power_iters; ++iter) {
-                // tmp = S @ v
-                double norm2 = 0.0;
-                for (int i = 0; i < d; ++i) {
-                    double acc = 0.0;
-                    for (int jj = 0; jj < d; ++jj) acc += S[i*d+jj] * v[jj];
-                    tmp[i] = acc;
-                    norm2 += acc * acc;
-                }
-                if (norm2 < 1e-30) break;
-                double inv = 1.0 / std::sqrt(norm2);
-                for (int j = 0; j < d; ++j) v[j] = tmp[j] * inv;
-                if (iter == 9) ok = true;
-            }
-
-            if (ok) {
-                for (int j = 0; j < d; ++j)
-                    cluster_axes[c][l * d + j] = (float)v[j];
-                // Deflation: S -= λ·vvᵀ  (λ = vᵀSv)
-                double lambda = 0.0;
-                for (int i = 0; i < d; ++i)
-                    for (int jj = 0; jj < d; ++jj)
-                        lambda += v[i] * S[i*d+jj] * v[jj];
-                for (int i = 0; i < d; ++i)
-                    for (int jj = 0; jj < d; ++jj)
-                        S[i*d+jj] -= lambda * v[i] * v[jj];
-            } else {
-                // Fallback: copy global axis l
-                for (int j = 0; j < d; ++j)
-                    cluster_axes[c][l * d + j] = axes[l * d + j];
-            }
+            float norm2 = 0.f;
+            for (int j = 0; j < d; ++j) norm2 += U[j * F + l] * U[j * F + l];
+            float inv = (norm2 > 1e-24f) ? (1.f / std::sqrt(norm2)) : 0.f;
+            for (int j = 0; j < d; ++j)
+                cluster_axes[c][l * d + j] = U[j * F + l] * inv;
         }
     }
+
 
     // ── cluster merge helpers ─────────────────────────────────────────────────
 
@@ -1392,7 +1373,7 @@ private:
         cluster_tombstones[fold] = 0;
         cluster_has_cones[fold]  = false;
         cluster_cones[fold].assign(F, SortedCone(F));
-        std::fill(sigma_drift[fold].begin(), sigma_drift[fold].end(), 0.0);
+        std::fill(U_drift[fold].begin(), U_drift[fold].end(), 0.f);
         cluster_axes[fold].clear();
 
         // Compact keep's cluster_global (remove deleted entries).
@@ -1403,7 +1384,7 @@ private:
         cg_keep               = std::move(live);
         cluster_counts[keep]  = (int64_t)cg_keep.size();
         cluster_tombstones[keep] = 0;
-        std::fill(sigma_drift[keep].begin(), sigma_drift[keep].end(), 0.0);
+        std::fill(U_drift[keep].begin(), U_drift[keep].end(), 0.f);
         cluster_axes[keep].clear();
 
         // Rebuild cones for the merged cluster using global axes initially;
@@ -1479,68 +1460,73 @@ private:
 
 // ── update_drift_and_check ────────────────────────────────────────────────────
 //
-// Fused drift EMA + 5-step power iteration.
+// Oja subspace sketch update + drift check (standalone, for Python path).
 //
-// sigma        : (d*d,) float64, modified in-place (row-major flattened d×d)
+// U_drift      : (d, F)  float32, modified in-place (Oja eigenvector sketch)
 // axes         : (F, d)  float32
-// displacement : (d,)    float64
+// displacement : (d,)    float32
 // beta         : EMA decay (e.g. 0.01)
 // theta_deg    : angle threshold in degrees (e.g. 15.0)
 //
-// Performs:  Σ ← (1-β)Σ + β·v·vᵀ   then 5 power-iteration steps.
-// Returns true if the leading eigenvector is > theta_deg from all fan axes,
+// Performs Oja's rule: proj = Uᵀ·v, U ← (1-β)U + β·v·projᵀ, normalise cols.
+// Returns true if U[:,0] is > theta_deg from all fan axes,
 // meaning _local_refresh should be triggered.
 
 bool update_drift_and_check(
-    py::array_t<double, py::array::c_style | py::array::forcecast> sigma,
+    py::array_t<float,  py::array::c_style | py::array::forcecast> U_np,
     py::array_t<float,  py::array::c_style | py::array::forcecast> axes,
-    py::array_t<double, py::array::c_style | py::array::forcecast> displacement,
+    py::array_t<float,  py::array::c_style | py::array::forcecast> displacement,
     double beta, double theta_deg)
 {
-    auto S  = sigma.mutable_unchecked<1>();
-    auto A  = axes.unchecked<2>();
-    auto V  = displacement.unchecked<1>();
-    const int64_t d = A.shape(1);
-    const int64_t F = A.shape(0);
+    auto U  = U_np.mutable_unchecked<2>();   // (d, F)
+    auto A  = axes.unchecked<2>();           // (F, d)
+    auto V  = displacement.unchecked<1>();   // (d,)
+    const int64_t d = U.shape(0);
+    const int64_t F = U.shape(1);
 
-    // Σ ← (1-β)Σ + β·v·vᵀ  (in-place, row-major)
-    const double omB = 1.0 - beta;
-    for (int64_t i = 0; i < d; ++i) {
-        double vi = V(i);
-        for (int64_t j = 0; j < d; ++j)
-            S(i * d + j) = omB * S(i * d + j) + beta * vi * V(j);
+    const float omB  = (float)(1.0 - beta);
+    const float betaf = (float)beta;
+
+    // proj[l] = Σ_j V[j] * U[j, l]
+    std::vector<float> proj(F, 0.f);
+    for (int64_t j = 0; j < d; ++j) {
+        float vj = V(j);
+        for (int64_t l = 0; l < F; ++l)
+            proj[l] += vj * U(j, l);
     }
 
-    // Power iteration — warm-start with axes[0]
-    std::vector<double> v(d), tmp(d);
-    for (int64_t j = 0; j < d; ++j)
-        v[j] = static_cast<double>(A(0, j));
-
-    for (int iter = 0; iter < 5; ++iter) {
-        for (int64_t i = 0; i < d; ++i) {
-            double acc = 0.0;
-            for (int64_t j = 0; j < d; ++j)
-                acc += S(i * d + j) * v[j];
-            tmp[i] = acc;
-        }
-        double norm2 = 0.0;
-        for (int64_t j = 0; j < d; ++j) norm2 += tmp[j] * tmp[j];
-        if (norm2 < 1e-24) return false;
-        double inv_norm = 1.0 / std::sqrt(norm2);
-        for (int64_t j = 0; j < d; ++j) v[j] = tmp[j] * inv_norm;
+    // U[j, l] = omB * U[j, l] + beta * V[j] * proj[l]
+    for (int64_t j = 0; j < d; ++j) {
+        float vj = V(j);
+        for (int64_t l = 0; l < F; ++l)
+            U(j, l) = omB * U(j, l) + betaf * vj * proj[l];
     }
 
-    // cos_max = max |axis_l · v| over all axes
-    double cos_max = 0.0;
+    // Normalise each column
     for (int64_t l = 0; l < F; ++l) {
-        double dot = 0.0;
+        float norm2 = 0.f;
+        for (int64_t j = 0; j < d; ++j) norm2 += U(j, l) * U(j, l);
+        if (norm2 > 1e-24f) {
+            float inv = 1.f / std::sqrt(norm2);
+            for (int64_t j = 0; j < d; ++j) U(j, l) *= inv;
+        }
+    }
+
+    // Drift check: use U[:, 0] as leading eigenvec estimate
+    float norm0 = 0.f;
+    for (int64_t j = 0; j < d; ++j) norm0 += U(j, 0) * U(j, 0);
+    if (norm0 < 1e-12f) return false;
+
+    float cos_max = 0.f;
+    for (int64_t l = 0; l < F; ++l) {
+        float dot = 0.f;
         for (int64_t j = 0; j < d; ++j)
-            dot += static_cast<double>(A(l, j)) * v[j];
-        double ab = std::abs(dot);
+            dot += A(l, j) * U(j, 0);
+        float ab = std::abs(dot);
         if (ab > cos_max) cos_max = ab;
     }
 
-    const double cos_theta = std::cos(theta_deg * (3.14159265358979323846 / 180.0));
+    const float cos_theta = std::cos((float)(theta_deg * (3.14159265358979323846 / 180.0)));
     return cos_max < cos_theta;
 }
 
@@ -1664,7 +1650,7 @@ PYBIND11_MODULE(_ampi_ext, m) {
              py::arg("d"), py::arg("F"), py::arg("nlist"), py::arg("cone_top_k"),
              py::arg("drift_theta"), py::arg("cosine"),
              py::arg("axes_np"), py::arg("centroids_np"),
-             py::arg("cluster_counts_np"), py::arg("sigma_drift_np"),
+             py::arg("cluster_counts_np"), py::arg("U_drift_np"),
              py::arg("data_np"), py::arg("del_mask_np"), py::arg("n_init"),
              py::arg("cluster_global_list"))
         .def("add",    &AMPIIndex::add,    py::arg("x"),
@@ -1759,14 +1745,14 @@ PYBIND11_MODULE(_ampi_ext, m) {
              "Returns global axes if per-cluster axes not yet computed.");
 
     m.def("update_drift_and_check", &update_drift_and_check,
-          "Fused drift EMA + power iteration.\n\n"
-          "  sigma        : (d*d,) float64, modified in-place\n"
+          "Oja subspace sketch update + drift check.\n\n"
+          "  U_drift      : (d, F)  float32, modified in-place\n"
           "  axes         : (F, d)  float32\n"
-          "  displacement : (d,)    float64\n"
+          "  displacement : (d,)    float32\n"
           "  beta         : float   EMA decay\n"
           "  theta_deg    : float   refresh threshold in degrees\n"
           "Returns True if _local_refresh should be triggered.",
-          py::arg("sigma"), py::arg("axes"), py::arg("displacement"),
+          py::arg("U_drift"), py::arg("axes"), py::arg("displacement"),
           py::arg("beta"), py::arg("theta_deg"));
     m.def("best_clusters", &best_clusters,
           "Indices of the `probes` nearest centroids to q, sorted nearest-first.\n\n"

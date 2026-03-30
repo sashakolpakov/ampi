@@ -279,9 +279,9 @@ def tombstone_compaction_fires():
     # Compaction should have fired: tombstone counter resets to 0.
     assert idx._cluster_tombstones[c_star] == 0, \
         f"tombstones not reset after compaction in cluster {c_star}"
-    # Sigma drift also reset.
-    assert np.all(idx._sigma_drift[c_star] == 0), \
-        "sigma_drift not cleared after _local_refresh"
+    # Oja sketch also reset.
+    assert np.all(idx._U_drift[c_star] == 0), \
+        "U_drift not cleared after _local_refresh"
 
 
 @test
@@ -293,9 +293,8 @@ def drift_detection_fires():
     data = rng.standard_normal((n, d)).astype('float32')
     idx  = AMPIAffineFanIndex(data, nlist=nlist, num_fans=16, seed=99, cone_top_k=1)
 
-    # Pick a cluster and record its initial sigma_drift norm.
+    # Pick a cluster and record its initial U_drift norm.
     c = 0
-    sig_before = idx._sigma_drift[c].copy()
 
     # Insert 200 points very strongly aligned with e_0 — biased direction.
     e0 = np.zeros(d, dtype='float32')
@@ -305,7 +304,7 @@ def drift_detection_fires():
         noise = rng.standard_normal(d).astype('float32') * 0.05
         idx.add(scale * e0 + noise)
 
-    # sigma_drift must have been updated (and possibly reset by a refresh).
+    # U_drift must have been updated (and possibly reset by a refresh).
     # At minimum: at some point it was non-zero. If a refresh fired, the
     # counter is 0. Either way the cluster is still queryable.
     q = scale * e0
@@ -525,10 +524,10 @@ def merge_params_propagate_to_cpp():
 
 @test
 def per_cluster_axes_populated_after_refresh():
-    """After local_refresh with non-trivial sigma_drift, cluster axes are valid unit vectors.
+    """After local_refresh with non-trivial U_drift, cluster axes are valid unit vectors.
 
-    Python path: sets sigma_drift directly, calls _local_refresh, checks cluster_axes.
-    C++ path:    inserts biased points to build sigma_drift, calls local_refresh,
+    Python path: sets U_drift directly, calls _local_refresh, checks cluster_axes.
+    C++ path:    inserts biased points to build U_drift, calls local_refresh,
                  checks get_cluster_axes returns (F, d) unit-vector float32 array.
     """
     rng  = np.random.default_rng(40)
@@ -538,10 +537,11 @@ def per_cluster_axes_populated_after_refresh():
     c_star = int(np.argmax([len(g) for g in idx.cluster_global]))
 
     if idx._cpp is None:
-        # Python path: inject a known biased sigma_drift matrix and refresh.
-        e0    = np.zeros(d, dtype=np.float64); e0[0] = 1.0
-        sigma = np.outer(e0, e0) * 10.0          # strong signal, clearly > 1e-10
-        idx._sigma_drift[c_star][:] = sigma.ravel()
+        # Python path: inject a known biased U_drift sketch and refresh.
+        # Set U_drift[:,0] to e0 (unit vector along dimension 0) — strong signal.
+        e0    = np.zeros(d, dtype=np.float32); e0[0] = 1.0
+        idx._U_drift[c_star][:] = 0.0
+        idx._U_drift[c_star][:, 0] = e0   # leading eigenvec estimate = e0
         idx._local_refresh(c_star)
 
         ca = idx.cluster_axes[c_star]
@@ -553,7 +553,7 @@ def per_cluster_axes_populated_after_refresh():
         np.testing.assert_allclose(norms, 1.0, atol=1e-5,
             err_msg="Python cluster_axes: axes not unit vectors")
         # Leading axis must align with e0 (the only direction with signal).
-        cos = float(np.max(np.abs(ca.astype(np.float64) @ e0)))
+        cos = float(np.max(np.abs(ca.astype(np.float64) @ e0.astype(np.float64))))
         assert cos > 0.9, f"leading axis not aligned with e0: cos={cos:.3f}"
 
     else:

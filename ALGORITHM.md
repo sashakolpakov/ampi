@@ -604,45 +604,27 @@ this new direction is not well-covered by any fan axis, points near the
 boundary of the shifted sub-region will be assigned to misaligned cones,
 reducing recall for queries in that direction.
 
-**Covariance accumulation.** Maintain a per-cluster d×d matrix Σ_c ∈ ℝ^{d×d}:
+**Oja subspace sketch.** Maintain a per-cluster d×F matrix U_c ∈ ℝ^{d×F}
+whose columns are running estimates of the top-F eigenvectors of the
+displacement covariance.  After each insert, given v = x − y:
 
 ```
-Σ_c  ←  (1 − β) · Σ_c  +  β · (x − y)(x − y)ᵀ
+proj  =  Uᵀ · v                             # (F,)  — project v onto sketch
+U_c   ←  (1 − β) · U_c  +  β · v · projᵀ  # (d,F) Oja rank-F update
+normalise each column of U_c to unit norm    # full QR every 50 inserts
 ```
 
-where β = 0.01 (exponential decay constant) and y is the **approximate
-nearest neighbour** of x within cluster c (see §6.7 below).
+where β = 0.01 and y is the **approximate nearest neighbour** of x within
+cluster c (§6.7).  This is Oja's subspace rule applied to the exponentially-
+weighted displacement covariance: it maintains the top-F eigenvectors directly
+without ever forming the d×d outer product.  Memory is O(nlist · d · F) float32
+instead of O(nlist · d²) float64 — a ~60× reduction at d=960, F=32
+(7.4 GB → 120 MB).
 
-The vector v = x − y is the local pair displacement.  Its outer product
-v·vᵀ is a rank-1 PSD matrix with sole eigenvector v/‖v‖ and eigenvalue
-‖v‖².  After many inserts, Σ_c converges to an EMA of rank-1 matrices:
+The leading eigenvector estimate is U_c[:,0].  No power iteration is needed
+at check time — the column is already the accumulated directional signal.
 
-```
-Σ_c  ≈  β · Σᵢ (1−β)^{t−i} · vᵢ · vᵢᵀ
-```
-
-which is the exponentially-weighted second moment of the displacement
-distribution.  Its leading eigenvector (dominant direction of recent local
-displacements) is extracted by power iteration.
-
-**Power iteration (5 steps).** Starting from v₀ = Σ_c · a₀ (warm-started
-on the first fan axis to exploit likely alignment):
-
-```
-vᵢ₊₁ = Σ_c · vᵢ / ‖Σ_c · vᵢ‖₂    i = 0, 1, 2, 3, 4
-```
-
-After 5 steps, v₅ converges to the leading eigenvector of Σ_c.  The number
-of steps needed for ε-accuracy in eigenvector angle is:
-
-```
-t  ≥  log(2/ε) / log(λ₁/λ₂)
-```
-
-where λ₁ > λ₂ are the top two eigenvalues.  For typical drift scenarios
-λ₁/λ₂ ≥ 2, giving < 0.001 rad error in 5 steps.
-
-**Trigger condition.** Compute the maximum cosine similarity between v₅
+**Trigger condition.** Compute the maximum cosine similarity between U_c[:,0]
 and any fan axis:
 
 ```

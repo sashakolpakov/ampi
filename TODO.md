@@ -22,6 +22,8 @@
       global axes, evict tombstones, reset Σ_drift and tombstone counter.
 - [x] Per-cluster fan axes (instead of global): recompute F axes from Σ_drift eigenvectors
       on refresh via deflated power iteration (10 steps per axis, F axes total).
+- [x] Replace full-rank Σ_drift (d×d float64, O(nlist·d²)) with rank-F Oja sketch
+      (d×F float32) — done. At d=960/nlist=1000: 7.4 GB → 120 MB. See DATABASE_PLAN.md §Memory.
 
 ### Sorted-Array Insert
 - [x] SortedCone C++ class: F sorted `std::vector<std::pair<float,uint32_t>>` per cone.

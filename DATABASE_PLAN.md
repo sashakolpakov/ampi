@@ -142,7 +142,7 @@ checkpoint := {
   axes:       float32[F, d],
   per_cluster: [
     { centroid: float32[d], n_c: u32,
-      sigma_drift: float32[d, d],
+      U_drift: float32[d, F],     # Oja subspace sketch (replaces d×d sigma_drift)
       cones: [ { n_f: u32, pairs: (float32, u32)[n_f] }, ... F cones ] }
   ],
   global_ids: u64[n],   # maps internal slot → user-provided ID
@@ -286,8 +286,9 @@ multi-process cluster.
 
 ## Memory Budget for Large Datasets
 
-GIST benchmarking (1M × d=960) revealed that the current in-memory architecture
-requires roughly **3 full float32 copies** of the dataset at peak:
+GIST benchmarking (d=960) exposed two distinct memory problems.
+
+### Problem 1 — Three full data copies at build/benchmark time
 
 | Copy | Who holds it | Size at 1M × d=960 |
 |------|-------------|-------------------|
@@ -296,19 +297,49 @@ requires roughly **3 full float32 copies** of the dataset at peak:
 | FAISS IVFFlat (benchmarks only) | `faiss.IndexIVFFlat` | 3.84 GB |
 
 For production serving (no FAISS, no GT), peak is ~2 copies (~8 GB at 1M × d=960).
-The sharded Phase-3 architecture naturally solves this: each shard holds only its
-assigned clusters.  With S shards, per-shard memory is ~2n/S × d × 4 bytes.
+The Phase-3 sharded architecture naturally distributes this: per-shard footprint is
+`~2 × (n/S) × d × 4 bytes`.
 
-**Near-term mitigations before Phase 3:**
-- `load_hdf5(n_train=N)` cap (already in benchmark scripts for GIST).
-- Lazy vector loading: store only centroids + cone indices in RAM; fetch raw
-  vectors from mmap'd file on demand for reranking.  This trades I/O for memory,
-  acceptable for read-heavy workloads.
-- `float16` quantisation of the raw data buffer (halves the data footprint; small
-  recall degradation at d >> 128, needs measurement).
+**Near-term mitigations (before Phase 3):**
+- `n_train` cap in benchmark scripts (already done for GIST at 200k).
+- mmap-backed `_data_buf`: back the data buffer with a memory-mapped file so the OS
+  pages in only the working set.  This is a natural outcome of the Phase 2.2
+  checkpoint layout (`mmap`-friendly fixed-header format).
+- `float16` raw vector storage: halves the data footprint; recall impact at d >> 128
+  needs measurement before committing.
 
-These are tracked in Phase 2 (persistence) as natural prerequisites for the mmap
-checkpoint layout described in §2.2.
+### Problem 2 — sigma_drift is O(nlist × d²) — impractical for high-d  ⚠️
+
+`self._sigma_drift` stores a full d×d float64 covariance matrix per cluster:
+
+| Config | nlist | sigma_drift size |
+|--------|-------|-----------------|
+| SIFT 1M d=128 | 1,000 | 0.13 GB |
+| GIST 200k d=960 | 894 | **6.59 GB** |
+| GIST 1M d=960 | 1,000 | **7.37 GB** |
+
+The 200k GIST benchmark survived only because `np.zeros` uses lazy OS page
+allocation — zero pages are never committed until written.  At build time no
+streaming inserts have occurred, so sigma_drift is never touched.  In production,
+once streaming inserts populate all clusters, the full 6–7 GB materialises.
+
+**Fix: rank-F online sketch (Oja's rule) — implemented ✓**
+
+Replaced `_sigma_drift` (d×d float64) with `_U_drift` (d×F float32) updated via
+Oja's subspace rule after each insert:
+
+```
+proj  = Uᵀ·v                             # (F,) — project displacement onto sketch
+U  ← (1−β)·U + β·v·projᵀ               # (d,F) Oja update
+normalise each column of U               # column-norm ≈ 1; full QR every 50 inserts
+```
+
+`U[:,0]` is the leading eigenvector estimate — no power iteration needed at check time.
+
+| Config | Old sigma_drift | New U_drift (F=32) | Reduction |
+|--------|----------------|-------------------|-----------|
+| GIST 200k d=960 | 6.59 GB | **110 MB** | ~60× |
+| GIST 1M d=960 | 7.37 GB | **123 MB** | ~60× |
 
 ---
 
