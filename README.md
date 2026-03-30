@@ -258,7 +258,8 @@ ampi/
 │   └── stress_test.py    # adversarial add/delete/update/churn scenarios
 ├── figures/              # Pareto frontier plots saved by benchmark scripts (gitignored)
 ├── .github/workflows/
-│   └── ci.yml            # CI: lint + smoke test on push
+│   ├── ci.yml            # CI: lint + smoke test on push
+│   └── cpp-verify.yml    # CI: cppcheck + two-pass LLM review on every push
 ├── demo.ipynb            # interactive walkthrough
 ├── setup.py              # C++ extension build + BLAS detection
 ├── pyproject.toml        # project metadata and dependencies

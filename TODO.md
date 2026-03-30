@@ -124,5 +124,6 @@ All phases merged (branch `cpp-pipeline`).
 
 - [x] CI: smoke test on every push/PR (`.github/workflows/ci.yml`)
 - [x] CI: stress test covering adversarial add/delete/update scenarios (`tests/stress_test.py`)
+- [x] CI: cppcheck + two-pass LLM C++ review on every push (`.github/workflows/cpp-verify.yml`)
 - [x] Pin numba/numpy versions in `pyproject.toml`
 - [ ] Publish to PyPI once recall is competitive and streaming insert is stable
