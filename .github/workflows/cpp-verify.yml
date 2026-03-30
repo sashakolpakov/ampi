@@ -1,0 +1,125 @@
+name: C++ Verification
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "ampi/*.cpp"
+      - "ampi/*.hpp"
+  pull_request:
+    paths:
+      - "ampi/*.cpp"
+      - "ampi/*.hpp"
+
+concurrency:
+  group: cpp-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ── Job 1: cppcheck static analysis ────────────────────────────────────────
+  cppcheck:
+    name: cppcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cppcheck
+
+      - name: Run cppcheck
+        run: |
+          cppcheck \
+            --enable=all \
+            --error-exitcode=1 \
+            --inline-suppr \
+            --suppress=missingIncludeSystem \
+            --suppress=unusedFunction \
+            --std=c++17 \
+            -I ampi \
+            ampi/_ext.cpp ampi/_gemm.hpp
+
+  # ── Job 2: LLM read-only review ──────────────────────────────────────────────
+  llm:
+    name: LLM C++ review
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install openai SDK
+        run: pip install openai
+
+      - name: Extract C++ diff
+        id: diff
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff origin/${{ github.base_ref }}...HEAD \
+                -- 'ampi/*.cpp' 'ampi/*.hpp' > /tmp/cpp_changes.diff
+          else
+            git diff HEAD~1...HEAD \
+                -- 'ampi/*.cpp' 'ampi/*.hpp' > /tmp/cpp_changes.diff
+          fi
+          lines=$(wc -l < /tmp/cpp_changes.diff)
+          echo "lines=$lines" >> "$GITHUB_OUTPUT"
+          echo "Changed lines in C++ files: $lines"
+
+      - name: Run LLM verification (read-only)
+        if: steps.diff.outputs.lines != '0'
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python verify/scripts/llm_verify.py \
+            --diff /tmp/cpp_changes.diff \
+            --out  /tmp/llm_report.md
+
+      - name: Write skip notice (no C++ changes)
+        if: steps.diff.outputs.lines == '0'
+        run: echo "No C++ changes — verification skipped." > /tmp/llm_report.md
+
+      - name: Post report as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('/tmp/llm_report.md', 'utf8');
+            const header =
+              `## C++ Verification — LLM Report\n\n` +
+              `> Read-only analysis. No source files were modified.\n\n`;
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            for (const c of comments.data) {
+              if (c.user.type === 'Bot' &&
+                  c.body.includes('C++ Verification — LLM Report')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo:  context.repo.repo,
+                  comment_id: c.id,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+              body: header + report,
+            });
