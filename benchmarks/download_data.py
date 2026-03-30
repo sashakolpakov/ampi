@@ -1,7 +1,9 @@
 """download_data.py — fetch ANN-benchmark HDF5 datasets used by benchmark_vs_*.py
 
 All files are hosted by the ann-benchmarks project (https://github.com/erikbern/ann-benchmarks).
-Total download size: ~1 GB (SIFT 1M + GloVe dominate).
+Total download size: ~1 GB (SIFT 1M + GloVe dominate); GIST adds ~3.6 GB.
+
+Uses curl for all downloads — avoids user-agent blocking from Cloudflare-proxied hosts.
 
 Usage
   python download_data.py               # download all datasets
@@ -9,10 +11,10 @@ Usage
   python download_data.py --list        # show dataset info without downloading
 """
 
-import argparse, sys, urllib.request
+import argparse, subprocess, sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).parent.parent
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 _DATA_DIR  = _REPO_ROOT / "data"
 
 _BASE_URL = "http://ann-benchmarks.com"
@@ -38,6 +40,11 @@ DATASETS = {
         dest=_DATA_DIR / "glove" / "glove-100-angular.hdf5",
         desc="GloVe Twitter 1.18M × d=100, angular/cosine  (~500 MB)",
     ),
+    "gist": dict(
+        url=f"{_BASE_URL}/gist-960-euclidean.hdf5",
+        dest=_DATA_DIR / "gist" / "gist-960-euclidean.hdf5",
+        desc="GIST, 1M × d=960, Euclidean — high-d stress test  (~3.6 GB)",
+    ),
 }
 
 
@@ -48,24 +55,19 @@ def _download(name, info, force=False):
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
     url = info["url"]
-    print(f"  [{name}] downloading {url} …")
-
-    def _progress(block_num, block_size, total_size):
-        if total_size <= 0:
-            return
-        pct = min(100, block_num * block_size * 100 // total_size)
-        bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
-        print(f"\r    [{bar}] {pct:3d}%", end="", flush=True)
-
-    try:
-        urllib.request.urlretrieve(url, dest, reporthook=_progress)
-        print(f"\r    done — saved to {dest}")
-    except Exception as e:
-        # Clean up partial download
+    print(f"  [{name}] downloading {url} …", flush=True)
+    # curl: -L follows redirects, --progress-bar gives a single progress line,
+    # -o writes to dest, --fail exits non-zero on HTTP errors.
+    ret = subprocess.run(
+        ["curl", "-L", "--progress-bar", "--fail", "-o", str(dest), url],
+        check=False,
+    )
+    if ret.returncode != 0:
         if dest.exists():
             dest.unlink()
-        print(f"\r    ERROR: {e}", file=sys.stderr)
+        print(f"  [{name}] ERROR: curl exited with code {ret.returncode}", file=sys.stderr)
         sys.exit(1)
+    print(f"  [{name}] saved to {dest}")
 
 
 def ensure_datasets(targets=None, force=False):
@@ -85,7 +87,7 @@ def ensure_datasets(targets=None, force=False):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("dataset", nargs="*", default=list(DATASETS),
-                    help="mnist fashion sift glove  (default: all)")
+                    help="mnist fashion sift glove gist  (default: all)")
     ap.add_argument("--force", action="store_true",
                     help="re-download even if the file already exists")
     ap.add_argument("--list",  action="store_true",

@@ -6,6 +6,7 @@ Datasets
   fashion : data/fashion-mnist/fashion-mnist-784-euclidean.hdf5
   sift    : data/sift/sift-128-euclidean.hdf5  (1M train / 10k test queries)
   glove   : data/glove/glove-100-angular.hdf5  (L2-normalised → cosine equiv)
+  gist    : data/gist/gist-960-euclidean.hdf5  (1M train / 1k test queries, d=960)
 
 Usage
   python benchmark_vs_hnsw.py                      # gauss only (default)
@@ -80,7 +81,7 @@ if __name__ == "__main__":
     args    = ap.parse_args()
     targets = set(args.dataset)
     if "all" in targets:
-        targets = {"gauss", "mnist", "fashion", "sift", "glove"}
+        targets = {"gauss", "mnist", "fashion", "sift", "glove", "gist"}
 
     ensure_datasets(targets, force=args.force)
     all_results = []
@@ -109,6 +110,13 @@ if __name__ == "__main__":
         data, queries, gt = load_hdf5(DATA_DIR / "glove/glove-100-angular.hdf5", normalize=True)
         all_results.append(("GloVe 1.18M  d=100",
                              run("GloVe 1.18M  d=100", data, queries, gt, metric='cosine')))
+
+    if "gist" in targets:
+        # Cap at 200k to stay within ~3 GB peak RAM (full 1M needs ~12 GB).
+        data, queries, gt = load_hdf5(DATA_DIR / "gist/gist-960-euclidean.hdf5",
+                                      n_train=200_000)
+        all_results.append(("GIST 200k  d=960",
+                             run("GIST 200k  d=960", data, queries, gt)))
 
     print()
     save_figures(all_results, family_style=_FAMILY_STYLE, suffix="_vs_hnsw")
