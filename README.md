@@ -1,5 +1,7 @@
 # AMPI — Adaptive Multi-Projection Index
 
+[![Open Demo in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/sashakolpakov/ampi/blob/main/demo.ipynb)
+
 ANN index for **live, mutable vector collections**.  Insert, delete, and update
 individual vectors at any time — no rebuild required.
 
