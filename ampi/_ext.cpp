@@ -385,6 +385,23 @@ public:
         }
         return false;
     }
+
+    // Return all (proj_value, global_id) pairs for axis l as two parallel arrays.
+    // Includes tombstoned entries — call compact() first if a clean snapshot is needed.
+    // Used by the Phase-2 checkpoint serializer.
+    py::tuple get_axis_pairs(int l) const {
+        const auto& ax = axes[l];
+        py::ssize_t n_f = (py::ssize_t)ax.size();
+        auto projs = py::array_t<float>(n_f);
+        auto ids   = py::array_t<uint32_t>(n_f);
+        auto bp = projs.mutable_unchecked<1>();
+        auto bi = ids.mutable_unchecked<1>();
+        for (py::ssize_t i = 0; i < n_f; ++i) {
+            bp(i) = ax[i].first;
+            bi(i) = (uint32_t)ax[i].second;
+        }
+        return py::make_tuple(projs, ids);
+    }
 };
 
 // ── AMPIIndex ─────────────────────────────────────────────────────────────────
@@ -1151,6 +1168,18 @@ public:
             ptr, dummy);
     }
 
+    // Return the (d, F) float32 Oja subspace sketch for cluster c.
+    // Used by the Phase-2 checkpoint serializer.
+    py::array_t<float> get_U_drift(int c) const {
+        auto out = py::array_t<float>({(py::ssize_t)d, (py::ssize_t)F});
+        auto buf = out.mutable_unchecked<2>();
+        const float* U = U_drift[c].data();   // row-major: U[j*F + l]
+        for (int j = 0; j < d; ++j)
+            for (int l = 0; l < F; ++l)
+                buf(j, l) = U[j * F + l];
+        return out;
+    }
+
 private:
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -1732,6 +1761,9 @@ PYBIND11_MODULE(_ampi_ext, m) {
              "Merges centroid pairs within eps whose QE increase is small.\n"
              "Calls _refresh_views() on the Python side are not needed —\n"
              "use AMPIAffineFanIndex.periodic_merge() instead.")
+        .def("get_U_drift", &AMPIIndex::get_U_drift, py::arg("c"),
+             "Copy of the (d, F) float32 Oja subspace sketch for cluster c.\n\n"
+             "Row-major layout (d rows, F columns). Used by the Phase-2 checkpoint serializer.")
         .def("get_cluster_axes", &AMPIIndex::get_cluster_axes,
              py::arg("c"),
              "Return (F, d) float32 axes for cluster c.\n\n"
@@ -1791,5 +1823,9 @@ PYBIND11_MODULE(_ampi_ext, m) {
              "Union-window query.  Returns sorted int32 global IDs.")
         .def("is_covered", &SortedCone::is_covered,
              py::arg("q_projs"), py::arg("w"), py::arg("kth_proj"),
-             "True if any axis l guarantees no unvisited point can enter the top-k.");
+             "True if any axis l guarantees no unvisited point can enter the top-k.")
+        .def("get_axis_pairs", &SortedCone::get_axis_pairs, py::arg("l"),
+             "Returns (projs: float32[n_f], ids: uint32[n_f]) for axis l.\n\n"
+             "Includes tombstoned entries; call compact() first for a clean snapshot.\n"
+             "Used by the Phase-2 checkpoint serializer.");
 }
