@@ -140,7 +140,7 @@ py::array_t<int32_t> union_query(
     auto out_buf = out.mutable_unchecked<1>();
     int64_t c = 0;
     for (int64_t k = 0; k < n; ++k)
-        if (mask[k]) out_buf(c++) = static_cast<int32_t>(k);
+        if (mask[k]) out_buf(c++) = static_cast<int32_t>(k);  // cppcheck-suppress unreadVariable
 
     return out;
 }
@@ -433,6 +433,7 @@ public:
     int      axes_power_iters = 10;   // deflated power-iteration steps per axis
     uint64_t insert_count     = 0;    // total inserts processed
 
+    // cppcheck-suppress uninitMemberVar
     AMPIIndex() = default;
 
     // ── construction ─────────────────────────────────────────────────────────
@@ -533,6 +534,14 @@ public:
     }
 
     void set_merge_params(int interval, double eps, double qe_ratio, int power_iters) {
+        if (interval < 0)
+            throw std::invalid_argument("merge_interval must be >= 0");
+        if (eps <= 0.0)
+            throw std::invalid_argument("eps must be > 0");
+        if (qe_ratio < 0.0 || qe_ratio > 1.0)
+            throw std::invalid_argument("qe_ratio must be in [0, 1]");
+        if (power_iters < 1)
+            throw std::invalid_argument("power_iters must be >= 1");
         merge_interval   = interval;
         eps_merge        = eps;
         merge_qe_ratio   = qe_ratio;
@@ -1121,6 +1130,8 @@ public:
     // Temporarily overrides the stored eps_merge for this call.
 
     void periodic_merge(double eps) {
+        if (eps <= 0.0)
+            throw std::invalid_argument("eps must be > 0");
         std::unique_lock<std::shared_mutex> lk(*p_mutex);
         const double saved = eps_merge;
         eps_merge = eps;
