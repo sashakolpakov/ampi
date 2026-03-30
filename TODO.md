@@ -58,6 +58,10 @@ See **DATABASE_PLAN.md** for the concrete phased implementation plan.
 - [ ] Checkpoint serializer: header + centroids + axes + per-cluster cone pairs.
 - [ ] mmap-friendly layout for read-only serving while new checkpoint is being written.
 - [ ] Truncate WAL after successful checkpoint.
+- [ ] mmap-backed `_data_buf`: replace `np.empty` allocation with a memory-mapped
+      file so the OS pages in only the clusters being queried/inserted; prerequisite
+      for single-node GIST 1M on a 16 GB machine.  Natural side-effect of the
+      mmap-friendly checkpoint layout above.
 
 ---
 
@@ -118,6 +122,8 @@ All phases merged (branch `cpp-pipeline`).
 - [x] SIFT-128 full 1M
 - [x] Recall@1 / Recall@100 curves (benchmarks/benchmark.py reports all three)
 - [x] GIST (1M, d=960) — run at 200k cap (full 1M needs ~12 GB peak; see BENCHMARKS.md §GIST)
+- [ ] GIST full 1M benchmark — blocked on mmap `_data_buf` (Phase 2); re-run once
+      mmap is in place to validate recall and QPS at full scale.
 - [x] Profile per-cluster fan-axis variance to validate drift-detection threshold θ_drift
 
 ---

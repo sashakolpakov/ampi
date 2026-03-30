@@ -301,9 +301,14 @@ The Phase-3 sharded architecture naturally distributes this: per-shard footprint
 
 **Near-term mitigations (before Phase 3):**
 - `n_train` cap in benchmark scripts (already done for GIST at 200k).
-- mmap-backed `_data_buf`: back the data buffer with a memory-mapped file so the OS
-  pages in only the working set.  This is a natural outcome of the Phase 2.2
-  checkpoint layout (`mmap`-friendly fixed-header format).
+- **mmap-backed `_data_buf`** *(Phase 2 prerequisite, unblocks GIST 1M)*: replace
+  `np.empty((_cap, d))` with `np.memmap(path, mode='w+', shape=(_cap, d))`.  The OS
+  maps the file into virtual address space and pages individual 4 KB chunks into
+  physical RAM only when touched — clusters that are never queried cost zero RAM.
+  For a serving workload where only ~10% of clusters are hot at any time, effective
+  RSS drops from 3.84 GB to ~0.4 GB.  This is a natural side-effect of the Phase 2.2
+  checkpoint layout (mmap-friendly fixed-size header + variable cone blocks).
+  **Prerequisite for running the full GIST 1M benchmark on a 16 GB machine.**
 - `float16` raw vector storage: halves the data footprint; recall impact at d >> 128
   needs measurement before committing.
 
