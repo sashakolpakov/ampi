@@ -8,7 +8,7 @@
 - [x] Update cluster centroid via EMA: μ_c ← (N_c·μ_c + x) / (N_c + 1).
 - [x] Pre-allocated capacity buffer for `self.data` and `self._deleted_mask`:
       doubling buffer in `add()`, amortised O(1) per insert.
-- [ ] Periodic cluster merge: after every `merge_interval` inserts, check pairs of
+- [x] Periodic cluster merge: after every `merge_interval` inserts, check pairs of
       clusters whose centroids are within ε_merge; merge if it reduces mean
       quantisation error (no full DP model comparison needed).
 
@@ -20,8 +20,8 @@
 - [x] If leading eigenvector is > θ_drift degrees from all fan axes, trigger _local_refresh.
 - [x] _local_refresh: rebuild all cones for cluster c from current live points + current
       global axes, evict tombstones, reset Σ_drift and tombstone counter.
-- [ ] Per-cluster fan axes (instead of global): recompute F axes from Σ_drift eigenvectors
-      on refresh. Currently kept global (random ≈ geometry-guided at F=128).
+- [x] Per-cluster fan axes (instead of global): recompute F axes from Σ_drift eigenvectors
+      on refresh via deflated power iteration (10 steps per axis, F axes total).
 
 ### Sorted-Array Insert
 - [x] SortedCone C++ class: F sorted `std::vector<std::pair<float,uint32_t>>` per cone.
@@ -30,7 +30,7 @@
 - [x] `compact()` — O(F·n) physical eviction of tombstoned entries.
 - [x] `query(q_projs, window_size)` — union-window, returns sorted global IDs.
 - [x] `is_covered(q_projs, w, kth_proj)` — early-stopping coverage check.
-- [ ] Replace `std::vector` with B-tree or skip-list per cone when n_cone > 10k to get
+- [x] Replace `std::vector` with B-tree or skip-list per cone when n_cone > 10k to get
       O(log n) insert instead of O(n) shift.
 
 ### Delete / Update
@@ -99,7 +99,7 @@ All phases merged (branch `cpp-pipeline`).
       C++ `SortedCone` objects (no `None` stubs).
 
 ### Open
-- [ ] Replace `std::vector` per-cone sorted array with B-tree / skip-list when
+- [x] Replace `std::vector` per-cone sorted array with B-tree / skip-list when
       n_cone > 10k (reduces insert from O(n_cone) shift to O(log n_cone)).
 
 ### Notes

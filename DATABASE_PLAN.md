@@ -75,10 +75,10 @@ When inserting point `x`:
    ```
 
 **Periodic cluster merge:** after every `merge_interval` inserts, for each
-pair of clusters whose centroids satisfy `‖μ_i - μ_j‖ < ε_merge`, compute
-Bayesian model comparison (BIC approximation: compare two Gaussians vs one).
-Merge the pair if the single-Gaussian model wins. Cost: O(nlist²) centroid
-comparisons — negligible for nlist ≤ 2000.
+pair of clusters whose centroids satisfy `‖μ_i - μ_j‖ < ε_merge`, compute the
+mean-QE increase from merging: δ = N_i·N_j/N_total² · ‖μ_i−μ_j‖².
+Merge if δ ≤ (mQE_i + mQE_j)/2 (i.e. centroid separation is small relative
+to within-cluster spread). Cost: O(nlist²) comparisons — negligible for nlist ≤ 2000.
 
 ### 1.3  Direction Drift Detection
 
@@ -95,8 +95,9 @@ After each insert, check whether the leading eigenvector of `Σ_drift_c`
 (power iteration, 3–5 steps) has rotated more than `θ_drift` degrees from the
 current fan axes. If so, schedule a **local fan-axis refresh** for cluster `c`:
 
-1. Recompute F axes from `Σ_drift_c`'s top-F eigenvectors (or keep random —
-   empirically random ≈ geometry-guided at F=128).
+1. Recompute F axes from `Σ_drift_c`'s top-F eigenvectors via deflated power
+   iteration (`axes_power_iters` steps per axis); falls back to global random axes when
+   ‖Σ_drift_c‖_F < 10⁻¹⁰ (insufficient signal).
 2. Re-project all `N_c` points in cluster `c` onto the new axes.
 3. Rebuild cone sorted arrays for cluster `c` — O(N_c · F · log N_c).
 4. Swap atomically (write-lock cluster `c` for the swap, then release).
@@ -288,8 +289,10 @@ multi-process cluster.
 | Parameter | Default | Note |
 |-----------|---------|------|
 | `cone_top_k` K | 1 or 2 | 2 for better cross-boundary recall |
-| `merge_interval` | 10 000 inserts | cluster merge check cadence |
-| `ε_merge` | 0.05 × median inter-centroid dist | merge threshold |
+| `merge_interval` | 0 (disabled) | set > 0 to enable periodic merge |
+| `ε_merge` | 1.0 (L2 distance) | centroid proximity threshold; tune per dataset |
+| `merge_qe_ratio` | 0.5 | merge if δ_qe ≤ ratio × (mQE_i + mQE_j) |
+| `axes_power_iters` | 10 | deflated power-iteration steps per fan axis |
 | `β` (drift EMA) | 0.01 | slow decay for stability |
 | `θ_drift` | 15° | fan-axis refresh trigger |
 | `tombstone_threshold` | 0.10 | fraction before compaction |

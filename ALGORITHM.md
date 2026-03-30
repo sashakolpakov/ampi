@@ -60,7 +60,7 @@ applies unchanged.
 | fp | Fan cones probed per cluster (`fan_probes`) |
 | w | Half-window size for sorted-projection search |
 | μ_c | Centroid of cluster c, c ∈ {0,…,M−1} |
-| aₗ | l-th fan axis (unit vector), l ∈ {0,…,F−1} |
+| aₗ^(c) | l-th fan axis for cluster c (unit vector), l ∈ {0,…,F−1}; globally shared at build time, recomputed per-cluster on refresh |
 | N_c | Number of points in cluster c |
 | n_f^(c) | Number of points in cone f of cluster c |
 
@@ -73,8 +73,9 @@ X  ⊂  ℝᵈ
              μ_c = centroid of Cₒ,   c ∈ [M]
              │
              └── Level 2: affine fan cones  {cone_{c,0}, …, cone_{c,F-1}}
-                          global axes a₀, …, a_{F-1} ∈ Sᵈ⁻¹
-                          point x ∈ Cₒ → top-K cones by |〈x−μ_c, aₗ〉| / ‖x−μ_c‖
+                          axes aₗ^(c) ∈ Sᵈ⁻¹ — global at build time; per-cluster
+                          after first local refresh (deflated power iteration on Σ_drift_c)
+                          point x ∈ Cₒ → top-K cones by |〈x−μ_c, aₗ^(c)〉| / ‖x−μ_c‖
                           │
                           └── Level 3: sorted projection arrays
                                cone_{c,f} stores F arrays, each sorted by 〈x−μ_c, aₗ〉

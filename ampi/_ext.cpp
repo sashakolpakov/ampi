@@ -419,9 +419,19 @@ public:
     std::vector<std::vector<uint32_t>>   cluster_global;
     std::vector<std::vector<SortedCone>> cluster_cones;   // [nlist][F]
     std::vector<std::vector<double>>     sigma_drift;     // [nlist][d*d]
+    // Per-cluster fan axes (F*d floats each); empty vector means use global axes.
+    // Populated by _compute_cluster_axes() during _local_refresh.
+    std::vector<std::vector<float>>      cluster_axes;    // [nlist]
 
     // point_cones[gid] = {(cluster, fan), ...}
     std::vector<std::vector<std::pair<uint16_t,uint16_t>>> point_cones;
+
+    // Periodic cluster merge parameters.
+    int      merge_interval   = 0;    // 0 = disabled
+    double   eps_merge        = 1.0;  // centroid L2 distance threshold
+    double   merge_qe_ratio   = 0.5;  // merge if δ_qe ≤ ratio*(mQE_i+mQE_j)
+    int      axes_power_iters = 10;   // deflated power-iteration steps per axis
+    uint64_t insert_count     = 0;    // total inserts processed
 
     AMPIIndex() = default;
 
@@ -511,6 +521,7 @@ public:
         // Build cones entirely in C++ (Phase 5: no Python cone objects passed in).
         idx.cluster_cones.resize(nlist);
         idx.cluster_has_cones.assign(nlist, false);
+        idx.cluster_axes.resize(nlist);   // all empty = use global axes
         idx.point_cones.resize((size_t)cap);
         for (int c = 0; c < nlist; ++c) {
             idx.cluster_cones[c].assign(F, SortedCone(F));
@@ -519,6 +530,13 @@ public:
         }
 
         return idx;
+    }
+
+    void set_merge_params(int interval, double eps, double qe_ratio, int power_iters) {
+        merge_interval   = interval;
+        eps_merge        = eps;
+        merge_qe_ratio   = qe_ratio;
+        axes_power_iters = power_iters;
     }
 
     // ── add ──────────────────────────────────────────────────────────────────
@@ -618,11 +636,13 @@ public:
             }
             float cn = (cn2 > 1e-20f) ? std::sqrt(cn2) : 0.f;
 
-            // Project onto all F axes
+            // Project onto per-cluster axes (or global if not yet computed).
+            const float* local_axes_c = cluster_axes[c].empty()
+                                        ? axes.data() : cluster_axes[c].data();
             std::vector<float> proj(F, 0.f);
             for (int l = 0; l < F; ++l)
                 for (int j = 0; j < d; ++j)
-                    proj[l] += centered[j] * axes[l * d + j];
+                    proj[l] += centered[j] * local_axes_c[l * d + j];
 
             // Top-K fan cones by |normed proj|
             int K_f = std::min(cone_top_k, F);
@@ -691,6 +711,13 @@ public:
                 if (_update_drift_and_check(c, v.data()))
                     _local_refresh(c);
             }
+        }
+
+        // Periodic cluster merge.
+        if (merge_interval > 0) {
+            ++insert_count;
+            if (insert_count % (uint64_t)merge_interval == 0)
+                _periodic_merge();
         }
 
         return global_id;
@@ -871,9 +898,12 @@ public:
             }
             float inv_qnorm = (qnorm2 > 1e-20f) ? 1.f / std::sqrt(qnorm2) : 1.f;
 
+            // Use per-cluster axes if available, else global.
+            const float* local_axes_c = cluster_axes[c].empty()
+                                        ? axes.data() : cluster_axes[c].data();
             std::vector<float> q_proj(F, 0.f);
             for (int l = 0; l < F; ++l) {
-                const float* al = &axes[l * d];
+                const float* al = local_axes_c + l * d;
                 float dot = 0.f;
                 for (int j = 0; j < d; ++j) dot += q_centered[j] * al[j];
                 q_proj[l] = dot;
@@ -1033,9 +1063,11 @@ public:
             }
             float inv_qnorm = (qnorm2 > 1e-20f) ? 1.f / std::sqrt(qnorm2) : 1.f;
 
+            const float* local_axes_c = cluster_axes[c].empty()
+                                        ? axes.data() : cluster_axes[c].data();
             std::vector<float> q_proj(F, 0.f);
             for (int l = 0; l < F; ++l) {
-                const float* al = &axes[l * d];
+                const float* al = local_axes_c + l * d;
                 float dot = 0.f;
                 for (int j = 0; j < d; ++j) dot += q_centered[j] * al[j];
                 q_proj[l] = dot;
@@ -1076,15 +1108,39 @@ public:
     }
 
     // ── local_refresh (public, GIL-free) ──────────────────────────────────────
-    //
-    // Rebuilds all cones for cluster c in-place using only C++ memory.
-    // The GIL is released by the pybind11 call_guard on the binding — this
-    // method itself contains no Python object accesses.
 
     void local_refresh(int c) {
         std::unique_lock<std::shared_mutex> lk(*p_mutex);
         if (c >= 0 && c < nlist)
             _local_refresh(c);
+    }
+
+    // ── periodic_merge (public) ───────────────────────────────────────────────
+    //
+    // Manually trigger a merge pass with the given eps_merge threshold.
+    // Temporarily overrides the stored eps_merge for this call.
+
+    void periodic_merge(double eps) {
+        std::unique_lock<std::shared_mutex> lk(*p_mutex);
+        const double saved = eps_merge;
+        eps_merge = eps;
+        _periodic_merge();
+        eps_merge = saved;
+    }
+
+    // ── get_cluster_axes ─────────────────────────────────────────────────────
+    //
+    // Returns (F, d) float32 array of the current fan axes for cluster c.
+    // Returns the global axes if per-cluster axes have not been computed yet.
+
+    py::array_t<float> get_cluster_axes(int c) const {
+        const float* ptr = (c >= 0 && c < nlist && !cluster_axes[c].empty())
+                           ? cluster_axes[c].data() : axes.data();
+        py::capsule dummy(const_cast<float*>(ptr), [](void*){});
+        return py::array_t<float>(
+            {(py::ssize_t)F, (py::ssize_t)d},
+            {(py::ssize_t)(d * sizeof(float)), (py::ssize_t)sizeof(float)},
+            ptr, dummy);
     }
 
 private:
@@ -1122,9 +1178,12 @@ private:
             for (int j = 0; j < d; ++j) ev[j] = tmp[j] * inv;
         }
 
+        // Compare against per-cluster axes if available, else global.
+        const float* cmp_axes = cluster_axes[c].empty()
+                                ? axes.data() : cluster_axes[c].data();
         double cos_max = 0.0;
         for (int l = 0; l < F; ++l) {
-            const float* al = &axes[l * d];
+            const float* al = cmp_axes + l * d;
             double dot = 0.0;
             for (int j = 0; j < d; ++j) dot += al[j] * ev[j];
             double ab = std::abs(dot);
@@ -1156,12 +1215,14 @@ private:
             norms[i] = (s2 > 1e-20f) ? std::sqrt(s2) : 1.f;
         }
 
-        // Step 2: projs (n_c × F) = x_c (n_c × d) @ axes^T (F × d).
+        // Step 2: projs (n_c × F) = x_c (n_c × d) @ local_axes^T (F × d).
         // ampi::sgemm(M, N, K, A, lda, B, ldb, C, ldc, transA=false, transB=true)
+        const float* local_axes = (cluster_axes[c].empty())
+                                  ? axes.data() : cluster_axes[c].data();
         std::vector<float> projs((size_t)n_c * F, 0.f);
         ampi::sgemm(n_c, F, d,
                     x_c.data(), d,
-                    axes.data(), d,
+                    local_axes, d,
                     projs.data(), F,
                     /*transA=*/false, /*transB=*/true);
 
@@ -1212,6 +1273,9 @@ private:
         for (uint32_t gid : cg)
             if (!del_mask[gid]) live.push_back(gid);
 
+        // Derive per-cluster axes from accumulated Σ_drift BEFORE resetting it.
+        _compute_cluster_axes(c);
+
         if (live.size() < 2) {
             cluster_has_cones[c] = false;
             cluster_cones[c].assign(F, SortedCone(F));
@@ -1222,6 +1286,183 @@ private:
         cluster_counts[c]       = (int64_t)cluster_global[c].size();
         cluster_tombstones[c]   = 0;
         std::fill(sigma_drift[c].begin(), sigma_drift[c].end(), 0.0);
+    }
+
+    // ── per-cluster axes (deflated power iteration on Σ_drift) ───────────────
+    //
+    // Computes F leading eigenvectors of sigma_drift[c] and stores them in
+    // cluster_axes[c] as (F*d) floats.  Falls back to clearing cluster_axes[c]
+    // (= use global axes) when the Frobenius norm of Σ_drift is too small.
+
+    void _compute_cluster_axes(int c) {
+        const auto& s = sigma_drift[c];
+        // Frobenius norm² check
+        double snorm2 = 0.0;
+        for (double v : s) snorm2 += v * v;
+        if (snorm2 < 1e-20) {
+            cluster_axes[c].clear();   // signal: use global axes
+            return;
+        }
+
+        // Working copy of Σ (double, row-major d×d)
+        std::vector<double> S(s.begin(), s.end());
+        cluster_axes[c].resize((size_t)F * d, 0.f);
+
+        std::vector<double> v(d), tmp(d);
+        for (int l = 0; l < F; ++l) {
+            // Warm start: global axis l
+            for (int j = 0; j < d; ++j) v[j] = (double)axes[l * d + j];
+
+            bool ok = false;
+            for (int iter = 0; iter < axes_power_iters; ++iter) {
+                // tmp = S @ v
+                double norm2 = 0.0;
+                for (int i = 0; i < d; ++i) {
+                    double acc = 0.0;
+                    for (int jj = 0; jj < d; ++jj) acc += S[i*d+jj] * v[jj];
+                    tmp[i] = acc;
+                    norm2 += acc * acc;
+                }
+                if (norm2 < 1e-30) break;
+                double inv = 1.0 / std::sqrt(norm2);
+                for (int j = 0; j < d; ++j) v[j] = tmp[j] * inv;
+                if (iter == 9) ok = true;
+            }
+
+            if (ok) {
+                for (int j = 0; j < d; ++j)
+                    cluster_axes[c][l * d + j] = (float)v[j];
+                // Deflation: S -= λ·vvᵀ  (λ = vᵀSv)
+                double lambda = 0.0;
+                for (int i = 0; i < d; ++i)
+                    for (int jj = 0; jj < d; ++jj)
+                        lambda += v[i] * S[i*d+jj] * v[jj];
+                for (int i = 0; i < d; ++i)
+                    for (int jj = 0; jj < d; ++jj)
+                        S[i*d+jj] -= lambda * v[i] * v[jj];
+            } else {
+                // Fallback: copy global axis l
+                for (int j = 0; j < d; ++j)
+                    cluster_axes[c][l * d + j] = axes[l * d + j];
+            }
+        }
+    }
+
+    // ── cluster merge helpers ─────────────────────────────────────────────────
+
+    // Merge cluster `fold` into cluster `keep`.  Called under exclusive lock.
+    void _merge_clusters(int keep, int fold) {
+        if (keep == fold) return;
+        if (cluster_counts[fold] == 0) return;
+
+        int64_t N_k     = cluster_counts[keep];
+        int64_t N_f     = cluster_counts[fold];
+        int64_t N_total = N_k + N_f;
+
+        // Merged centroid.
+        float* mu_k      = &centroids[keep * d];
+        const float* mu_f = &centroids[fold * d];
+        float inv_N = 1.0f / (float)N_total;
+        for (int j = 0; j < d; ++j)
+            mu_k[j] = ((float)N_k * mu_k[j] + (float)N_f * mu_f[j]) * inv_N;
+        // Redirect fold's centroid so new inserts near that region go to keep.
+        for (int j = 0; j < d; ++j)
+            centroids[fold * d + j] = mu_k[j];
+
+        // Append fold's live points to keep's cluster_global.
+        auto& cg_fold = cluster_global[fold];
+        auto& cg_keep = cluster_global[keep];
+        for (uint32_t gid : cg_fold)
+            if (!del_mask[gid]) cg_keep.push_back(gid);
+
+        // Clear fold cluster state.
+        cg_fold.clear();
+        cluster_counts[fold]     = 0;
+        cluster_tombstones[fold] = 0;
+        cluster_has_cones[fold]  = false;
+        cluster_cones[fold].assign(F, SortedCone(F));
+        std::fill(sigma_drift[fold].begin(), sigma_drift[fold].end(), 0.0);
+        cluster_axes[fold].clear();
+
+        // Compact keep's cluster_global (remove deleted entries).
+        std::vector<uint32_t> live;
+        live.reserve(cg_keep.size());
+        for (uint32_t gid : cg_keep)
+            if (!del_mask[gid]) live.push_back(gid);
+        cg_keep               = std::move(live);
+        cluster_counts[keep]  = (int64_t)cg_keep.size();
+        cluster_tombstones[keep] = 0;
+        std::fill(sigma_drift[keep].begin(), sigma_drift[keep].end(), 0.0);
+        cluster_axes[keep].clear();
+
+        // Rebuild cones for the merged cluster using global axes initially;
+        // per-cluster axes will be derived on the next _local_refresh.
+        _build_cones(keep, cg_keep);
+    }
+
+    // Scan all cluster pairs within eps_merge; merge qualifying pairs.
+    // Called under exclusive lock from _add_raw (when insert_count % merge_interval == 0)
+    // or from the public periodic_merge() method.
+    void _periodic_merge() {
+        if (eps_merge <= 0.0) return;
+        const double eps2 = eps_merge * eps_merge;
+        std::vector<bool> merged(nlist, false);
+
+        for (int i = 0; i < nlist; ++i) {
+            if (merged[i] || cluster_counts[i] == 0) continue;
+
+            double best_d2 = eps2;
+            int    best_j  = -1;
+
+            for (int j = i + 1; j < nlist; ++j) {
+                if (merged[j] || cluster_counts[j] == 0) continue;
+                const float* mi = &centroids[i * d];
+                const float* mj = &centroids[j * d];
+                double d2 = 0.0;
+                for (int k = 0; k < d; ++k) { double df = mi[k]-mj[k]; d2 += df*df; }
+                if (d2 < best_d2) { best_d2 = d2; best_j = j; }
+            }
+
+            if (best_j < 0) continue;
+            const int j = best_j;
+
+            // Mean QE for each cluster.
+            const int64_t N_i     = cluster_counts[i];
+            const int64_t N_j     = cluster_counts[j];
+            const int64_t N_total = N_i + N_j;
+            const float* mu_i = &centroids[i * d];
+            const float* mu_j = &centroids[j * d];
+
+            double mQE_i = 0.0;
+            for (uint32_t gid : cluster_global[i]) {
+                if (del_mask[gid]) continue;
+                const float* xi = &data_buf[gid * d];
+                double d2 = 0.0;
+                for (int k = 0; k < d; ++k) { double df = xi[k]-mu_i[k]; d2 += df*df; }
+                mQE_i += d2;
+            }
+            if (N_i > 0) mQE_i /= (double)N_i;
+
+            double mQE_j = 0.0;
+            for (uint32_t gid : cluster_global[j]) {
+                if (del_mask[gid]) continue;
+                const float* xj = &data_buf[gid * d];
+                double d2 = 0.0;
+                for (int k = 0; k < d; ++k) { double df = xj[k]-mu_j[k]; d2 += df*df; }
+                mQE_j += d2;
+            }
+            if (N_j > 0) mQE_j /= (double)N_j;
+
+            // Merge if the QE increase from using μ_merged (instead of separate
+            // centroids) is small relative to the combined within-cluster spread:
+            //   δ_qe = N_i*N_j/N_total² * ||μ_i - μ_j||²  ≤  (mQE_i + mQE_j)/2
+            double weight   = (double)(N_i * N_j) / ((double)N_total * N_total);
+            double delta_qe = weight * best_d2;
+            if (delta_qe <= (mQE_i + mQE_j) * merge_qe_ratio) {
+                _merge_clusters(i, j);
+                merged[j] = true;
+            }
+        }
     }
 };
 
@@ -1465,6 +1706,18 @@ PYBIND11_MODULE(_ampi_ext, m) {
              "True if the index uses cosine distance.")
         .def_readwrite("drift_theta",  &AMPIIndex::drift_theta,
              "Drift-angle threshold in degrees.  Writable — change at any time.")
+        .def_readwrite("merge_interval", &AMPIIndex::merge_interval,
+             "Inserts between periodic cluster-merge checks (0 = disabled).")
+        .def_readwrite("eps_merge",       &AMPIIndex::eps_merge,
+             "Centroid L2 distance threshold for the merge check.")
+        .def_readwrite("merge_qe_ratio",  &AMPIIndex::merge_qe_ratio,
+             "Merge if δ_qe ≤ ratio*(mQE_i+mQE_j).")
+        .def_readwrite("axes_power_iters",&AMPIIndex::axes_power_iters,
+             "Deflated power-iteration steps per axis in _compute_cluster_axes.")
+        .def("set_merge_params", &AMPIIndex::set_merge_params,
+             py::arg("interval"), py::arg("eps"),
+             py::arg("qe_ratio"), py::arg("power_iters"),
+             "Set merge_interval, eps_merge, merge_qe_ratio, axes_power_iters in one call.")
         .def("query", &AMPIIndex::query,
              py::arg("q"), py::arg("k"), py::arg("window_size"),
              py::arg("probes"), py::arg("fan_probes"),
@@ -1481,7 +1734,18 @@ PYBIND11_MODULE(_ampi_ext, m) {
              py::call_guard<py::gil_scoped_release>(),
              "Rebuild all cones for cluster c without holding the GIL.\n\n"
              "Resets tombstone count and drift covariance for cluster c.\n"
-             "No-op if c is out of range.");
+             "No-op if c is out of range.")
+        .def("periodic_merge", &AMPIIndex::periodic_merge,
+             py::arg("eps"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Trigger one cluster-merge pass with the given eps_merge threshold.\n\n"
+             "Merges centroid pairs within eps whose QE increase is small.\n"
+             "Calls _refresh_views() on the Python side are not needed —\n"
+             "use AMPIAffineFanIndex.periodic_merge() instead.")
+        .def("get_cluster_axes", &AMPIIndex::get_cluster_axes,
+             py::arg("c"),
+             "Return (F, d) float32 axes for cluster c.\n\n"
+             "Returns global axes if per-cluster axes not yet computed.");
 
     m.def("update_drift_and_check", &update_drift_and_check,
           "Fused drift EMA + power iteration.\n\n"
