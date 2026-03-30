@@ -46,7 +46,16 @@ See **DATABASE_PLAN.md** for the concrete phased implementation plan.
 
 ---
 
-## 2. Persistence Layer (Phase 2 — not started)
+## 2. Persistence Layer (Phase 2 — prerequisites done, implementation not started)
+
+### Phase-2 Prerequisites (branch `phase-2-prereqs`)
+- [x] `AMPIIndex::get_U_drift(c)` — returns `(d, F) float32` copy of the Oja sketch;
+      needed by the checkpoint serializer to snapshot per-cluster drift state.
+- [x] `SortedCone::get_axis_pairs(l)` — returns `(projs, ids)` for axis l; needed by
+      the checkpoint serializer to read cone pairs back out of C++.
+- [x] mmap-backed `_data_buf` (`data_path=` kwarg on `AMPIAffineFanIndex`): replaces
+      `np.empty` with `np.memmap`; OS pages in only touched clusters — prerequisite
+      for single-node GIST 1M on a 16 GB machine.
 
 ### Write-Ahead Log
 - [ ] Append-only binary WAL: one record per mutation (INSERT|DELETE, global_id,
@@ -58,10 +67,6 @@ See **DATABASE_PLAN.md** for the concrete phased implementation plan.
 - [ ] Checkpoint serializer: header + centroids + axes + per-cluster cone pairs.
 - [ ] mmap-friendly layout for read-only serving while new checkpoint is being written.
 - [ ] Truncate WAL after successful checkpoint.
-- [ ] mmap-backed `_data_buf`: replace `np.empty` allocation with a memory-mapped
-      file so the OS pages in only the clusters being queried/inserted; prerequisite
-      for single-node GIST 1M on a 16 GB machine.  Natural side-effect of the
-      mmap-friendly checkpoint layout above.
 
 ---
 
