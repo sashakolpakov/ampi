@@ -93,8 +93,6 @@ _U_REORTH_INTERVAL = 50   # QR re-orthonormalise every N inserts per cluster
 _MERGE_INTERVAL       = 0      # 0 = disabled; set > 0 to enable periodic merge
 _EPS_MERGE            = 1.0    # centroid L2 distance threshold for merge check
 
-# ── Per-cluster axis computation ──────────────────────────────────────────────
-_AXES_POWER_ITERS     = 10     # deflated power-iteration steps in _compute_cluster_axes
 _MERGE_QE_RATIO       = 0.5    # merge if δ_qe ≤ ratio × (mQE_i + mQE_j)
 
 
@@ -354,13 +352,11 @@ class AMPIAffineFanIndex:
     def __init__(self, data, nlist=None, num_fans=16, seed=0, cone_top_k=1,
                  metric='l2', drift_theta=_DRIFT_THETA,
                  merge_interval=_MERGE_INTERVAL, eps_merge=_EPS_MERGE,
-                 axes_power_iters=_AXES_POWER_ITERS,
                  merge_qe_ratio=_MERGE_QE_RATIO):
         self.metric           = _normalize_metric(metric)
         self.drift_theta      = float(drift_theta)
         self.merge_interval   = int(merge_interval)
         self.eps_merge        = float(eps_merge)
-        self.axes_power_iters = int(axes_power_iters)
         self.merge_qe_ratio   = float(merge_qe_ratio)
 
         self.data = np.ascontiguousarray(data, dtype=np.float32)
@@ -464,7 +460,7 @@ class AMPIAffineFanIndex:
                 self.cluster_global,
             )
             self._cpp.set_merge_params(self.merge_interval, self.eps_merge,
-                                       self.merge_qe_ratio, self.axes_power_iters)
+                                       self.merge_qe_ratio)
             self._refresh_views()
             self.cluster_cones = _CppConesProxy(self._cpp)
         else:

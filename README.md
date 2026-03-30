@@ -13,7 +13,7 @@ retrain.  AMPI is designed around the assumption that your data changes continuo
 
 **How AMPI stays fresh without rebuilding:**
 - Inserts and deletes are O(1) amortised — no sorted arrays are rebuilt globally.
-- Per-cluster covariance drift detection (EMA + power iteration) triggers a
+- Per-cluster Oja subspace sketch detects directional drift and triggers a
   *local* cone refresh only for the affected cluster — O(N_c · F · d) vs
   O(T · n · M · d) for a full IVF retrain.
 - Tombstone compaction is automatic when a cluster's delete fraction exceeds 10%.

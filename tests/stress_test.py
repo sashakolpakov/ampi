@@ -500,24 +500,18 @@ def merge_interval_auto_triggers():
 
 @test
 def merge_params_propagate_to_cpp():
-    """Non-default axes_power_iters and merge_qe_ratio must reach the C++ layer."""
+    """Non-default merge_qe_ratio must reach the C++ layer."""
     idx, _, _ = _small_index(n=500, d=16, nlist=5, F=8)
     if idx._cpp is None:
         return
-    assert idx._cpp.axes_power_iters == idx.axes_power_iters, \
-        "axes_power_iters mismatch Python vs C++"
     assert abs(idx._cpp.merge_qe_ratio - idx.merge_qe_ratio) < 1e-9, \
         "merge_qe_ratio mismatch Python vs C++"
 
     rng  = np.random.default_rng(30)
     data = rng.standard_normal((500, 16)).astype('float32')
-    idx2 = AMPIAffineFanIndex(data, nlist=5, num_fans=8, seed=30,
-                               axes_power_iters=3, merge_qe_ratio=0.1)
-    assert idx2.axes_power_iters == 3,              "Python axes_power_iters not stored"
+    idx2 = AMPIAffineFanIndex(data, nlist=5, num_fans=8, seed=30, merge_qe_ratio=0.1)
     assert abs(idx2.merge_qe_ratio - 0.1) < 1e-9,  "Python merge_qe_ratio not stored"
     if idx2._cpp is not None:
-        assert idx2._cpp.axes_power_iters == 3, \
-            "axes_power_iters=3 not propagated to C++"
         assert abs(idx2._cpp.merge_qe_ratio - 0.1) < 1e-9, \
             "merge_qe_ratio=0.1 not propagated to C++"
 

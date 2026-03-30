@@ -74,7 +74,7 @@ X  ⊂  ℝᵈ
              │
              └── Level 2: affine fan cones  {cone_{c,0}, …, cone_{c,F-1}}
                           axes aₗ^(c) ∈ Sᵈ⁻¹ — global at build time; per-cluster
-                          after first local refresh (deflated power iteration on Σ_drift_c)
+                          after first local refresh (columns of U_drift_c Oja sketch)
                           point x ∈ Cₒ → top-K cones by |〈x−μ_c, aₗ^(c)〉| / ‖x−μ_c‖
                           │
                           └── Level 3: sorted projection arrays

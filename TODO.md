@@ -93,7 +93,7 @@ All phases merged (branch `cpp-pipeline`).
 - [x] BLAS-accelerated `project_data` via `ampi/_gemm.hpp` (Accelerate / OpenBLAS / MKL /
       AVX2 / NEON); 20–112× over scalar loop.
 - [x] `best_clusters`, `best_fan_cones`: C++ nth_element replaces NumPy argsort per query.
-- [x] `update_drift_and_check`: fused EMA + 5-step power iteration in C++.
+- [x] `update_drift_and_check`: Oja rank-F subspace sketch + leading-eigenvec angle check in C++.
 - [x] `AMPIIndex` C++ class: owns all mutable state; `add`, `remove`, `local_refresh`,
       `build_cones`, full adaptive query loop, `batch_add`, `batch_delete`.
 - [x] `std::shared_mutex` — concurrent reads, serialised writes; GIL released on hot paths.

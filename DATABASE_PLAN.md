@@ -85,19 +85,18 @@ to within-cluster spread). Cost: O(nlist²) comparisons — negligible for nlist
 Per cluster, maintain an EMA of the outer product of nearest-neighbour pairs:
 
 ```
-Σ_drift_c ← (1 − β) · Σ_drift_c  +  β · (x − y)(x − y)^T
+U_drift_c ← Oja rank-F sketch update (see §Memory / Oja's rule below)
 ```
 
 where `y` = the approximate nearest neighbour of `x` within cluster `c`
 (cheaply found from the cone candidate set before L2 rerank).
 
-After each insert, check whether the leading eigenvector of `Σ_drift_c`
-(power iteration, 3–5 steps) has rotated more than `θ_drift` degrees from the
+After each insert, check whether `U_drift_c[:,0]` (leading eigenvector estimate,
+no power iteration needed) has rotated more than `θ_drift` degrees from the
 current fan axes. If so, schedule a **local fan-axis refresh** for cluster `c`:
 
-1. Recompute F axes from `Σ_drift_c`'s top-F eigenvectors via deflated power
-   iteration (`axes_power_iters` steps per axis); falls back to global random axes when
-   ‖Σ_drift_c‖_F < 10⁻¹⁰ (insufficient signal).
+1. Read F axes directly from columns of `U_drift_c` (already normalised); falls
+   back to global random axes when `‖U_drift_c[:,0]‖ < 10⁻⁵` (insufficient signal).
 2. Re-project all `N_c` points in cluster `c` onto the new axes.
 3. Rebuild cone sorted arrays for cluster `c` — O(N_c · F · log N_c).
 4. Swap atomically (write-lock cluster `c` for the swap, then release).
@@ -351,7 +350,6 @@ normalise each column of U               # column-norm ≈ 1; full QR every 50 i
 | `merge_interval` | 0 (disabled) | set > 0 to enable periodic merge |
 | `ε_merge` | 1.0 (L2 distance) | centroid proximity threshold; tune per dataset |
 | `merge_qe_ratio` | 0.5 | merge if δ_qe ≤ ratio × (mQE_i + mQE_j) |
-| `axes_power_iters` | 10 | deflated power-iteration steps per fan axis |
 | `β` (drift EMA) | 0.01 | slow decay for stability |
 | `θ_drift` | 15° | fan-axis refresh trigger |
 | `tombstone_threshold` | 0.10 | fraction before compaction |

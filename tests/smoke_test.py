@@ -128,7 +128,6 @@ if _HAS_CPP:
 
     # ── merge / per-cluster-axes fields (gap 4) ───────────────────────────────
     assert isinstance(cpp.merge_qe_ratio,  float), "merge_qe_ratio not float"
-    assert isinstance(cpp.axes_power_iters, int),  "axes_power_iters not int"
 
     for _c in range(cpp.nlist):
         _ax_c = cpp.get_cluster_axes(_c)
@@ -137,13 +136,12 @@ if _HAS_CPP:
         assert _ax_c.dtype == np.float32, \
             f"get_cluster_axes({_c}) wrong dtype: {_ax_c.dtype}"
 
-    # set_merge_params must update all four fields atomically
-    cpp.set_merge_params(42, 3.14, 0.25, 7)
+    # set_merge_params must update all three fields atomically
+    cpp.set_merge_params(42, 3.14, 0.25)
     assert cpp.merge_interval   == 42,                    "merge_interval not set"
     assert abs(cpp.eps_merge    - 3.14) < 1e-9,          "eps_merge not set"
     assert abs(cpp.merge_qe_ratio - 0.25) < 1e-9,        "merge_qe_ratio not set"
-    assert cpp.axes_power_iters == 7,                     "axes_power_iters not set"
-    cpp.set_merge_params(0, 1.0, 0.5, 10)   # restore defaults
+    cpp.set_merge_params(0, 1.0, 0.5)   # restore defaults
 
     # ── cosine_metric flag is True for cosine indexes (gap 7) ─────────────────
     _idx_cos_compat = AMPIAffineFanIndex(

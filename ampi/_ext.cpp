@@ -430,7 +430,6 @@ public:
     int      merge_interval   = 0;    // 0 = disabled
     double   eps_merge        = 1.0;  // centroid L2 distance threshold
     double   merge_qe_ratio   = 0.5;  // merge if δ_qe ≤ ratio*(mQE_i+mQE_j)
-    int      axes_power_iters = 10;   // deflated power-iteration steps per axis
     uint64_t insert_count     = 0;    // total inserts processed
 
     // cppcheck-suppress uninitMemberVar
@@ -534,19 +533,16 @@ public:
         return idx;
     }
 
-    void set_merge_params(int interval, double eps, double qe_ratio, int power_iters) {
+    void set_merge_params(int interval, double eps, double qe_ratio) {
         if (interval < 0)
             throw std::invalid_argument("merge_interval must be >= 0");
         if (eps <= 0.0)
             throw std::invalid_argument("eps must be > 0");
         if (qe_ratio < 0.0 || qe_ratio > 1.0)
             throw std::invalid_argument("qe_ratio must be in [0, 1]");
-        if (power_iters < 1)
-            throw std::invalid_argument("power_iters must be >= 1");
-        merge_interval   = interval;
-        eps_merge        = eps;
-        merge_qe_ratio   = qe_ratio;
-        axes_power_iters = power_iters;
+        merge_interval = interval;
+        eps_merge      = eps;
+        merge_qe_ratio = qe_ratio;
     }
 
     // ── add ──────────────────────────────────────────────────────────────────
@@ -1709,12 +1705,9 @@ PYBIND11_MODULE(_ampi_ext, m) {
              "Centroid L2 distance threshold for the merge check.")
         .def_readwrite("merge_qe_ratio",  &AMPIIndex::merge_qe_ratio,
              "Merge if δ_qe ≤ ratio*(mQE_i+mQE_j).")
-        .def_readwrite("axes_power_iters",&AMPIIndex::axes_power_iters,
-             "Deflated power-iteration steps per axis in _compute_cluster_axes.")
         .def("set_merge_params", &AMPIIndex::set_merge_params,
-             py::arg("interval"), py::arg("eps"),
-             py::arg("qe_ratio"), py::arg("power_iters"),
-             "Set merge_interval, eps_merge, merge_qe_ratio, axes_power_iters in one call.")
+             py::arg("interval"), py::arg("eps"), py::arg("qe_ratio"),
+             "Set merge_interval, eps_merge, and merge_qe_ratio in one call.")
         .def("query", &AMPIIndex::query,
              py::arg("q"), py::arg("k"), py::arg("window_size"),
              py::arg("probes"), py::arg("fan_probes"),
