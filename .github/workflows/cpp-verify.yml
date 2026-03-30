@@ -4,14 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
-    paths:
-      - "ampi/*.cpp"
-      - "ampi/*.hpp"
+      - "**"
   pull_request:
-    paths:
-      - "ampi/*.cpp"
-      - "ampi/*.hpp"
 
 concurrency:
   group: cpp-verify-${{ github.ref }}
@@ -36,14 +30,23 @@ jobs:
       - name: Run cppcheck
         run: |
           cppcheck \
-            --enable=all \
+            --enable=warning,performance,portability \
             --error-exitcode=1 \
             --inline-suppr \
             --suppress=missingIncludeSystem \
             --suppress=unusedFunction \
             --std=c++17 \
             -I ampi \
+            --output-file=cppcheck.log \
             ampi/_ext.cpp ampi/_gemm.hpp
+          cat cppcheck.log
+
+      - name: Upload cppcheck log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cppcheck-log
+          path: cppcheck.log
 
   # ── Job 2: LLM read-only review ──────────────────────────────────────────────
   llm:
@@ -89,6 +92,13 @@ jobs:
       - name: Write skip notice (no C++ changes)
         if: steps.diff.outputs.lines == '0'
         run: echo "No C++ changes — verification skipped." > /tmp/llm_report.md
+
+      - name: Upload LLM report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-report
+          path: /tmp/llm_report.md
 
       - name: Post report as PR comment
         if: github.event_name == 'pull_request'
