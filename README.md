@@ -46,7 +46,8 @@ The main index. Three-level structure:
 | `add(x)` | O(M·d + K·F·n_f) | inserts into sorted arrays in affected cluster |
 | `delete(global_id)` | O(K·F) | tombstone; auto-compacts at 10% threshold |
 | `update(global_id, x)` | delete + add | returns new global_id |
-| local refresh | O(N_c·F·d) | triggered by drift or compaction; one cluster only |
+| local refresh | O(N_c·F·d) | triggered by drift or compaction; recomputes per-cluster axes |
+| `periodic_merge(eps)` | O(nlist²) | merges centroid pairs within eps; runs automatically every `merge_interval` inserts |
 
 ### AMPIBinaryIndex
 
@@ -107,6 +108,8 @@ binary_cands = binary.query_candidates(q, window_size=200)   # (m,) int32 indice
 | `num_fans` F | cones per cluster | largest F s.t. `n/(nlist×F) ≥ w_base` |
 | `cone_top_k` K | soft assignment | K=1 fast; K=2 better recall at cluster boundaries |
 | `metric` | distance function | `'l2'`/`'L2'`/`'euclidean'` (Euclidean), `'sqeuclidean'` (squared L2), `'cosine'` (normalises internally) |
+| `merge_interval` | periodic merge cadence | 0 = disabled; set e.g. 1000 to merge every 1000 inserts |
+| `eps_merge` | merge threshold (L2) | centroid distance below which a pair is a merge candidate |
 | `probes` cp | clusters probed per query | 5–20 |
 | `fan_probes` fp | cones probed per cluster | F/4 … F |
 | `window_size` w | candidates per cone per axis | scales with `sqrt(n)` |

@@ -126,9 +126,46 @@ if _HAS_CPP:
     assert not (set(_bids.tolist()) & set(_found.tolist())), \
         "batch-deleted points appeared in query"
 
+    # ── merge / per-cluster-axes fields (gap 4) ───────────────────────────────
+    assert isinstance(cpp.merge_qe_ratio,  float), "merge_qe_ratio not float"
+    assert isinstance(cpp.axes_power_iters, int),  "axes_power_iters not int"
+
+    for _c in range(cpp.nlist):
+        _ax_c = cpp.get_cluster_axes(_c)
+        assert _ax_c.shape == (cpp.F, cpp.d), \
+            f"get_cluster_axes({_c}) wrong shape: {_ax_c.shape}"
+        assert _ax_c.dtype == np.float32, \
+            f"get_cluster_axes({_c}) wrong dtype: {_ax_c.dtype}"
+
+    # set_merge_params must update all four fields atomically
+    cpp.set_merge_params(42, 3.14, 0.25, 7)
+    assert cpp.merge_interval   == 42,                    "merge_interval not set"
+    assert abs(cpp.eps_merge    - 3.14) < 1e-9,          "eps_merge not set"
+    assert abs(cpp.merge_qe_ratio - 0.25) < 1e-9,        "merge_qe_ratio not set"
+    assert cpp.axes_power_iters == 7,                     "axes_power_iters not set"
+    cpp.set_merge_params(0, 1.0, 0.5, 10)   # restore defaults
+
+    # ── cosine_metric flag is True for cosine indexes (gap 7) ─────────────────
+    _idx_cos_compat = AMPIAffineFanIndex(
+        data, nlist=5, num_fans=16, seed=0, metric='cosine')
+    assert _idx_cos_compat._cpp is not None, "cosine index has no C++ backend"
+    assert _idx_cos_compat._cpp.cosine_metric is True, \
+        "cosine_metric not True for metric='cosine'"
+
     print("AMPIIndex accessor compatibility: OK")
 else:
     print("AMPIIndex accessor compatibility: SKIPPED (C++ ext not built)")
+
+
+# ── Binary query_candidates (gap 6) ──────────────────────────────────────────
+_q0 = qs[0]
+_cands_b = idx_b.query_candidates(_q0, window_size=100)
+assert _cands_b.ndim == 1,              "binary query_candidates not 1-D"
+assert _cands_b.dtype == np.int32,      "binary query_candidates wrong dtype"
+_, _, _ids_b = idx_b.query(_q0, k=10, window_size=100)
+assert set(_ids_b.tolist()).issubset(set(_cands_b.tolist())), \
+    "binary query_candidates not a superset of query top-k"
+print("Binary query_candidates: OK")
 
 
 # ── C++ query correctness ─────────────────────────────────────────────────────
@@ -369,3 +406,45 @@ _, _, _ids_upd = _idx3d.query(_q_upd, k=10, window_size=200,
 assert _gid_old not in _ids_upd.tolist(), "old point still in results after update"
 
 print("add / delete / update API: OK")
+
+
+# ── AFanTuner smoke (gap 5) ───────────────────────────────────────────────────
+# Verifies that AFanTuner constructs without error, returns all expected keys,
+# and that the tuned index achieves reasonable recall on tiny data.
+
+from ampi import AFanTuner
+
+_rng_t   = np.random.default_rng(7)
+_n_t, _d_t = 2_000, 16
+_data_t  = _rng_t.standard_normal((_n_t, _d_t)).astype("float32")
+_qs_t    = _rng_t.standard_normal((20, _d_t)).astype("float32")
+
+_flat_t  = faiss.IndexFlatL2(_d_t)
+_flat_t.add(_data_t)
+_, _gt_t = _flat_t.search(_qs_t, 10)
+
+_tuner  = AFanTuner(_data_t, _qs_t, _gt_t, n_bo_iter=4)
+_result = _tuner.tune(verbose=False)
+
+assert set(_result.keys()) >= {"index", "nlist", "alpha", "K", "F", "suggestions"}, \
+    f"tune() result missing keys: {_result.keys()}"
+assert isinstance(_result["index"], AMPIAffineFanIndex), \
+    "tune() 'index' not AMPIAffineFanIndex"
+assert isinstance(_result["suggestions"], list), \
+    "tune() 'suggestions' not a list"
+assert _result["nlist"] >= 1,   "nlist < 1"
+assert _result["F"]     >= 1,   "F < 1"
+assert _result["K"]     in (1, 2, 3), f"K={_result['K']} not in {{1,2,3}}"
+
+# Tuned index must achieve at least 0.5 recall on the same queries
+_tuned_idx = _result["index"]
+_found_t   = [_tuned_idx.query(_q, k=10, window_size=50,
+                                probes=min(5, _tuned_idx.nlist),
+                                fan_probes=min(8, _tuned_idx.F))[2] for _q in _qs_t]
+_rec_t = sum(
+    len(set(_gt_t[i].tolist()) & set(_found_t[i].tolist()))
+    for i in range(len(_qs_t))
+) / (len(_qs_t) * 10)
+assert _rec_t >= 0.50, f"AFanTuner index recall too low: {_rec_t:.3f}"
+
+print("AFanTuner smoke: OK")

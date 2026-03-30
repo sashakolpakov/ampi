@@ -430,6 +430,185 @@ def heavy_churn_recall():
         assert not bad, f"deleted ids {bad} returned during churn"
 
 
+# ── periodic merge ───────────────────────────────────────────────────────────
+
+@test
+def periodic_merge_reduces_cluster_count():
+    """Two near-identical tight clusters must be folded into one by periodic_merge."""
+    rng = np.random.default_rng(20)
+    d   = 16
+    # Two very tight groups whose centroids are 0.001 apart — merge criterion
+    # is trivially satisfied: δ_qe ≈ 0.25 * 1e-6 << 0.5 * (mQE_a + mQE_b).
+    group_a = (rng.standard_normal((100, d)) * 0.1).astype('float32')
+    group_b = (rng.standard_normal((100, d)) * 0.1 + 0.001).astype('float32')
+    data    = np.vstack([group_a, group_b])
+    idx     = AMPIAffineFanIndex(data, nlist=2, num_fans=8, seed=20)
+
+    if idx._cpp is not None:
+        non_empty_before = sum(1 for c in idx._cpp.get_cluster_counts() if c > 0)
+    else:
+        non_empty_before = sum(1 for g in idx.cluster_global if len(g) > 0)
+    assert non_empty_before == 2, "precondition: expected 2 non-empty clusters"
+
+    idx.periodic_merge(eps_merge=1.0)
+
+    if idx._cpp is not None:
+        non_empty_after = sum(1 for c in idx._cpp.get_cluster_counts() if c > 0)
+    else:
+        non_empty_after = sum(1 for g in idx.cluster_global if len(g) > 0)
+    assert non_empty_after < non_empty_before, \
+        f"periodic_merge did not reduce cluster count: {non_empty_before} → {non_empty_after}"
+
+
+@test
+def periodic_merge_recall_preserved():
+    """Recall@5 must be maintained after a merge that folds two near-identical clusters."""
+    rng = np.random.default_rng(21)
+    d   = 16
+    group_a = (rng.standard_normal((100, d)) * 0.1).astype('float32')
+    group_b = (rng.standard_normal((100, d)) * 0.1 + 0.001).astype('float32')
+    data    = np.vstack([group_a, group_b])
+    idx     = AMPIAffineFanIndex(data, nlist=2, num_fans=8, seed=21)
+
+    qs  = (rng.standard_normal((20, d)) * 0.1).astype('float32')
+    gt  = _brute_knn(data, qs, k=5)
+
+    idx.periodic_merge(eps_merge=1.0)
+
+    found = [idx.query(q, k=5, window_size=100,
+                        probes=idx.nlist, fan_probes=idx.F)[2] for q in qs]
+    rec = _recall(gt, found, k=5)
+    assert rec >= 0.80, f"recall after periodic_merge = {rec:.3f} < 0.80"
+
+
+@test
+def merge_interval_auto_triggers():
+    """With merge_interval>0 auto-merge fires during add() calls without crashing."""
+    rng  = np.random.default_rng(22)
+    d    = 16
+    data = rng.standard_normal((200, d)).astype('float32')
+    idx  = AMPIAffineFanIndex(data, nlist=4, num_fans=8, seed=22,
+                               merge_interval=5, eps_merge=100.0)
+    for _ in range(25):
+        idx.add(rng.standard_normal(d).astype('float32'))
+    q = rng.standard_normal(d).astype('float32')
+    _, _, ids = idx.query(q, k=5, window_size=100,
+                           probes=idx.nlist, fan_probes=idx.F)
+    assert len(ids) > 0, "index not queryable after merge_interval auto-merge"
+
+
+# ── merge params and per-cluster axes ─────────────────────────────────────────
+
+@test
+def merge_params_propagate_to_cpp():
+    """Non-default axes_power_iters and merge_qe_ratio must reach the C++ layer."""
+    idx, _, _ = _small_index(n=500, d=16, nlist=5, F=8)
+    if idx._cpp is None:
+        return
+    assert idx._cpp.axes_power_iters == idx.axes_power_iters, \
+        "axes_power_iters mismatch Python vs C++"
+    assert abs(idx._cpp.merge_qe_ratio - idx.merge_qe_ratio) < 1e-9, \
+        "merge_qe_ratio mismatch Python vs C++"
+
+    rng  = np.random.default_rng(30)
+    data = rng.standard_normal((500, 16)).astype('float32')
+    idx2 = AMPIAffineFanIndex(data, nlist=5, num_fans=8, seed=30,
+                               axes_power_iters=3, merge_qe_ratio=0.1)
+    assert idx2.axes_power_iters == 3,              "Python axes_power_iters not stored"
+    assert abs(idx2.merge_qe_ratio - 0.1) < 1e-9,  "Python merge_qe_ratio not stored"
+    if idx2._cpp is not None:
+        assert idx2._cpp.axes_power_iters == 3, \
+            "axes_power_iters=3 not propagated to C++"
+        assert abs(idx2._cpp.merge_qe_ratio - 0.1) < 1e-9, \
+            "merge_qe_ratio=0.1 not propagated to C++"
+
+
+@test
+def per_cluster_axes_populated_after_refresh():
+    """After local_refresh with non-trivial sigma_drift, cluster axes are valid unit vectors.
+
+    Python path: sets sigma_drift directly, calls _local_refresh, checks cluster_axes.
+    C++ path:    inserts biased points to build sigma_drift, calls local_refresh,
+                 checks get_cluster_axes returns (F, d) unit-vector float32 array.
+    """
+    rng  = np.random.default_rng(40)
+    d    = 32
+    data = rng.standard_normal((800, d)).astype('float32')
+    idx  = AMPIAffineFanIndex(data, nlist=4, num_fans=8, seed=40)
+    c_star = int(np.argmax([len(g) for g in idx.cluster_global]))
+
+    if idx._cpp is None:
+        # Python path: inject a known biased sigma_drift matrix and refresh.
+        e0    = np.zeros(d, dtype=np.float64); e0[0] = 1.0
+        sigma = np.outer(e0, e0) * 10.0          # strong signal, clearly > 1e-10
+        idx._sigma_drift[c_star][:] = sigma.ravel()
+        idx._local_refresh(c_star)
+
+        ca = idx.cluster_axes[c_star]
+        assert ca is not None, f"cluster_axes[{c_star}] still None after refresh"
+        assert ca.shape == (idx.F, idx.d), \
+            f"cluster_axes[{c_star}] wrong shape: {ca.shape}"
+        assert ca.dtype == np.float32
+        norms = np.linalg.norm(ca.astype(np.float64), axis=1)
+        np.testing.assert_allclose(norms, 1.0, atol=1e-5,
+            err_msg="Python cluster_axes: axes not unit vectors")
+        # Leading axis must align with e0 (the only direction with signal).
+        cos = float(np.max(np.abs(ca.astype(np.float64) @ e0)))
+        assert cos > 0.9, f"leading axis not aligned with e0: cos={cos:.3f}"
+
+    else:
+        # C++ path: insert points biased along e0 relative to c_star's centroid,
+        # then manually trigger local_refresh and verify the returned axes.
+        centroid = idx._cpp.get_centroids()[c_star].copy()
+        e0       = np.zeros(d, dtype='float32'); e0[0] = 1.0
+        # Points placed 1 unit from centroid along e0 — stays within the cluster's
+        # neighbourhood (within-cluster spread ≈ sqrt(d) ≈ 5.6).
+        for _ in range(80):
+            x = centroid + e0 * 1.0 + rng.standard_normal(d).astype('float32') * 0.1
+            idx._cpp.add(x.astype('float32'))
+
+        idx._cpp.local_refresh(c_star)
+        ax_c = idx._cpp.get_cluster_axes(c_star)
+
+        assert ax_c.shape == (idx.F, idx.d), \
+            f"C++ get_cluster_axes wrong shape: {ax_c.shape}"
+        assert ax_c.dtype == np.float32, f"C++ cluster axes wrong dtype: {ax_c.dtype}"
+        norms = np.linalg.norm(ax_c.astype(np.float64), axis=1)
+        np.testing.assert_allclose(norms, 1.0, atol=1e-5,
+            err_msg="C++ cluster axes are not unit vectors")
+
+
+# ── sqeuclidean with mutations ────────────────────────────────────────────────
+
+@test
+def sqeuclidean_add_delete():
+    """add/delete/update work correctly under sqeuclidean metric; distances are non-negative."""
+    rng  = np.random.default_rng(50)
+    data = rng.standard_normal((500, 16)).astype('float32')
+    idx  = AMPIAffineFanIndex(data, nlist=5, num_fans=8, seed=50,
+                               metric='sqeuclidean')
+
+    x   = _spike(16, 6)
+    gid = idx.add(x)
+
+    _, dists_pre, ids_pre = idx.query(x, k=5, window_size=200,
+                                       probes=idx.nlist, fan_probes=idx.F)
+    assert gid in ids_pre.tolist(), "sqeuclidean: inserted spike not found"
+    assert (dists_pre >= 0).all(), \
+        f"sqeuclidean: negative distances before delete: {dists_pre.min()}"
+
+    idx.delete(gid)
+    _, dists_post, ids_post = idx.query(x, k=10, window_size=200,
+                                         probes=idx.nlist, fan_probes=idx.F)
+    assert gid not in ids_post.tolist(), "sqeuclidean: deleted spike still returned"
+    assert (dists_post >= 0).all(), \
+        f"sqeuclidean: negative distances after delete: {dists_post.min()}"
+
+    new_gid = idx.update(int(ids_post[0]),
+                          rng.standard_normal(16).astype('float32'))
+    assert isinstance(new_gid, int), "sqeuclidean: update did not return int"
+
+
 # ── buffer / compaction / drift ───────────────────────────────────────────────
 
 @test

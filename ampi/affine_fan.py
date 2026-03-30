@@ -87,6 +87,14 @@ _DRIFT_THETA          = 15.0   # degrees — fan-axis refresh trigger
 _TOMBSTONE_THRESHOLD  = 0.10   # compact when tombstones > 10 % of cluster size
 _NN_PROBE_W           = 8      # half-window for approx-NN lookup in drift EMA
 
+# ── Periodic cluster-merge constants ─────────────────────────────────────────
+_MERGE_INTERVAL       = 0      # 0 = disabled; set > 0 to enable periodic merge
+_EPS_MERGE            = 1.0    # centroid L2 distance threshold for merge check
+
+# ── Per-cluster axis computation ──────────────────────────────────────────────
+_AXES_POWER_ITERS     = 10     # deflated power-iteration steps in _compute_cluster_axes
+_MERGE_QE_RATIO       = 0.5    # merge if δ_qe ≤ ratio × (mQE_i + mQE_j)
+
 
 # ── C++ cone proxy ────────────────────────────────────────────────────────────
 #
@@ -342,9 +350,16 @@ class AMPIAffineFanIndex:
     """
 
     def __init__(self, data, nlist=None, num_fans=16, seed=0, cone_top_k=1,
-                 metric='l2', drift_theta=_DRIFT_THETA):
-        self.metric = _normalize_metric(metric)
-        self.drift_theta = float(drift_theta)
+                 metric='l2', drift_theta=_DRIFT_THETA,
+                 merge_interval=_MERGE_INTERVAL, eps_merge=_EPS_MERGE,
+                 axes_power_iters=_AXES_POWER_ITERS,
+                 merge_qe_ratio=_MERGE_QE_RATIO):
+        self.metric           = _normalize_metric(metric)
+        self.drift_theta      = float(drift_theta)
+        self.merge_interval   = int(merge_interval)
+        self.eps_merge        = float(eps_merge)
+        self.axes_power_iters = int(axes_power_iters)
+        self.merge_qe_ratio   = float(merge_qe_ratio)
 
         self.data = np.ascontiguousarray(data, dtype=np.float32)
         if metric == 'cosine':
@@ -423,6 +438,15 @@ class AMPIAffineFanIndex:
         # Each row is a row-major flattened d×d covariance matrix.
         self._sigma_drift = np.zeros((self.nlist, self.d * self.d), dtype=np.float64)
 
+        # Per-cluster fan axes — list of nlist (F, d) float32 arrays, or None
+        # meaning "use global self.axes".  Populated by _local_refresh via
+        # _compute_cluster_axes (deflated power iteration on Σ_drift).
+        self.cluster_axes = [None] * self.nlist
+
+        # Insert counter for periodic merge; only used by the Python path.
+        # C++ tracks its own counter internally.
+        self._insert_count = 0
+
         # ── C++ index (Phase 3+) ──────────────────────────────────────────────
         if _HAS_EXT:
             self._cpp = _AMPIIndex.from_build(
@@ -434,6 +458,8 @@ class AMPIAffineFanIndex:
                 self.n,
                 self.cluster_global,
             )
+            self._cpp.set_merge_params(self.merge_interval, self.eps_merge,
+                                       self.merge_qe_ratio, self.axes_power_iters)
             self._refresh_views()
             self.cluster_cones = _CppConesProxy(self._cpp)
         else:
@@ -472,6 +498,37 @@ class AMPIAffineFanIndex:
         proj = q_centered @ self.axes.T / q_norm
         return np.argsort(-np.abs(proj))[:fan_probes]
 
+    def _compute_cluster_axes(self, c):
+        """Compute F fan axes for cluster c from Σ_drift via deflated power iteration.
+
+        Returns an (F, d) float32 array of unit vectors.  Falls back to the
+        global random axes when Σ_drift[c] has insufficient signal
+        (Frobenius norm < 1e-10).  This is called by _local_refresh before
+        Σ_drift is reset, so the axes reflect accumulated drift direction.
+        """
+        sig = self._sigma_drift[c].reshape(self.d, self.d)
+        if np.linalg.norm(sig, 'fro') < 1e-10:
+            return self.axes   # share immutable global axes as fallback
+
+        S      = sig.astype(np.float64).copy()
+        result = np.empty((self.F, self.d), dtype=np.float32)
+
+        for l in range(self.F):
+            v = self.axes[l].astype(np.float64)   # warm start: global axis l
+            for _ in range(self.axes_power_iters):
+                vn   = S @ v
+                norm = float(np.linalg.norm(vn))
+                if norm < 1e-15:
+                    v = self.axes[l].astype(np.float64)
+                    break
+                v = vn / norm
+            result[l] = v.astype(np.float32)
+            # Deflation: S -= λ·vvᵀ  so next iteration finds the next eigenvector
+            lam  = float(v @ S @ v)
+            S   -= lam * np.outer(v, v)
+
+        return result
+
     def _check_drift(self, c):
         """Power iteration on Σ_drift[c]; trigger _local_refresh if the
         leading eigenvector is > _DRIFT_THETA degrees from all fan axes.
@@ -485,17 +542,18 @@ class AMPIAffineFanIndex:
             if norm < 1e-12:
                 return
             v /= norm
-        # Maximum cosine similarity between v and any current fan axis.
-        cos_max = float(np.max(np.abs(self.axes.astype(np.float64) @ v)))
+        # Compare against per-cluster axes if available, else global.
+        axes_c  = self.cluster_axes[c] if self.cluster_axes[c] is not None else self.axes
+        cos_max = float(np.max(np.abs(axes_c.astype(np.float64) @ v)))
         if cos_max < np.cos(np.radians(self.drift_theta)):
             self._local_refresh(c)
 
     def _local_refresh(self, c):
         """Rebuild all cones for cluster c in-place.
 
-        Evicts tombstoned entries, rebalances cone assignments using the
-        current (global) fan axes, and resets the drift covariance.
-        O(N_c · F · log N_c).
+        Evicts tombstoned entries, rebalances cone assignments using
+        per-cluster axes derived from Σ_drift (or global axes as fallback),
+        and resets the drift covariance.  O(N_c · F · log N_c).
         """
         c_global = self.cluster_global[c]
         if len(c_global) == 0:
@@ -512,6 +570,7 @@ class AMPIAffineFanIndex:
             self.cluster_global[c] = c_idx
             self._cluster_tombstones[c] = 0
             self._sigma_drift[c][:] = 0
+            self.cluster_axes[c] = None
             return
 
         # Remove all (c, *) entries from _point_cones before rebuilding.
@@ -522,19 +581,158 @@ class AMPIAffineFanIndex:
                     (cc, ff) for cc, ff in self._point_cones[gid_i] if cc != c
                 ]
 
+        # Derive per-cluster axes from accumulated Σ_drift before resetting it.
+        axes_c = self._compute_cluster_axes(c)
+        self.cluster_axes[c] = axes_c
+
         cones, pc = _build_cones_for_cluster(
             c_idx, self.data[c_idx], self.centroids[c],
-            self.axes, self.F, self.cone_top_k,
+            axes_c, self.F, self.cone_top_k,
         )
-        self.cluster_cones[c]    = cones
-        self.cluster_global[c]   = c_idx
-        self._cluster_counts[c]  = len(c_idx)   # keep denominator in sync
+        self.cluster_cones[c]       = cones
+        self.cluster_global[c]      = c_idx
+        self._cluster_counts[c]     = len(c_idx)   # keep denominator in sync
         self._cluster_tombstones[c] = 0
-        self._sigma_drift[c][:] = 0
+        self._sigma_drift[c][:]     = 0            # reset AFTER computing axes
 
         for global_id, fs in pc.items():
             for f in fs:
                 self._point_cones.setdefault(global_id, []).append((c, f))
+
+    # ── cluster merge ─────────────────────────────────────────────────────────
+
+    def _py_merge_clusters(self, keep, fold):
+        """Merge cluster `fold` into cluster `keep` (Python-path).
+
+        Updates centroids, cluster_global, _point_cones, and rebuilds
+        cones for the merged cluster via _local_refresh.
+        """
+        N_k = int(self._cluster_counts[keep])
+        N_f = int(self._cluster_counts[fold])
+        if N_f == 0:
+            return
+
+        # Merged centroid (weighted average).
+        N_total  = N_k + N_f
+        mu_k     = self.centroids[keep]
+        mu_f     = self.centroids[fold]
+        mu_merged = ((N_k * mu_k + N_f * mu_f) / N_total).astype(np.float32)
+
+        # Live points from fold.
+        cg_fold = self.cluster_global[fold]
+        if self._n_deleted and len(cg_fold):
+            fold_live = cg_fold[~self._deleted_mask[cg_fold]].astype(np.int32)
+        else:
+            fold_live = cg_fold.astype(np.int32)
+
+        # Remove all (fold, *) entries from _point_cones for fold's live points.
+        for gid in fold_live:
+            gid_i = int(gid)
+            if gid_i in self._point_cones:
+                self._point_cones[gid_i] = [
+                    (cc, ff) for cc, ff in self._point_cones[gid_i] if cc != fold
+                ]
+
+        # Append fold's live points into keep's global list.
+        self.cluster_global[keep] = np.concatenate(
+            [self.cluster_global[keep], fold_live]).astype(np.int32)
+
+        # Update centroids: keep = merged; fold = merged (redirect new inserts).
+        self.centroids[keep] = mu_merged
+        self.centroids[fold] = mu_merged
+
+        # Update counts / tombstones.
+        self._cluster_counts[keep]     = N_total
+        self._cluster_counts[fold]     = 0
+        self._cluster_tombstones[fold] = 0
+
+        # Clear fold cluster.
+        self.cluster_global[fold]  = np.array([], dtype=np.int32)
+        self.cluster_cones[fold]   = None
+        self.cluster_axes[fold]    = None
+        self._sigma_drift[fold][:] = 0
+
+        # Rebuild cones for the merged cluster (also resets tombstone count,
+        # Σ_drift, and computes per-cluster axes).
+        self._local_refresh(keep)
+
+    def _py_periodic_merge(self):
+        """Scan all cluster pairs; merge close pairs that reduce mean QE."""
+        eps2   = self.eps_merge ** 2
+        merged = [False] * self.nlist
+
+        for i in range(self.nlist):
+            if merged[i] or self._cluster_counts[i] == 0:
+                continue
+
+            best_j  = -1
+            best_d2 = eps2   # only keep pairs strictly below eps2
+
+            for j in range(i + 1, self.nlist):
+                if merged[j] or self._cluster_counts[j] == 0:
+                    continue
+                d2 = float(np.sum((self.centroids[i] - self.centroids[j]) ** 2))
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_j  = j
+
+            if best_j < 0:
+                continue
+            j = best_j
+
+            N_i     = int(self._cluster_counts[i])
+            N_j     = int(self._cluster_counts[j])
+            N_total = N_i + N_j
+
+            # Mean quantisation error for each cluster.
+            cg_i = self.cluster_global[i]
+            cg_j = self.cluster_global[j]
+            if self._n_deleted and len(cg_i):
+                live_i = cg_i[~self._deleted_mask[cg_i]]
+            else:
+                live_i = cg_i
+            if self._n_deleted and len(cg_j):
+                live_j = cg_j[~self._deleted_mask[cg_j]]
+            else:
+                live_j = cg_j
+
+            mQE_i = (float(np.mean(
+                np.sum((self.data[live_i] - self.centroids[i]) ** 2, axis=1)))
+                if len(live_i) else 0.0)
+            mQE_j = (float(np.mean(
+                np.sum((self.data[live_j] - self.centroids[j]) ** 2, axis=1)))
+                if len(live_j) else 0.0)
+
+            # The merge increases mean QE by exactly:
+            #   δ = N_i*N_j / N_total² * ||μ_i - μ_j||²
+            # Merge if that increase is small relative to cluster spread.
+            weight   = (N_i * N_j) / (N_total ** 2)
+            delta_qe = weight * best_d2
+            if delta_qe <= (mQE_i + mQE_j) * 0.5:
+                self._py_merge_clusters(i, j)
+                merged[j] = True
+
+    def periodic_merge(self, eps_merge=None):
+        """Trigger a cluster merge pass immediately.
+
+        Checks all centroid pairs within eps_merge; merges those that
+        reduce mean quantisation error (no full model comparison).
+
+        Parameters
+        ----------
+        eps_merge : float or None — centroid L2 distance threshold.
+                    Defaults to self.eps_merge.
+        """
+        if eps_merge is None:
+            eps_merge = self.eps_merge
+        if self._cpp is not None:
+            self._cpp.periodic_merge(float(eps_merge))
+            self._refresh_views()
+            return
+        old_eps        = self.eps_merge
+        self.eps_merge = float(eps_merge)
+        self._py_periodic_merge()
+        self.eps_merge = old_eps
 
     # ── streaming insert / delete / update ────────────────────────────────────
 
@@ -593,7 +791,9 @@ class AMPIAffineFanIndex:
         for c in top_clusters:
             centroid = self.centroids[c]
             centered = x - centroid
-            proj     = (centered @ self.axes.T).astype(np.float32)   # (F,)
+            # Use per-cluster fan axes if they have been computed, else global.
+            axes_c   = self.cluster_axes[c] if self.cluster_axes[c] is not None else self.axes
+            proj     = (centered @ axes_c.T).astype(np.float32)   # (F,)
 
             # Top cone_top_k cones by |normalised projection|.
             cn = float(np.linalg.norm(centered))
@@ -640,6 +840,9 @@ class AMPIAffineFanIndex:
                 displacement = (x - approx_nn) if approx_nn is not None else centered
                 v = displacement.astype(np.float64)
                 if _HAS_EXT:
+                    # C++ update_drift_and_check compares against global axes;
+                    # if it triggers a refresh, _local_refresh will compute
+                    # per-cluster axes from the accumulated Σ_drift.
                     if _cpp_update_drift_and_check(
                             self._sigma_drift[c], self.axes, v,
                             _DRIFT_BETA, self.drift_theta):
@@ -650,6 +853,12 @@ class AMPIAffineFanIndex:
                         + _DRIFT_BETA * np.outer(v, v).ravel()
                     )
                     self._check_drift(c)
+
+        # §Merge: after every merge_interval inserts, scan cluster pairs.
+        if self.merge_interval > 0:
+            self._insert_count += 1
+            if self._insert_count % self.merge_interval == 0:
+                self._py_periodic_merge()
 
         return global_id
 
@@ -790,10 +999,16 @@ class AMPIAffineFanIndex:
 
             centroid   = self.centroids[c]
             q_centered = q - centroid
+            axes_c     = self.cluster_axes[c] if self.cluster_axes[c] is not None else self.axes
             q_proj     = np.ascontiguousarray(
-                (q_centered @ self.axes.T).astype(np.float32))
+                (q_centered @ axes_c.T).astype(np.float32))
 
-            best_cones = self._best_fan_cones(q_centered, fan_probes)
+            q_norm = float(np.linalg.norm(q_centered))
+            if q_norm < 1e-10:
+                best_cones = np.arange(min(fan_probes, self.F), dtype=np.int32)
+            else:
+                best_cones = np.argsort(-np.abs(q_centered @ axes_c.T) / q_norm)[:fan_probes]
+
             for f in best_cones:
                 f = int(f)
                 if f >= len(self.cluster_cones[c]) or self.cluster_cones[c][f] is None:
@@ -852,10 +1067,16 @@ class AMPIAffineFanIndex:
                 continue
             centroid   = self.centroids[c]
             q_centered = q - centroid
+            axes_c     = self.cluster_axes[c] if self.cluster_axes[c] is not None else self.axes
             q_proj     = np.ascontiguousarray(
-                (q_centered @ self.axes.T).astype(np.float32)
+                (q_centered @ axes_c.T).astype(np.float32)
             )
-            for f in map(int, self._best_fan_cones(q_centered, fan_probes)):
+            q_norm = float(np.linalg.norm(q_centered))
+            if q_norm < 1e-10:
+                top_fs = range(min(fan_probes, self.F))
+            else:
+                top_fs = np.argsort(-np.abs(q_centered @ axes_c.T) / q_norm)[:fan_probes]
+            for f in map(int, top_fs):
                 if f < len(self.cluster_cones[c]) and self.cluster_cones[c][f] is not None:
                     cone_ctxs.append((self.cluster_cones[c][f], q_proj))
 
