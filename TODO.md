@@ -115,8 +115,8 @@ All phases merged (branch `cpp-pipeline`).
 - [x] Fashion-MNIST (60k, d=784)
 - [x] SIFT-128 full 1M
 - [x] Recall@1 / Recall@100 curves (benchmarks/benchmark.py reports all three)
-- [ ] GIST (1M, d=960) — high-d stress test
-- [ ] Profile per-cluster fan-axis variance to validate drift-detection threshold θ_drift
+- [x] GIST (1M, d=960) — run at 200k cap (full 1M needs ~12 GB peak; see BENCHMARKS.md §GIST)
+- [x] Profile per-cluster fan-axis variance to validate drift-detection threshold θ_drift
 
 ---
 

@@ -284,6 +284,34 @@ multi-process cluster.
 
 ---
 
+## Memory Budget for Large Datasets
+
+GIST benchmarking (1M × d=960) revealed that the current in-memory architecture
+requires roughly **3 full float32 copies** of the dataset at peak:
+
+| Copy | Who holds it | Size at 1M × d=960 |
+|------|-------------|-------------------|
+| `self.data` / `_data_buf` | `AMPIAffineFanIndex` | 3.84 GB |
+| GT computation buffer | `_brute_knn` (chunked BLAS pass) | ~3.84 GB peak |
+| FAISS IVFFlat (benchmarks only) | `faiss.IndexIVFFlat` | 3.84 GB |
+
+For production serving (no FAISS, no GT), peak is ~2 copies (~8 GB at 1M × d=960).
+The sharded Phase-3 architecture naturally solves this: each shard holds only its
+assigned clusters.  With S shards, per-shard memory is ~2n/S × d × 4 bytes.
+
+**Near-term mitigations before Phase 3:**
+- `load_hdf5(n_train=N)` cap (already in benchmark scripts for GIST).
+- Lazy vector loading: store only centroids + cone indices in RAM; fetch raw
+  vectors from mmap'd file on demand for reranking.  This trades I/O for memory,
+  acceptable for read-heavy workloads.
+- `float16` quantisation of the raw data buffer (halves the data footprint; small
+  recall degradation at d >> 128, needs measurement).
+
+These are tracked in Phase 2 (persistence) as natural prerequisites for the mmap
+checkpoint layout described in §2.2.
+
+---
+
 ## Key Constants (starting defaults, tune per dataset)
 
 | Parameter | Default | Note |

@@ -153,6 +153,7 @@ HNSW is faster in raw QPS — but only on a freshly built, static index.
 | Fashion-MNIST 60k | 1.000 | 6,125 | 1.000 | **3,055** (2× fewer) |
 | SIFT 1M | 0.992 | 50,000 | 0.990 | **39,703** (20% fewer) |
 | GloVe 1.18M | 0.879 | 54,400 | **0.897** | 59,929 (wins on recall) |
+| GIST 200k d=960 | 0.982 | 22,350 | 0.964 | **16,760** (25% fewer) |
 
 ### The rebuild problem
 
@@ -189,6 +190,7 @@ python benchmarks/benchmark_vs_faiss.py all --force  # re-download data
 | `fashion` | Fashion-MNIST, n=60k, d=784, Euclidean | ~55 MB |
 | `sift` | SIFT descriptors, n=1M, d=128, Euclidean | ~350 MB |
 | `glove` | GloVe Twitter, n=1.18M, d=100, cosine | ~500 MB |
+| `gist` | GIST, n=1M, d=960, Euclidean (high-d stress test; benchmarked at 200k) | ~3.6 GB |
 
 To download manually or inspect which files are present:
 
@@ -253,8 +255,9 @@ ampi/
 │   ├── benchmark_vs_faiss.py  # recall@1/10/100 vs FAISS (Flat L2 + IVF)
 │   ├── benchmark_vs_hnsw.py   # recall@1/10/100 vs hnswlib
 │   ├── _bench_common.py       # shared dataset loaders, evaluation, AMPI builder
-│   ├── download_data.py       # dataset downloader (auto-called by benchmarks)
-│   └── _bench_sgemm.py        # project_data microbenchmark (scalar loop vs SGEMM)
+│   ├── download_data.py            # dataset downloader (auto-called by benchmarks)
+│   ├── profile_drift_threshold.py  # per-cluster fan-axis variance profiler
+│   └── _bench_sgemm.py             # project_data microbenchmark (scalar loop vs SGEMM)
 ├── tests/
 │   ├── smoke_test.py     # fast unit test, no datasets needed
 │   └── stress_test.py    # adversarial add/delete/update/churn scenarios

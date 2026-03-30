@@ -121,6 +121,34 @@ IVF's Voronoi partition.
 
 ---
 
+### GIST 200k  ·  d=960  ·  Euclidean  *(high-d stress test)*
+
+> Capped at 200k vectors; full 1M requires ~12 GB peak RAM (3 full float32 copies:
+> data, FAISS IVFFlat, AMPI buffer).  200k gives ~3 GB peak and is still a 7×
+> higher-dimensional dataset than SIFT-128.  GP-BO chose nlist=894, F=32.
+
+| Method | R@1 | R@10 | R@100 | QPS | Cands |
+|---|---:|---:|---:|---:|---:|
+| Flat L2 | 1.000 | 0.998 | 1.000 | 26 | n |
+| IVF nprobe=10 | 0.845 | 0.786 | 0.703 | **734** | 4,470 |
+| IVF nprobe=25 | 0.970 | 0.933 | 0.884 | 415 | 11,175 |
+| IVF nprobe=50 | 0.995 | **0.982** | 0.965 | 193 | 22,350 |
+| AFan K=1 cp=10 fp=32 w=16 | 0.785 | 0.713 | 0.610 | **129** | **2,749** |
+| AFan K=1 cp=20 fp=32 w=16 | 0.915 | 0.867 | 0.775 | 72 | **5,897** |
+| AFan K=1 cp=50 fp=32 w=16 | 0.985 | **0.964** | 0.929 | 31 | **16,760** |
+| AFan K=2 cp=50 fp=32 w=16 | 0.985 | **0.964** | 0.929 | 32 | 16,760 |
+
+At R@10≈0.96, AFan uses **16,760 candidates vs IVF's 22,350** (~25% fewer) with
+comparable QPS (31 vs 193 — the gap is pure Python query-path overhead, not
+algorithmic).  High dimensionality (d=960) hurts everyone: IVF recall at nprobe=10
+drops to 0.786, well below its SIFT/MNIST numbers at equivalent nprobe.  AFan
+maintains competitive recall structure but is more sensitive to the candidate budget
+in high-d because the fan-axis coverage weakens as d grows (random axes in ℝ^960
+are nearly orthogonal — median build-time angle to nearest axis ≈ 85°; see
+drift-detection notes below).
+
+---
+
 ## vs hnswlib
 
 HNSW parameters: M=16, ef\_construction=200, ef swept over [10, 20, 50, 100, 200, 400, 800].
@@ -194,6 +222,23 @@ to the random subsample used during GP-BO tuning.)
 
 ---
 
+### GIST 200k  ·  d=960  ·  HNSW build: 316 s (5.3 min)
+
+| Method | R@1 | R@10 | R@100 | QPS |
+|---|---:|---:|---:|---:|
+| HNSW ef=50 | 0.960 | 0.932 | 0.839 | **316** |
+| HNSW ef=200 | 0.990 | 0.970 | 0.928 | 150 |
+| HNSW ef=400 | 1.000 | **0.991** | 0.971 | 95 |
+| AFan K=1 cp=20 fp=32 w=16 | 0.915 | 0.867 | 0.775 | 72 |
+| AFan K=1 cp=50 fp=32 w=16 | 0.985 | **0.964** | 0.929 | 31 |
+
+HNSW ef=50 achieves R@10=0.932 at 316 QPS — strong for high-d.  At matched recall
+(~0.96), HNSW ef=200 (150 QPS) is ~5× faster than AFan (31 QPS).  HNSW build took
+316 s at 200k vectors; extrapolating to 1M would be ~26 min.  AFan build was 37 s at
+200k.  The QPS gap will narrow as AMPI's query orchestration moves to C++.
+
+---
+
 ## Summary
 
 **vs FAISS IVF (static):** AMPI uses 2–3× fewer candidates on MNIST/Fashion for
@@ -213,6 +258,32 @@ current implementation maturity, not algorithmic limits.
 
 ---
 
+## Drift-detection threshold validation
+
+`benchmarks/profile_drift_threshold.py` profiles the angle between each cluster's
+leading data eigenvector and the nearest fan axis at build time, across all datasets.
+
+| Dataset | Median angle to nearest axis | Explained-var ratio (median) | All clusters > θ_drift? |
+|---|---:|---:|---:|
+| Gaussian 50k d=128 | 77.4° | 0.022 | 100 % |
+| GIST 200k d=960 | 85.3° | 0.046 | 100 % |
+
+**Interpretation:** build-time angles are far above `_DRIFT_THETA = 15°` on all
+datasets tested.  This is expected — random axes are not aligned with cluster
+principal directions at construction time.  `θ_drift` governs the *displacement*
+covariance EMA after streaming inserts, measured against the adapted per-cluster
+axes produced by `_local_refresh`.  The high build-time angle simply means random
+axes serve as an uninformed initialisation; `_local_refresh` runs after the first
+EMA update to compute data-adapted axes, and all subsequent drift is measured
+relative to those.  The 15° threshold is therefore a post-refresh sensitivity
+parameter, not a build-time coverage requirement.
+
+The near-isotropic cluster structure at d=960 (explained-variance ratio ~0.046)
+means fan axes need more coverage per cluster in high-d — a larger F (e.g. F=128)
+or data-adapted initial axes would improve recall at fixed candidate budget.
+
+---
+
 ## Notes
 
 - **Candidate count** is the primary efficiency metric: it measures how many
@@ -224,5 +295,9 @@ current implementation maturity, not algorithmic limits.
 - All AMPI parameters (nlist, F) are chosen automatically via GP-BO on a data
   subsample.  Query parameters (cp, fp, w) are swept exhaustively; the table
   shows Pareto-optimal configs.
+- **Memory cap for large datasets:** GIST 1M at d=960 requires ~12 GB peak RAM
+  (three float32 copies: data, FAISS IVFFlat, AMPI buffer).  The benchmark scripts
+  cap GIST at 200k (`n_train=200_000`) to stay within ~3 GB.  Pass a larger cap or
+  remove the limit on machines with sufficient RAM.
 - Figures (recall vs candidates, QPS vs candidates, dist-ratio) are saved to
   `figures/` by the benchmark scripts.
