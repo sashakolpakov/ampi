@@ -513,7 +513,7 @@ public:
         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> del_mask_np,
         int n_init,
         py::list  cluster_global_list,  // [nlist] of int32 numpy arrays
-        std::string data_path = "")     // when non-empty: mmap data to {data_path}/_cpp_data_buf.dat
+        const std::string& data_path = "")     // when non-empty: mmap data to {data_path}/_cpp_data_buf.dat
     {
         AMPIIndex idx;
         idx.d             = d;
@@ -630,7 +630,7 @@ public:
         py::array_t<float,   py::array::c_style | py::array::forcecast> centroids_np,
         py::array_t<int64_t, py::array::c_style | py::array::forcecast> cluster_counts_np,
         uint32_t n_total,
-        std::string data_path,
+        const std::string& data_path,
         py::list  cluster_global_list,
         py::list  cones_list
     )
