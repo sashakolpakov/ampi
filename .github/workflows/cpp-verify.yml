@@ -63,8 +63,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install openai SDK
-        run: pip install openai
+      - name: Install anthropic SDK
+        run: pip install anthropic
 
       - name: Extract C++ diff
         id: diff
@@ -83,7 +83,7 @@ jobs:
       - name: Run LLM verification (read-only)
         if: steps.diff.outputs.lines != '0'
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           python verify/scripts/llm_verify.py \
             --diff /tmp/cpp_changes.diff \

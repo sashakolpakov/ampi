@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-LLM C++ verification script — two-pass review.
-
-Pass 1: Generate a list of potential issues from the diff.
-Pass 2: Filter out false positives given the full diff context.
+LLM C++ verification script — single-pass review via Claude Haiku.
 
 Usage:
     python verify/scripts/llm_verify.py --diff /tmp/cpp_changes.diff --out /tmp/llm_report.md
@@ -12,55 +9,32 @@ Usage:
 import argparse
 import os
 import sys
-from openai import OpenAI
+import anthropic
 
-PASS1_SYSTEM = """\
+SYSTEM = """\
 You are a senior C++ code reviewer specialising in high-performance numerical
-code, pybind11 extensions, and concurrent data structures.
+code, pybind11 extensions, mmap, and concurrent data structures.
 
-Read the unified diff below and produce a numbered list of potential issues.
-For each issue include:
-- Severity: CRITICAL / WARNING / NOTE
-- Location: file:line if determinable
-- Description: one or two sentences
+You will be given a unified diff. Your job is to find genuine bugs or safety
+issues introduced by this change.
 
-Cast a wide net — include anything suspicious even if you are not certain.
-Do not filter yet. Output plain text, no preamble.
+STRICT SCOPE RULES — violations of these rules make the review useless:
+1. Only flag code on lines beginning with '+' (newly added lines).
+   Lines beginning with ' ' (context) or '-' (removed) are NOT your concern.
+2. Do not flag issues that are already fixed elsewhere in the same diff.
+3. Do not flag style, naming, or speculative concerns.
+4. Do not flag pre-existing code that is merely visible as context.
+
+For each real issue found, output exactly:
+- Severity: CRITICAL | WARNING
+- Location: file:line (the '+' line number in the new file)
+- Description: one or two sentences stating the concrete problem.
+
+If there are no genuine issues, output exactly: No issues found.
+No preamble. No commentary. Plain Markdown.
 """
 
-PASS2_SYSTEM = """\
-You are a senior C++ code reviewer. You have been given:
-1. A unified diff of C++ changes.
-2. A candidate issue list produced by a first-pass reviewer.
-
-Your job is to remove false positives from the issue list.
-For each candidate issue decide: KEEP or REMOVE.
-Remove an issue if:
-- It is about code on context lines (lines starting with ' ') or removed lines
-  (starting with '-') — only lines starting with '+' are newly introduced code.
-- It is a style preference with no correctness impact.
-- The concern is already handled correctly in the diff.
-- It is speculative with no concrete evidence in the diff.
-
-Output only the kept issues, renumbered from 1, in the same format.
-If nothing remains, write "No issues found."
-Output plain Markdown suitable for a GitHub PR comment.
-"""
-
-MAX_DIFF_CHARS = 24_000
-
-
-def call(client, system, user, max_tokens=1024):
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-        temperature=0.2,
-        max_tokens=max_tokens,
-    )
-    return response.choices[0].message.content.strip()
+MAX_DIFF_CHARS = 32_000
 
 
 def main():
@@ -77,38 +51,25 @@ def main():
     if len(diff_text) > MAX_DIFF_CHARS:
         diff_text = diff_text[:MAX_DIFF_CHARS] + "\n\n[diff truncated]"
 
-    api_key = os.environ.get("GROQ_API_KEY")
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        print("ERROR: GROQ_API_KEY not set", file=sys.stderr)
+        print("ERROR: ANTHROPIC_API_KEY not set", file=sys.stderr)
         sys.exit(1)
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.groq.com/openai/v1",
-    )
+    client = anthropic.Anthropic(api_key=api_key)
 
-    # Pass 1 — generate candidate issues
-    raw_issues = call(
-        client,
-        PASS1_SYSTEM,
-        f"```diff\n{diff_text}\n```",
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
         max_tokens=1024,
+        system=SYSTEM,
+        messages=[
+            {"role": "user", "content": f"```diff\n{diff_text}\n```"},
+        ],
     )
 
-    # Pass 2 — remove false positives
-    pass2_user = (
-        f"## Diff\n\n```diff\n{diff_text}\n```\n\n"
-        f"## Candidate issues\n\n{raw_issues}"
-    )
-    final_report = call(
-        client,
-        PASS2_SYSTEM,
-        pass2_user,
-        max_tokens=1024,
-    )
-
-    open(args.out, "w").write(final_report + "\n")
-    print(final_report)
+    report = message.content[0].text.strip()
+    open(args.out, "w").write(report + "\n")
+    print(report)
 
 
 if __name__ == "__main__":
