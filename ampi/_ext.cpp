@@ -1391,10 +1391,15 @@ private:
         _mmap_path = path;
         _mmap_fd   = ::open(path.c_str(), O_CREAT | O_RDWR, 0600);
         if (_mmap_fd < 0) throw std::runtime_error("mmap open failed: " + path);
-        if (::ftruncate(_mmap_fd, (off_t)sz) < 0)
+        if (::ftruncate(_mmap_fd, (off_t)sz) < 0) {
+            ::close(_mmap_fd); _mmap_fd = -1;
             throw std::runtime_error("ftruncate failed: " + path);
+        }
         _mmap_addr = ::mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, _mmap_fd, 0);
-        if (_mmap_addr == MAP_FAILED) throw std::runtime_error("mmap failed: " + path);
+        if (_mmap_addr == MAP_FAILED) {
+            ::close(_mmap_fd); _mmap_fd = -1;
+            throw std::runtime_error("mmap failed: " + path);
+        }
         _mmap_size = sz;
         _data_ptr  = static_cast<float*>(_mmap_addr);
     }
@@ -1402,6 +1407,8 @@ private:
     // Grow the mmap file to new_sz bytes (macOS-compatible: unmap then remap).
     void _mmap_grow(size_t new_sz) {
         ::munmap(_mmap_addr, _mmap_size);
+        _mmap_addr = MAP_FAILED;  // mark invalid before any failure point
+        _data_ptr  = nullptr;
         if (::ftruncate(_mmap_fd, (off_t)new_sz) < 0)
             throw std::runtime_error("ftruncate grow failed");
         _mmap_addr = ::mmap(nullptr, new_sz, PROT_READ | PROT_WRITE, MAP_SHARED, _mmap_fd, 0);
