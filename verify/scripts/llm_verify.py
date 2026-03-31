@@ -24,6 +24,10 @@ STRICT SCOPE RULES — violations of these rules make the review useless:
 2. Do not flag issues that are already fixed elsewhere in the same diff.
 3. Do not flag style, naming, or speculative concerns.
 4. Do not flag pre-existing code that is merely visible as context.
+5. Before claiming a data race, verify that the access is not protected by the
+   same lock on both sides (shared_mutex shared/exclusive pairing counts).
+   If a write happens under exclusive lock and the read under shared lock,
+   there is no race — do not flag it.
 
 For each real issue found, output exactly:
 - Severity: CRITICAL | WARNING
