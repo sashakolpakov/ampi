@@ -64,7 +64,7 @@ def make_gaussian(n=10_000, d=128, seed=42):
     return data, qs, _sort_gt(data, qs, gt).astype(np.int32)
 
 
-def load_hdf5(path, n_train=None, normalize=False):
+def load_hdf5(path, n_train=None, normalize=False, mmap_dir=None):
     """Load an ANN-benchmark HDF5 file and return (data, queries, gt).
 
     Parameters
@@ -72,21 +72,51 @@ def load_hdf5(path, n_train=None, normalize=False):
     path      : path to .hdf5 file with 'train' and 'test' datasets
     n_train   : optional cap on training vectors (None = use all)
     normalize : if True, L2-normalise both data and queries (for cosine benchmarks)
+    mmap_dir  : when set, stream training vectors into a flat file here and return
+                a np.memmap instead of a heap array — keeps RSS low for large datasets
 
     Returns
     -------
-    data    : (n, d) float32
+    data    : (n, d) float32  (np.memmap when mmap_dir is set)
     queries : (N_QUERIES, d) float32
     gt      : (N_QUERIES, K_MAX) int32 — exact k-NN indices sorted by ascending distance
+
+    When the HDF5 file contains a pre-computed 'neighbors' dataset (ANN-benchmarks
+    standard), it is used directly instead of running brute-force kNN.  This avoids
+    the ~4 GB peak allocation for large datasets like GIST 1M.
     """
+    import os
     with h5py.File(path) as f:
-        data    = f["train"][:n_train].astype(np.float32)
+        n_total = f["train"].shape[0]
+        d       = f["train"].shape[1]
+        n       = n_total if n_train is None else min(n_train, n_total)
         queries = f["test"][:N_QUERIES].astype(np.float32)
+        if "neighbors" in f and n_train is None:
+            gt = f["neighbors"][:N_QUERIES, :K_MAX].astype(np.int32)
+            precomputed_gt = True
+        else:
+            precomputed_gt = False
+
+        if mmap_dir is not None:
+            # Stream HDF5 → flat file in chunks; return memmap so the OS pages on demand.
+            os.makedirs(mmap_dir, exist_ok=True)
+            fpath = os.path.join(mmap_dir, "_train_data.dat")
+            data  = np.memmap(fpath, mode="w+", dtype="float32", shape=(n, d))
+            chunk = 50_000
+            for start in range(0, n, chunk):
+                end = min(start + chunk, n)
+                data[start:end] = f["train"][start:end].astype(np.float32)
+            data.flush()
+        else:
+            data = f["train"][:n].astype(np.float32)
+
     if normalize:
         data    = data    / (np.linalg.norm(data,    axis=1, keepdims=True) + 1e-10)
         queries = queries / (np.linalg.norm(queries, axis=1, keepdims=True) + 1e-10)
-    gt = _brute_knn(data, queries, K_MAX)
-    return data, queries, _sort_gt(data, queries, gt).astype(np.int32)
+    if not precomputed_gt:
+        gt = _brute_knn(data, queries, K_MAX)
+        gt = _sort_gt(data, queries, gt).astype(np.int32)
+    return data, queries, gt
 
 
 # ── evaluation ────────────────────────────────────────────────────────────────
@@ -344,7 +374,7 @@ def save_figures(all_results, family_style=None, suffix=""):
 
 # ── AMPI index builder ────────────────────────────────────────────────────────
 
-def build_ampi_configs(data, queries, gt, metric='l2'):
+def build_ampi_configs(data, queries, gt, metric='l2', data_path=None):
     """Tune and build AMPI indexes; return a list of (label, query_fn, cands_fn).
 
     Handles Binary index, GP-BO alpha tuning, AffineFan index construction,
@@ -416,12 +446,39 @@ def build_ampi_configs(data, queries, gt, metric='l2'):
     best_F     = max(viable_Fs) if viable_Fs else 16
     print(f"    Best: nlist={best_nlist} (alpha={best_alpha:.3f}), F={best_F}")
 
+    # Use streaming build for large datasets (avoids random mmap page faults).
+    _STREAMING_THRESHOLD = 200_000
+    _use_streaming = (data_path is not None and n > _STREAMING_THRESHOLD)
+
+    def _build_streaming(label, ktk):
+        import os
+        from ampi.streaming import streaming_build
+        s_path = os.path.join(data_path, f"_ampi_K{ktk}")
+        os.makedirs(s_path, exist_ok=True)
+        print(f"  Building {label} (streaming)…", end=" ", flush=True)
+        t0  = time.perf_counter()
+        idx = streaming_build(
+            data_source=lambda s, e: data[s:e],
+            n=n, d=d, nlist=best_nlist, num_fans=best_F,
+            cone_top_k=ktk, seed=0, metric=metric,
+            data_path=s_path,
+        )
+        print(f"{time.perf_counter() - t0:.2f}s")
+        return idx
+
     af_indexes = {}
     for ktk in [1, 2]:
         tag = f"AFan F={best_F} K={ktk}"
-        af_indexes[ktk] = _build(tag, AMPIAffineFanIndex,
-                                 nlist=best_nlist, num_fans=best_F,
-                                 seed=0, cone_top_k=ktk, metric=metric)
+        if _use_streaming:
+            af_indexes[ktk] = _build_streaming(tag, ktk)
+        else:
+            kw  = dict(nlist=best_nlist, num_fans=best_F,
+                       seed=0, cone_top_k=ktk, metric=metric)
+            if data_path is not None:
+                import os
+                kw["data_path"] = os.path.join(data_path, f"_ampi_K{ktk}")
+                os.makedirs(kw["data_path"], exist_ok=True)
+            af_indexes[ktk] = _build(tag, AMPIAffineFanIndex, **kw)
 
     print("  Warming up AMPI indexes...", flush=True)
     for w in [wb, 2 * wb, 4 * wb]:

@@ -739,6 +739,66 @@ def concurrent_rw_no_crash():
 
 
 @_register
+def mmap_cpp_data_path():
+    """C++ mmap mode: data_path= creates a mmap file; queries and adds work correctly."""
+    import os, tempfile
+    rng = np.random.default_rng(77)
+    n, d = 2000, 32
+    data = rng.standard_normal((n, d)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = AMPIAffineFanIndex(data, nlist=10, num_fans=8, seed=0, data_path=tmp)
+        if idx._cpp is not None:
+            cpp_file = os.path.join(tmp, "_cpp_data_buf.dat")
+            assert os.path.exists(cpp_file), "C++ mmap file not created"
+        # Queries must be correct.
+        q = rng.standard_normal(d).astype(np.float32)
+        _, _, ids = idx.query(q, k=10, window_size=200, probes=idx.nlist, fan_probes=idx.F)
+        assert len(ids) == 10, f"mmap query returned {len(ids)} results"
+        # Streaming adds (may trigger mmap remap).
+        for _ in range(100):
+            idx.add(rng.standard_normal(d).astype(np.float32))
+        assert idx.n == n + 100, f"n wrong after adds: {idx.n}"
+        # Deleted points must not appear (use a spike far from the bulk so it's
+        # the exact NN at k=1).
+        spike = np.zeros(d, dtype=np.float32)
+        spike[0] = 1e4
+        gid = idx.add(spike)
+        _, _, before = idx.query(spike, k=1, window_size=200,
+                                 probes=idx.nlist, fan_probes=idx.F)
+        assert gid in before.tolist(), "mmap: inserted spike not found as NN"
+        idx.delete(gid)
+        _, _, after = idx.query(spike, k=5, window_size=200,
+                                probes=idx.nlist, fan_probes=idx.F)
+        assert gid not in after.tolist(), "mmap: deleted spike leaked"
+
+
+@_register
+def mmap_serialization_getters():
+    """get_U_drift and get_axis_pairs return correct shapes after mutations."""
+    import tempfile
+    rng = np.random.default_rng(88)
+    data = rng.standard_normal((1000, 32)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = AMPIAffineFanIndex(data, nlist=8, num_fans=4, seed=0, data_path=tmp)
+        if idx._cpp is None:
+            return
+        cpp = idx._cpp
+        for _ in range(50):
+            idx.add(rng.standard_normal(32).astype(np.float32))
+        for c in range(cpp.nlist):
+            U = cpp.get_U_drift(c)
+            assert U.shape == (cpp.d, cpp.F), \
+                f"get_U_drift({c}) shape {U.shape} != ({cpp.d}, {cpp.F})"
+            assert U.dtype == np.float32, f"get_U_drift dtype {U.dtype}"
+            if cpp.has_cones(c):
+                for f in range(cpp.F):
+                    projs, ids = cpp.get_cone(c, f).get_axis_pairs(0)
+                    assert projs.dtype == np.float32, "get_axis_pairs projs dtype"
+                    assert ids.dtype == np.uint32, "get_axis_pairs ids dtype"
+                    assert projs.shape == ids.shape, "get_axis_pairs shape mismatch"
+
+
+@_register
 def batch_correctness_after_mutations():
     """batch_add then batch_delete: deleted IDs must never appear in queries."""
     idx, _, rng = _small_index(n=2000, d=32, nlist=8, F=8)
@@ -758,6 +818,130 @@ def batch_correctness_after_mutations():
                                 probes=idx.nlist, fan_probes=idx.F)
         leaked = deleted_set & set(found.tolist())
         assert not leaked, f"batch-deleted ids {leaked} appeared in query"
+
+
+# ── streaming_build ───────────────────────────────────────────────────────────
+
+@_register
+def streaming_build_basic_recall():
+    """streaming_build recall@10 >= 0.75 on 3000-point data."""
+    import tempfile, os
+    from ampi.streaming import streaming_build
+
+    rng  = np.random.default_rng(200)
+    n, d = 3000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = streaming_build(
+            lambda s, e: data[s:e],
+            n=n, d=d, nlist=20, num_fans=8,
+            cone_top_k=1, seed=0,
+            data_path=os.path.join(tmp, 'idx'),
+        )
+        assert idx.n == n,  f"streaming n={idx.n} != {n}"
+        assert idx._cpp is not None, "streaming_build returned no C++ index"
+
+        qs    = rng.standard_normal((50, d)).astype('float32')
+        gt    = _brute_knn(data, qs, k=10)
+        found = [idx.query(q, k=10, window_size=200,
+                            probes=idx.nlist, fan_probes=idx.F)[2] for q in qs]
+        rec   = _recall(gt, found, k=10)
+        assert rec >= 0.75, f"streaming recall@10 = {rec:.3f} < 0.75"
+
+
+@_register
+def streaming_build_add_delete():
+    """After streaming_build: add spike → found as NN; delete → gone."""
+    import tempfile, os
+    from ampi.streaming import streaming_build
+
+    rng  = np.random.default_rng(201)
+    n, d = 2000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        idx   = streaming_build(lambda s, e: data[s:e], n=n, d=d,
+                                 nlist=16, num_fans=8, seed=0,
+                                 data_path=os.path.join(tmp, 'idx'))
+        spike = np.zeros(d, dtype='float32')
+        spike[0] = 1e4
+        gid   = idx.add(spike)
+
+        _, _, before = idx.query(spike, k=1, window_size=200,
+                                  probes=idx.nlist, fan_probes=idx.F)
+        assert gid in before.tolist(), "streaming: spike not found before delete"
+
+        idx.delete(gid)
+        _, _, after = idx.query(spike, k=5, window_size=200,
+                                 probes=idx.nlist, fan_probes=idx.F)
+        assert gid not in after.tolist(), "streaming: deleted spike leaked"
+
+
+@_register
+def streaming_build_cosine():
+    """streaming_build with cosine metric: distances in [0,1]; spike findable and deletable."""
+    import tempfile, os
+    from ampi.streaming import streaming_build
+
+    rng  = np.random.default_rng(202)
+    n, d = 2000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = streaming_build(lambda s, e: data[s:e], n=n, d=d,
+                               nlist=16, num_fans=8, metric='cosine', seed=0,
+                               data_path=os.path.join(tmp, 'idx'))
+        assert idx.metric == 'cosine'
+        if idx._cpp is not None:
+            assert idx._cpp.cosine_metric is True, "cosine_metric not set in C++ layer"
+
+        spike = np.zeros(d, dtype='float32')
+        spike[0] = 1.0   # unit vector
+        gid = idx.add(spike)
+
+        _, dists, before = idx.query(spike, k=5, window_size=200,
+                                      probes=idx.nlist, fan_probes=idx.F)
+        assert gid in before.tolist(), "streaming cosine: spike not found"
+        assert (dists >= -1e-4).all() and (dists <= 1 + 1e-4).all(), \
+            f"streaming cosine: distances out of [0,1]: {dists}"
+
+        idx.delete(gid)
+        _, _, after = idx.query(spike, k=5, window_size=200,
+                                 probes=idx.nlist, fan_probes=idx.F)
+        assert gid not in after.tolist(), "streaming cosine: deleted spike leaked"
+
+
+@_register
+def streaming_build_matches_regular_recall():
+    """Streaming build recall must be within 15pp of regular build on same data+seed."""
+    import tempfile, os
+    from ampi.streaming import streaming_build
+
+    rng  = np.random.default_rng(203)
+    n, d = 3000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+    qs   = rng.standard_normal((50, d)).astype('float32')
+    gt   = _brute_knn(data, qs, k=10)
+
+    def _rec(found_list):
+        return _recall(gt, found_list, k=10)
+
+    idx_reg   = AMPIAffineFanIndex(data, nlist=20, num_fans=8, seed=0)
+    found_reg = [idx_reg.query(q, k=10, window_size=200,
+                                probes=idx_reg.nlist, fan_probes=idx_reg.F)[2] for q in qs]
+    rec_reg   = _rec(found_reg)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        idx_str   = streaming_build(lambda s, e: data[s:e], n=n, d=d,
+                                     nlist=20, num_fans=8, seed=0,
+                                     data_path=os.path.join(tmp, 'idx'))
+        found_str = [idx_str.query(q, k=10, window_size=200,
+                                    probes=idx_str.nlist, fan_probes=idx_str.F)[2] for q in qs]
+        rec_str   = _rec(found_str)
+
+    assert rec_str >= rec_reg - 0.15, \
+        f"streaming recall {rec_str:.3f} too far below regular {rec_reg:.3f} (gap > 15pp)"
 
 
 # ── runner ────────────────────────────────────────────────────────────────────

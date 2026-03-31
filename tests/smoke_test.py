@@ -89,11 +89,25 @@ if _HAS_CPP:
         assert isinstance(gi, np.ndarray), f"cluster_global[{c}] not ndarray"
         hc = cpp.has_cones(c)
         assert isinstance(hc, bool), f"has_cones({c}) not bool"
+        # get_U_drift: (d, F) float32 Oja sketch for each cluster
+        _U = cpp.get_U_drift(c)
+        assert _U.shape == (cpp.d, cpp.F), \
+            f"get_U_drift({c}) wrong shape: {_U.shape}"
+        assert _U.dtype == np.float32, \
+            f"get_U_drift({c}) wrong dtype: {_U.dtype}"
         for f in range(cpp.F):
             cone = cpp.get_cone(c, f)
             # SortedCone methods accessible
             _ = cone.size()
             _ = cone.all_ids()
+            # get_axis_pairs: (projs: float32[n_f], ids: uint32[n_f])
+            _projs, _ids = cone.get_axis_pairs(0)
+            assert _projs.dtype == np.float32, \
+                f"get_axis_pairs projs wrong dtype: {_projs.dtype}"
+            assert _ids.dtype == np.uint32, \
+                f"get_axis_pairs ids wrong dtype: {_ids.dtype}"
+            assert _projs.shape == _ids.shape, \
+                "get_axis_pairs projs/ids shape mismatch"
 
     # ── per-point inverse map ─────────────────────────────────────────────────
     pc = cpp.get_point_cones(0)
@@ -456,3 +470,118 @@ _rec_t = sum(
 assert _rec_t >= 0.50, f"AFanTuner index recall too low: {_rec_t:.3f}"
 
 print("AFanTuner smoke: OK")
+
+
+# ── mmap-backed data buffer ───────────────────────────────────────────────────
+# Verifies both the C++ mmap path (data_path= kwarg, _HAS_EXT=True) and the
+# Python fallback memmap path (_HAS_EXT=False is hard to force, so we verify
+# the file and dtype directly).
+
+import os, tempfile
+
+with tempfile.TemporaryDirectory() as _mmap_dir:
+    _mmap_rng  = np.random.default_rng(99)
+    _mmap_data = _mmap_rng.standard_normal((800, 32)).astype(np.float32)
+    _mmap_idx  = AMPIAffineFanIndex(_mmap_data, nlist=8, num_fans=4,
+                                     seed=0, data_path=_mmap_dir)
+
+    if _HAS_CPP:
+        # C++ extension: mmap file is owned by C++; Python _data_buf is np.empty.
+        _cpp_file = os.path.join(_mmap_dir, "_cpp_data_buf.dat")
+        assert os.path.exists(_cpp_file), "C++ mmap file not created"
+        _expected_bytes = _mmap_idx._cpp.capacity * 32 * 4   # capacity * d * sizeof(float)
+        _actual_bytes   = os.path.getsize(_cpp_file)
+        assert _actual_bytes >= _expected_bytes, \
+            f"C++ mmap file too small: {_actual_bytes} < {_expected_bytes}"
+        assert not isinstance(_mmap_idx._data_buf, np.memmap), \
+            "Python _data_buf should be np.empty when C++ ext is present"
+    else:
+        # Python fallback: _data_buf should be a memmap.
+        _py_file = os.path.join(_mmap_dir, "_data_buf.dat")
+        assert os.path.exists(_py_file), "Python mmap file not created"
+        assert isinstance(_mmap_idx._data_buf, np.memmap), \
+            "Python _data_buf should be np.memmap when data_path is set"
+
+    # Queries must still return correct results regardless of mmap mode.
+    _mmap_q   = _mmap_rng.standard_normal(32).astype(np.float32)
+    _, _, _mmap_ids = _mmap_idx.query(_mmap_q, k=5, window_size=200,
+                                       probes=_mmap_idx.nlist,
+                                       fan_probes=_mmap_idx.F)
+    assert len(_mmap_ids) == 5, f"mmap query returned wrong count: {len(_mmap_ids)}"
+
+    # Streaming adds must work (may trigger C++ _grow_buffers → mmap remap).
+    for _ in range(20):
+        _mmap_idx.add(_mmap_rng.standard_normal(32).astype(np.float32))
+    assert _mmap_idx.n == len(_mmap_data) + 20, \
+        f"n wrong after mmap adds: {_mmap_idx.n}"
+
+print("mmap-backed data buffer: OK")
+
+
+# ── streaming_build correctness ───────────────────────────────────────────────
+# Verifies that streaming_build produces a fully functional index:
+#   - correct metadata (n, d, F, nlist)
+#   - mmap file written at the expected path and size
+#   - spike added post-build is the exact NN
+#   - deleting the spike hides it from subsequent queries
+#   - recall@10 is reasonable vs brute-force GT
+
+import os, tempfile
+from ampi.streaming import streaming_build
+
+if _HAS_CPP:
+    with tempfile.TemporaryDirectory() as _sb_dir:
+        _sb_rng  = np.random.default_rng(55)
+        _sb_n, _sb_d = 2000, 32
+        _sb_data = _sb_rng.standard_normal((_sb_n, _sb_d)).astype(np.float32)
+        _sb_path = os.path.join(_sb_dir, 'stream')
+
+        _sb_idx = streaming_build(
+            lambda s, e: _sb_data[s:e],
+            n=_sb_n, d=_sb_d, nlist=16, num_fans=8,
+            cone_top_k=1, seed=0, metric='l2',
+            data_path=_sb_path,
+        )
+
+        # Structural checks
+        assert _sb_idx.n     == _sb_n,  f"streaming n: {_sb_idx.n} != {_sb_n}"
+        assert _sb_idx.nlist == 16,     f"streaming nlist: {_sb_idx.nlist}"
+        assert _sb_idx.F     == 8,      f"streaming F: {_sb_idx.F}"
+        assert _sb_idx.d     == _sb_d,  f"streaming d: {_sb_idx.d}"
+        assert _sb_idx.metric == 'l2',  f"streaming metric: {_sb_idx.metric}"
+        assert _sb_idx._cpp  is not None, "streaming_build: no C++ index"
+
+        # mmap file must exist and be exactly n * d * 4 bytes
+        _cpp_f = os.path.join(_sb_path, '_cpp_data_buf.dat')
+        assert os.path.exists(_cpp_f), "streaming: _cpp_data_buf.dat missing"
+        assert os.path.getsize(_cpp_f) == _sb_n * _sb_d * 4, \
+            f"streaming: mmap size {os.path.getsize(_cpp_f)} != {_sb_n * _sb_d * 4}"
+
+        # Exact NN: spike added after build is the trivially unique NN
+        _sb_spike = np.zeros(_sb_d, dtype=np.float32)
+        _sb_spike[0] = 1e4
+        _sb_gid = _sb_idx.add(_sb_spike)
+        _, _, _sb_ids = _sb_idx.query(_sb_spike, k=1, window_size=200,
+                                       probes=_sb_idx.nlist, fan_probes=_sb_idx.F)
+        assert _sb_gid in _sb_ids.tolist(), "streaming: spike not found as NN"
+
+        # Delete hides the spike
+        _sb_idx.delete(_sb_gid)
+        _, _, _sb_after = _sb_idx.query(_sb_spike, k=5, window_size=200,
+                                         probes=_sb_idx.nlist, fan_probes=_sb_idx.F)
+        assert _sb_gid not in _sb_after.tolist(), "streaming: deleted spike leaked"
+
+        # Recall@10 vs FAISS brute-force
+        _sb_qs  = _sb_rng.standard_normal((30, _sb_d)).astype(np.float32)
+        _sb_fl  = faiss.IndexFlatL2(_sb_d)
+        _sb_fl.add(_sb_data)
+        _, _sb_gt = _sb_fl.search(_sb_qs, 10)
+        _sb_found = [_sb_idx.query(q, k=10, window_size=200,
+                                    probes=_sb_idx.nlist, fan_probes=_sb_idx.F)[2]
+                     for q in _sb_qs]
+        _sb_rec = recall10(_sb_gt, _sb_found)
+        assert _sb_rec >= 0.70, f"streaming recall@10 = {_sb_rec:.3f} < 0.70"
+
+    print("streaming_build correctness: OK")
+else:
+    print("streaming_build correctness: SKIPPED (C++ ext not built)")

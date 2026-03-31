@@ -26,8 +26,13 @@
 #include <mutex>
 #include <numeric>     // std::iota
 #include <shared_mutex>
+#include <string>
 #include <unordered_set>
 #include <vector>
+
+#include <fcntl.h>    // open, O_CREAT, O_RDWR
+#include <sys/mman.h> // mmap, munmap, MAP_SHARED, PROT_READ, PROT_WRITE
+#include <unistd.h>   // ftruncate, close
 
 namespace py = pybind11;
 
@@ -418,7 +423,13 @@ public:
     double drift_theta;
     bool cosine_metric;
 
-    std::vector<float>   data_buf;   // capacity * d, row-major
+    std::vector<float>   data_buf;   // capacity * d, row-major (owned; empty in mmap mode)
+    float*               _data_ptr = nullptr; // always valid: data_buf.data() or mmap addr
+    // ── mmap backing store (set by from_build when data_path is provided) ────
+    std::string          _mmap_path;
+    int                  _mmap_fd   = -1;
+    void*                _mmap_addr = MAP_FAILED;
+    size_t               _mmap_size = 0;
     std::vector<uint8_t> del_mask;   // capacity (0 = live, 1 = deleted)
     uint32_t n, capacity, n_deleted;
 
@@ -452,6 +463,43 @@ public:
     // cppcheck-suppress uninitMemberVar
     AMPIIndex() = default;
 
+    // Move constructor: transfer mmap ownership so the destructor only runs
+    // on the live object.  Needed because ~AMPIIndex() suppresses the implicit
+    // move constructor (C++11 rule of five).
+    AMPIIndex(AMPIIndex&& o) noexcept
+        : data_buf(std::move(o.data_buf)),
+          _data_ptr(o._data_ptr),
+          _mmap_path(std::move(o._mmap_path)),
+          _mmap_fd(o._mmap_fd),
+          _mmap_addr(o._mmap_addr),
+          _mmap_size(o._mmap_size),
+          del_mask(std::move(o.del_mask)),
+          n(o.n), capacity(o.capacity), n_deleted(o.n_deleted),
+          p_mutex(std::move(o.p_mutex)),
+          d(o.d), F(o.F), nlist(o.nlist), cone_top_k(o.cone_top_k),
+          drift_theta(o.drift_theta), cosine_metric(o.cosine_metric),
+          axes(std::move(o.axes)),
+          centroids(std::move(o.centroids)),
+          cluster_counts(std::move(o.cluster_counts)),
+          cluster_tombstones(std::move(o.cluster_tombstones)),
+          U_drift(std::move(o.U_drift)),
+          cluster_global(std::move(o.cluster_global)),
+          cluster_cones(std::move(o.cluster_cones)),
+          cluster_has_cones(std::move(o.cluster_has_cones)),
+          cluster_axes(std::move(o.cluster_axes)),
+          point_cones(std::move(o.point_cones)),
+          merge_interval(o.merge_interval),
+          eps_merge(o.eps_merge),
+          merge_qe_ratio(o.merge_qe_ratio),
+          insert_count(o.insert_count)
+    {
+        // Prevent double-close/unmap in the moved-from destructor.
+        o._data_ptr  = nullptr;
+        o._mmap_fd   = -1;
+        o._mmap_addr = MAP_FAILED;
+        o._mmap_size = 0;
+    }
+
     // ── construction ─────────────────────────────────────────────────────────
 
     static AMPIIndex from_build(
@@ -464,7 +512,8 @@ public:
         py::array_t<float,   py::array::c_style | py::array::forcecast> data_np,
         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> del_mask_np,
         int n_init,
-        py::list  cluster_global_list)  // [nlist] of int32 numpy arrays
+        py::list  cluster_global_list,  // [nlist] of int32 numpy arrays
+        std::string data_path = "")     // when non-empty: mmap data to {data_path}/_cpp_data_buf.dat
     {
         AMPIIndex idx;
         idx.d             = d;
@@ -494,11 +543,25 @@ public:
                 idx.centroids[c * d + j] = CN(c, j);
 
         // data buffer (full pre-allocated capacity)
-        idx.data_buf.resize((size_t)cap * d);
+        // mmap mode: write to a memory-mapped file so the OS can page out idle
+        // clusters, keeping RSS proportional to the working set rather than n.
+        size_t data_sz = (size_t)cap * d * sizeof(float);
         auto DN = data_np.unchecked<2>();
-        for (int64_t i = 0; i < cap; ++i)
-            for (int j = 0; j < d; ++j)
-                idx.data_buf[i * d + j] = DN(i, j);
+        if (!data_path.empty()) {
+            std::string fpath = data_path + "/_cpp_data_buf.dat";
+            idx._mmap_open(fpath, data_sz);
+            float* mp = idx._data_ptr;
+            for (int64_t i = 0; i < (int64_t)n_init; ++i)
+                for (int j = 0; j < d; ++j)
+                    mp[i * d + j] = DN(i, j);
+            // headroom slots are already zeroed by the OS (mmap of a new file)
+        } else {
+            idx.data_buf.resize((size_t)cap * d);
+            for (int64_t i = 0; i < cap; ++i)
+                for (int j = 0; j < d; ++j)
+                    idx.data_buf[i * d + j] = DN(i, j);
+            idx._data_ptr = idx.data_buf.data();
+        }
 
         // deleted mask
         idx.del_mask.resize((size_t)cap, 0);
@@ -545,6 +608,117 @@ public:
             idx.cluster_cones[c].assign(F, SortedCone(F));
             if (!idx.cluster_global[c].empty())
                 idx._build_cones(c, idx.cluster_global[c]);
+        }
+
+        return idx;
+    }
+
+    // ── from_stream ───────────────────────────────────────────────────────────
+    //
+    // Assemble an AMPIIndex from pre-built streaming components, bypassing
+    // _build_cones (which would cause random access across the full mmap).
+    //
+    // The mmap data file at data_path/_cpp_data_buf.dat must already be written
+    // (by the Python streaming pass) before this factory is called.
+    //
+    // cones_list : [nlist] of list-of-F SortedCone objects (built by dispatcher)
+
+    static AMPIIndex from_stream(
+        int d, int F, int nlist, int cone_top_k,
+        double drift_theta, bool cosine,
+        py::array_t<float,   py::array::c_style | py::array::forcecast> axes_np,
+        py::array_t<float,   py::array::c_style | py::array::forcecast> centroids_np,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> cluster_counts_np,
+        uint32_t n_total,
+        std::string data_path,
+        py::list  cluster_global_list,
+        py::list  cones_list
+    )
+    {
+        if (data_path.empty())
+            throw std::invalid_argument("from_stream: data_path must not be empty");
+
+        AMPIIndex idx;
+        idx.d             = d;
+        idx.F             = F;
+        idx.nlist         = nlist;
+        idx.cone_top_k    = cone_top_k;
+        idx.drift_theta   = drift_theta;
+        idx.cosine_metric = cosine;
+        idx.n             = n_total;
+        idx.capacity      = n_total;
+        idx.n_deleted     = 0;
+
+        // axes
+        auto AX = axes_np.unchecked<2>();
+        idx.axes.resize((size_t)F * d);
+        for (int l = 0; l < F; ++l)
+            for (int j = 0; j < d; ++j)
+                idx.axes[l * d + j] = AX(l, j);
+
+        // centroids
+        auto CN = centroids_np.unchecked<2>();
+        idx.centroids.resize((size_t)nlist * d);
+        for (int c = 0; c < nlist; ++c)
+            for (int j = 0; j < d; ++j)
+                idx.centroids[c * d + j] = CN(c, j);
+
+        // data buffer: open existing mmap file written by Python streaming pass.
+        // _mmap_open uses ftruncate which is a no-op when size matches.
+        std::string fpath = data_path + "/_cpp_data_buf.dat";
+        size_t data_sz = (size_t)n_total * d * sizeof(float);
+        idx._mmap_open(fpath, data_sz);
+
+        // deleted mask: all zeros (fresh build, no deletions)
+        idx.del_mask.resize((size_t)n_total, 0);
+
+        // per-cluster counts
+        auto CC = cluster_counts_np.unchecked<1>();
+        idx.cluster_counts.resize(nlist);
+        for (int c = 0; c < nlist; ++c)
+            idx.cluster_counts[c] = CC(c);
+        idx.cluster_tombstones.assign(nlist, 0);
+
+        // Oja drift sketch: zero-initialised
+        idx.U_drift.resize(nlist);
+        for (int c = 0; c < nlist; ++c)
+            idx.U_drift[c].assign((size_t)d * F, 0.f);
+
+        // cluster_global
+        idx.cluster_global.resize(nlist);
+        for (int c = 0; c < nlist; ++c) {
+            py::object obj = cluster_global_list[c];
+            if (obj.is_none()) continue;
+            auto arr = obj.cast<py::array_t<int32_t>>();
+            auto buf = arr.unchecked<1>();
+            idx.cluster_global[c].reserve((size_t)buf.shape(0));
+            for (int64_t i = 0; i < buf.shape(0); ++i)
+                idx.cluster_global[c].push_back((uint32_t)buf(i));
+        }
+
+        // Pre-built cones: copy from Python SortedCone objects.
+        // Rebuild point_cones from axes[0] (same gid set as any other axis).
+        idx.cluster_cones.resize(nlist);
+        idx.cluster_has_cones.assign(nlist, false);
+        idx.cluster_axes.resize(nlist);   // all empty = use global axes
+        idx.point_cones.resize((size_t)n_total);
+
+        for (int c = 0; c < nlist; ++c) {
+            py::list cone_c = cones_list[c].cast<py::list>();
+            idx.cluster_cones[c].resize(F, SortedCone(F));
+            for (int f = 0; f < F; ++f) {
+                const SortedCone& sc = cone_c[f].cast<const SortedCone&>();
+                idx.cluster_cones[c][f] = sc;   // copy
+                const auto& ax0 = idx.cluster_cones[c][f].axes;
+                if (!ax0.empty() && !ax0[0].empty()) {
+                    idx.cluster_has_cones[c] = true;
+                    for (auto& p : ax0[0]) {
+                        uint32_t gid = (uint32_t)p.second;
+                        if (gid < n_total)
+                            idx.point_cones[gid].push_back({(uint16_t)c, (uint16_t)f});
+                    }
+                }
+            }
         }
 
         return idx;
@@ -625,7 +799,7 @@ public:
         uint32_t global_id = n;
         if (n >= capacity) _grow_buffers();
 
-        std::copy(x, x + d, &data_buf[n * d]);
+        std::copy(x, x + d, _data_ptr + (size_t)n * d);
         del_mask[n] = 0;
         ++n;
 
@@ -722,7 +896,7 @@ public:
                     float best_d2 = std::numeric_limits<float>::max();
                     const float* best_ptr = nullptr;
                     for (uint32_t gid2 : nn_set) {
-                        const float* p2 = &data_buf[gid2 * d];
+                        const float* p2 = _data_ptr + (size_t)gid2 * d;
                         float d2 = 0.f;
                         for (int j = 0; j < d; ++j) { float dj = x[j]-p2[j]; d2 += dj*dj; }
                         if (d2 < best_d2) { best_d2 = d2; best_ptr = p2; }
@@ -798,11 +972,11 @@ public:
     // ── numpy views (call _refresh_views() in Python after any add/remove) ──
 
     py::array_t<float> get_data_view() {
-        py::capsule dummy(data_buf.data(), [](void*){});
+        py::capsule dummy(_data_ptr, [](void*){});
         return py::array_t<float>(
             {(py::ssize_t)n, (py::ssize_t)d},
             {(py::ssize_t)(d * sizeof(float)), (py::ssize_t)sizeof(float)},
-            data_buf.data(), dummy);
+            _data_ptr, dummy);
     }
 
     py::array_t<uint8_t> get_deleted_mask() {
@@ -981,7 +1155,7 @@ public:
             int m = (int)cands.size();
             std::vector<float> dists_tmp(m);
             for (int i = 0; i < m; ++i) {
-                const float* p = &data_buf[cands[i] * d];
+                const float* p = _data_ptr + (size_t)cands[i] * d;
                 float acc = 0.f;
                 for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
                 dists_tmp[i] = acc;
@@ -1015,7 +1189,7 @@ public:
         int m = (int)cands.size();
         std::vector<float> sq_dists(m);
         for (int i = 0; i < m; ++i) {
-            const float* p = &data_buf[cands[i] * d];
+            const float* p = _data_ptr + (size_t)cands[i] * d;
             float acc = 0.f;
             for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
             sq_dists[i] = acc;
@@ -1180,12 +1354,52 @@ public:
         return out;
     }
 
+    ~AMPIIndex() { _mmap_close(); }
+
 private:
+    // ── mmap helpers ─────────────────────────────────────────────────────────
+
+    // Open (or create) a file at path, extend to sz bytes, and MAP_SHARED it.
+    // Sets _mmap_fd, _mmap_addr, _mmap_size, _mmap_path, _data_ptr.
+    void _mmap_open(const std::string& path, size_t sz) {
+        _mmap_path = path;
+        _mmap_fd   = ::open(path.c_str(), O_CREAT | O_RDWR, 0600);
+        if (_mmap_fd < 0) throw std::runtime_error("mmap open failed: " + path);
+        if (::ftruncate(_mmap_fd, (off_t)sz) < 0)
+            throw std::runtime_error("ftruncate failed: " + path);
+        _mmap_addr = ::mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, _mmap_fd, 0);
+        if (_mmap_addr == MAP_FAILED) throw std::runtime_error("mmap failed: " + path);
+        _mmap_size = sz;
+        _data_ptr  = static_cast<float*>(_mmap_addr);
+    }
+
+    // Grow the mmap file to new_sz bytes (macOS-compatible: unmap then remap).
+    void _mmap_grow(size_t new_sz) {
+        ::munmap(_mmap_addr, _mmap_size);
+        if (::ftruncate(_mmap_fd, (off_t)new_sz) < 0)
+            throw std::runtime_error("ftruncate grow failed");
+        _mmap_addr = ::mmap(nullptr, new_sz, PROT_READ | PROT_WRITE, MAP_SHARED, _mmap_fd, 0);
+        if (_mmap_addr == MAP_FAILED) throw std::runtime_error("mmap grow failed");
+        _mmap_size = new_sz;
+        _data_ptr  = static_cast<float*>(_mmap_addr);
+    }
+
+    void _mmap_close() {
+        if (_mmap_addr != MAP_FAILED) { ::munmap(_mmap_addr, _mmap_size); _mmap_addr = MAP_FAILED; }
+        if (_mmap_fd   >= 0)          { ::close(_mmap_fd);                _mmap_fd   = -1; }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     void _grow_buffers() {
         uint32_t new_cap = capacity * 2;
-        data_buf.resize((size_t)new_cap * d, 0.f);
+        if (_mmap_addr != MAP_FAILED) {
+            // mmap mode: extend the file and remap.
+            _mmap_grow((size_t)new_cap * d * sizeof(float));
+        } else {
+            data_buf.resize((size_t)new_cap * d, 0.f);
+            _data_ptr = data_buf.data();
+        }
         del_mask.resize(new_cap, 0);
         point_cones.resize(new_cap);
         capacity = new_cap;
@@ -1253,7 +1467,7 @@ private:
         std::vector<float> x_c((size_t)n_c * d);
         std::vector<float> norms(n_c, 0.f);
         for (int i = 0; i < n_c; ++i) {
-            const float* xi = &data_buf[live_ids[i] * d];
+            const float* xi = _data_ptr + (size_t)live_ids[i] * d;
             float s2 = 0.f;
             for (int j = 0; j < d; ++j) {
                 float cj = xi[j] - cent[j];
@@ -1453,7 +1667,7 @@ private:
             double mQE_i = 0.0;
             for (uint32_t gid : cluster_global[i]) {
                 if (del_mask[gid]) continue;
-                const float* xi = &data_buf[gid * d];
+                const float* xi = _data_ptr + (size_t)gid * d;
                 double d2 = 0.0;
                 for (int k = 0; k < d; ++k) { double df = xi[k]-mu_i[k]; d2 += df*df; }
                 mQE_i += d2;
@@ -1463,7 +1677,7 @@ private:
             double mQE_j = 0.0;
             for (uint32_t gid : cluster_global[j]) {
                 if (del_mask[gid]) continue;
-                const float* xj = &data_buf[gid * d];
+                const float* xj = _data_ptr + (size_t)gid * d;
                 double d2 = 0.0;
                 for (int k = 0; k < d; ++k) { double df = xj[k]-mu_j[k]; d2 += df*df; }
                 mQE_j += d2;
@@ -1677,7 +1891,19 @@ PYBIND11_MODULE(_ampi_ext, m) {
              py::arg("axes_np"), py::arg("centroids_np"),
              py::arg("cluster_counts_np"), py::arg("U_drift_np"),
              py::arg("data_np"), py::arg("del_mask_np"), py::arg("n_init"),
-             py::arg("cluster_global_list"))
+             py::arg("cluster_global_list"),
+             py::arg("data_path") = std::string(""))
+        .def_static("from_stream", &AMPIIndex::from_stream,
+             py::arg("d"), py::arg("F"), py::arg("nlist"), py::arg("cone_top_k"),
+             py::arg("drift_theta"), py::arg("cosine"),
+             py::arg("axes_np"), py::arg("centroids_np"),
+             py::arg("cluster_counts_np"), py::arg("n_total"),
+             py::arg("data_path"),
+             py::arg("cluster_global_list"),
+             py::arg("cones_list"),
+             "Build an AMPIIndex from pre-computed streaming components.\n\n"
+             "Skips _build_cones entirely — no random mmap access.\n"
+             "data_path/_cpp_data_buf.dat must already be written.")
         .def("add",    &AMPIIndex::add,    py::arg("x"),
              py::call_guard<py::gil_scoped_release>(),
              "Insert one (d,) float32 vector.  Returns int global_id.")
