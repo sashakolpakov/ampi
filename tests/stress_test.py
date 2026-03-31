@@ -944,6 +944,66 @@ def streaming_build_matches_regular_recall():
         f"streaming recall {rec_str:.3f} too far below regular {rec_reg:.3f} (gap > 15pp)"
 
 
+# ── bounds checks ────────────────────────────────────────────────────────────
+
+@_register
+def bounds_checks_raise_python_exceptions():
+    """Out-of-range / wrong-dimension arguments must raise Python exceptions, not segfault."""
+    idx, _, _ = _small_index(n=500, d=16, nlist=5, F=8)
+    if idx._cpp is None:
+        return
+
+    cpp   = idx._cpp
+    d_idx = idx.d
+    nl    = idx.nlist
+
+    # add: wrong dimension
+    try:
+        cpp.add(np.zeros(d_idx + 1, dtype='float32'))
+        assert False, "add: expected ValueError"
+    except ValueError:
+        pass
+
+    # batch_add: wrong column count
+    try:
+        cpp.batch_add(np.zeros((2, d_idx + 1), dtype='float32'))
+        assert False, "batch_add: expected ValueError"
+    except ValueError:
+        pass
+
+    # get_U_drift: out of range
+    for bad in (-1, nl):
+        try:
+            cpp.get_U_drift(bad)
+            assert False, f"get_U_drift({bad}): expected IndexError"
+        except IndexError:
+            pass
+
+    # get_cluster_global: out of range
+    for bad in (-1, nl):
+        try:
+            cpp.get_cluster_global(bad)
+            assert False, f"get_cluster_global({bad}): expected IndexError"
+        except IndexError:
+            pass
+
+    # get_cone: out of range
+    for bad_c, bad_f in ((-1, 0), (nl, 0), (0, -1), (0, idx.F)):
+        try:
+            cpp.get_cone(bad_c, bad_f)
+            assert False, f"get_cone({bad_c}, {bad_f}): expected IndexError"
+        except IndexError:
+            pass
+
+    # query: wrong dimension
+    try:
+        cpp.query(np.zeros(d_idx + 1, dtype='float32'),
+                  k=1, window_size=10, probes=1, fan_probes=1)
+        assert False, "query: expected ValueError"
+    except ValueError:
+        pass
+
+
 # ── runner ────────────────────────────────────────────────────────────────────
 
 def main():

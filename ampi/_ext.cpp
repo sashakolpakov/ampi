@@ -395,6 +395,9 @@ public:
     // Includes tombstoned entries — call compact() first if a clean snapshot is needed.
     // Used by the Phase-2 checkpoint serializer.
     py::tuple get_axis_pairs(int l) const {
+        if (l < 0 || l >= (int)axes.size())
+            throw py::index_error("axis index " + std::to_string(l) +
+                                  " out of range [0, " + std::to_string(axes.size()) + ")");
         const auto& ax = axes[l];
         py::ssize_t n_f = (py::ssize_t)ax.size();
         auto projs = py::array_t<float>(n_f);
@@ -739,6 +742,9 @@ public:
     // ── add ──────────────────────────────────────────────────────────────────
 
     uint32_t add(py::array_t<float, py::array::c_style | py::array::forcecast> x_np) {
+        if (x_np.shape(0) != d)
+            throw py::value_error("add: expected vector of length " + std::to_string(d) +
+                                  ", got " + std::to_string(x_np.shape(0)));
         auto X = x_np.unchecked<1>();
         std::vector<float> x(d);
         if (cosine_metric) {
@@ -764,6 +770,9 @@ public:
         py::array_t<float, py::array::c_style | py::array::forcecast> data_np)
     {
         auto D2 = data_np.unchecked<2>();  // GIL held: safe pointer extraction
+        if (D2.shape(1) != d)
+            throw py::value_error("batch_add: expected vectors of length " + std::to_string(d) +
+                                  ", got " + std::to_string(D2.shape(1)));
         int m = (int)D2.shape(0);
 
         // Normalise all rows while GIL is held (pure arithmetic, no lock needed)
@@ -1000,6 +1009,9 @@ public:
     }
 
     py::array_t<int32_t> get_cluster_global(int c) {
+        if (c < 0 || c >= nlist)
+            throw py::index_error("cluster index " + std::to_string(c) +
+                                  " out of range [0, " + std::to_string(nlist) + ")");
         auto& cg = cluster_global[c];
         auto out = py::array_t<int32_t>((py::ssize_t)cg.size());
         auto buf = out.mutable_unchecked<1>();
@@ -1008,7 +1020,12 @@ public:
         return out;
     }
 
-    SortedCone& get_cone(int c, int f) { return cluster_cones[c][f]; }
+    SortedCone& get_cone(int c, int f) {
+        if (c < 0 || c >= nlist || f < 0 || f >= F)
+            throw py::index_error("get_cone: (c=" + std::to_string(c) +
+                                  ", f=" + std::to_string(f) + ") out of range");
+        return cluster_cones[c][f];
+    }
 
     py::array_t<float> get_axes() const {
         py::capsule dummy(const_cast<float*>(axes.data()), [](void*){});
@@ -1052,6 +1069,9 @@ public:
         py::array_t<float, py::array::c_style | py::array::forcecast> q_np,
         int k, int window_size, int probes, int fan_probes)
     {
+        if (q_np.shape(0) != d)
+            throw py::value_error("query: expected vector of length " + std::to_string(d) +
+                                  ", got " + std::to_string(q_np.shape(0)));
         auto Q = q_np.unchecked<1>();
         const float* qptr = &Q(0);
         std::shared_lock<std::shared_mutex> lk(*p_mutex);
@@ -1223,6 +1243,9 @@ public:
         py::array_t<float, py::array::c_style | py::array::forcecast> q_np,
         int window_size, int probes, int fan_probes)
     {
+        if (q_np.shape(0) != d)
+            throw py::value_error("query_candidates: expected vector of length " + std::to_string(d) +
+                                  ", got " + std::to_string(q_np.shape(0)));
         auto Q = q_np.unchecked<1>();
         const float* qptr = &Q(0);
         std::shared_lock<std::shared_mutex> lk(*p_mutex);
@@ -1345,6 +1368,9 @@ public:
     // Return the (d, F) float32 Oja subspace sketch for cluster c.
     // Used by the Phase-2 checkpoint serializer.
     py::array_t<float> get_U_drift(int c) const {
+        if (c < 0 || c >= nlist)
+            throw py::index_error("cluster index " + std::to_string(c) +
+                                  " out of range [0, " + std::to_string(nlist) + ")");
         auto out = py::array_t<float>({(py::ssize_t)d, (py::ssize_t)F});
         auto buf = out.mutable_unchecked<2>();
         const float* U = U_drift[c].data();   // row-major: U[j*F + l]
