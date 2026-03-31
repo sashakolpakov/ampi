@@ -426,8 +426,11 @@ public:
     double drift_theta;
     bool cosine_metric;
 
-    std::vector<float>   data_buf;   // capacity * d, row-major (owned; empty in mmap mode)
-    float*               _data_ptr = nullptr; // always valid: data_buf.data() or mmap addr
+    // Heap-mode data buffer.  Stored behind shared_ptr so that numpy arrays
+    // returned by get_data_view() keep the allocation alive after a grow
+    // creates a new one.  Null in mmap mode.
+    std::shared_ptr<std::vector<float>> _data_buf_sp;
+    float*               _data_ptr = nullptr; // always valid: _data_buf_sp->data() or mmap addr
     // ── mmap backing store (set by from_build when data_path is provided) ────
     std::string          _mmap_path;
     int                  _mmap_fd   = -1;
@@ -470,7 +473,7 @@ public:
     // on the live object.  Needed because ~AMPIIndex() suppresses the implicit
     // move constructor (C++11 rule of five).
     AMPIIndex(AMPIIndex&& o) noexcept
-        : data_buf(std::move(o.data_buf)),
+        : _data_buf_sp(std::move(o._data_buf_sp)),
           _data_ptr(o._data_ptr),
           _mmap_path(std::move(o._mmap_path)),
           _mmap_fd(o._mmap_fd),
@@ -559,11 +562,11 @@ public:
                     mp[i * d + j] = DN(i, j);
             // headroom slots are already zeroed by the OS (mmap of a new file)
         } else {
-            idx.data_buf.resize((size_t)cap * d);
+            idx._data_buf_sp = std::make_shared<std::vector<float>>((size_t)cap * d);
             for (int64_t i = 0; i < cap; ++i)
                 for (int j = 0; j < d; ++j)
-                    idx.data_buf[i * d + j] = DN(i, j);
-            idx._data_ptr = idx.data_buf.data();
+                    (*idx._data_buf_sp)[i * d + j] = DN(i, j);
+            idx._data_ptr = idx._data_buf_sp->data();
         }
 
         // deleted mask
@@ -981,11 +984,22 @@ public:
     // ── numpy views (call _refresh_views() in Python after any add/remove) ──
 
     py::array_t<float> get_data_view() {
-        py::capsule dummy(_data_ptr, [](void*){});
+        py::capsule capsule;
+        if (_data_buf_sp) {
+            // Heap mode: capsule holds a copy of the shared_ptr, keeping the
+            // current allocation alive even after a grow replaces _data_buf_sp.
+            auto* owner = new std::shared_ptr<std::vector<float>>(_data_buf_sp);
+            capsule = py::capsule(owner, [](void* p) {
+                delete static_cast<std::shared_ptr<std::vector<float>>*>(p);
+            });
+        } else {
+            // mmap mode: region stays mapped for the lifetime of the index.
+            capsule = py::capsule(_data_ptr, [](void*){});
+        }
         return py::array_t<float>(
             {(py::ssize_t)n, (py::ssize_t)d},
             {(py::ssize_t)(d * sizeof(float)), (py::ssize_t)sizeof(float)},
-            _data_ptr, dummy);
+            _data_ptr, capsule);
     }
 
     py::array_t<uint8_t> get_deleted_mask() {
@@ -1435,8 +1449,12 @@ private:
             // mmap mode: extend the file and remap.
             _mmap_grow((size_t)new_cap * d * sizeof(float));
         } else {
-            data_buf.resize((size_t)new_cap * d, 0.f);
-            _data_ptr = data_buf.data();
+            // Allocate fresh — do not resize in place, which would invalidate
+            // raw pointers held by any numpy arrays returned by get_data_view().
+            auto new_buf = std::make_shared<std::vector<float>>((size_t)new_cap * d, 0.f);
+            std::copy(_data_ptr, _data_ptr + (size_t)n * d, new_buf->data());
+            _data_buf_sp = std::move(new_buf);
+            _data_ptr = _data_buf_sp->data();
         }
         del_mask.resize(new_cap, 0);
         point_cones.resize(new_cap);
