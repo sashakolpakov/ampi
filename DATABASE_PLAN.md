@@ -118,6 +118,16 @@ current fan axes. If so, schedule a **local fan-axis refresh** for cluster `c`:
 
 Single-node durability before distributing.
 
+**Prerequisites satisfied (branch `phase-2-prereqs`):**
+- `AMPIIndex::get_U_drift(c)` — `(d, F) float32` Oja sketch getter (needed for §2.2 per-cluster serialization).
+- `SortedCone::get_axis_pairs(l)` — `(projs, ids)` pair reader (needed for §2.2 cone serialization).
+- mmap-backed `_data_buf` — see §Memory above.
+- `AMPIIndex::from_stream` C++ factory — assembles from pre-built `SortedCone` objects + existing
+  mmap data file; no `_build_cones` random-access pass needed at build time.
+- `StreamingBuildDispatcher` / `streaming_build()` (`ampi/streaming.py`) — sequential build path:
+  50k-row k-means sample, one streaming pass (72 MB RAM, n-independent), assembles via `from_stream`.
+  Peak RSS ≈ 90 MB for GIST 1M. **Unblocks GIST 1M benchmark on 8 GB RAM.**
+
 ### 2.1  Write-Ahead Log (WAL)
 
 Append-only binary log, one record per mutation:
@@ -300,15 +310,11 @@ The Phase-3 sharded architecture naturally distributes this: per-shard footprint
 `~2 × (n/S) × d × 4 bytes`.
 
 **Near-term mitigations (before Phase 3):**
-- `n_train` cap in benchmark scripts (already done for GIST at 200k).
-- **mmap-backed `_data_buf`** *(Phase 2 prerequisite, unblocks GIST 1M)*: replace
-  `np.empty((_cap, d))` with `np.memmap(path, mode='w+', shape=(_cap, d))`.  The OS
-  maps the file into virtual address space and pages individual 4 KB chunks into
-  physical RAM only when touched — clusters that are never queried cost zero RAM.
-  For a serving workload where only ~10% of clusters are hot at any time, effective
-  RSS drops from 3.84 GB to ~0.4 GB.  This is a natural side-effect of the Phase 2.2
-  checkpoint layout (mmap-friendly fixed-size header + variable cone blocks).
-  **Prerequisite for running the full GIST 1M benchmark on a 16 GB machine.**
+- **mmap-backed `_data_buf`** *(done ✓)*: `data_path=` kwarg pages data on demand;
+  effective RSS ≈ 0.4 GB for a hot-cluster serving workload.
+- **`StreamingBuildDispatcher` / `streaming_build()`** *(done ✓)*: sequential build
+  that never random-accesses the mmap. Peak build RSS ≈ 90 MB (n-independent).
+  Benchmark auto-selects streaming for n > 200k. **Unblocks GIST 1M on 8 GB RAM.**
 - `float16` raw vector storage: halves the data footprint; recall impact at d >> 128
   needs measurement before committing.
 

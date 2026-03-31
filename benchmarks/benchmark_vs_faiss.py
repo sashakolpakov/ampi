@@ -33,44 +33,68 @@ _FAMILY_STYLE = {
 }
 
 
-def run(dataset_name, data, queries, gt, metric='l2'):
+_FAISS_RAM_LIMIT = 1.5e9   # 1.5 GB — skip FAISS build above this threshold
+
+
+def _try_build_faiss(data):
+    """Build FAISS Flat + IVF indexes; return (flat, ivf, nlist) or None on OOM."""
+    n, d    = data.shape
+    est_ram = n * d * 4          # float32 data copy inside FAISS
+    if est_ram > _FAISS_RAM_LIMIT:
+        gb = est_ram / 1e9
+        print(f"  [skip FAISS] estimated RAM {gb:.1f} GB > {_FAISS_RAM_LIMIT/1e9:.1f} GB limit")
+        return None
+
+    try:
+        flat = faiss.IndexFlatL2(d)
+        flat.add(data)
+
+        nlist = max(16, int(np.sqrt(n)))
+        ivf   = faiss.IndexIVFFlat(faiss.IndexFlatL2(d), d, nlist, faiss.METRIC_L2)
+        ivf.train(data)
+        ivf.add(data)
+        return flat, ivf, nlist
+    except (MemoryError, RuntimeError) as exc:
+        print(f"  [skip FAISS] OOM during build: {exc}")
+        return None
+
+
+def run(dataset_name, data, queries, gt, metric='l2', data_path=None):
     n, d = data.shape
     sep  = "═" * 72
     print(f"\n{sep}")
     print(f"  {dataset_name}  —  n={n:,}  d={d}  queries={len(queries)}  k={K}")
     print(sep)
 
-    flat = faiss.IndexFlatL2(d)
-    flat.add(data)
+    faiss_result = _try_build_faiss(data)
 
-    nlist = max(16, int(np.sqrt(n)))
-    ivf   = faiss.IndexIVFFlat(faiss.IndexFlatL2(d), d, nlist, faiss.METRIC_L2)
-    ivf.train(data)
-    ivf.add(data)
-
-    faiss_configs = [
-        ("Flat L2",
-         lambda q: (None, None, flat.search(q[None], K_MAX)[1][0]),
-         lambda q: n),
-    ]
-    for nprobe in [1, 5, 10, 25, 50]:
-        if nprobe > nlist:
-            continue
-        def _ivf(q, p=nprobe):
-            ivf.nprobe = p
-            return (None, None, ivf.search(q[None], K_MAX)[1][0])
+    faiss_configs = []
+    if faiss_result is not None:
+        flat, ivf, nlist = faiss_result
         faiss_configs.append((
-            f"IVF nprobe={nprobe}", _ivf,
-            lambda q, p=nprobe: p * (n // nlist),
+            "Flat L2",
+            lambda q: (None, None, flat.search(q[None], K_MAX)[1][0]),
+            lambda q: n,
         ))
+        for nprobe in [1, 5, 10, 25, 50]:
+            if nprobe > nlist:
+                continue
+            def _ivf(q, p=nprobe):
+                ivf.nprobe = p
+                return (None, None, ivf.search(q[None], K_MAX)[1][0])
+            faiss_configs.append((
+                f"IVF nprobe={nprobe}", _ivf,
+                lambda q, p=nprobe: p * (n // nlist),
+            ))
 
-    ampi_configs = build_ampi_configs(data, queries, gt, metric)
+    ampi_configs = build_ampi_configs(data, queries, gt, metric, data_path=data_path)
 
+    exact_labels = ("Flat L2",) if faiss_result is not None else ()
     print_table_header()
     return run_evaluation(
         faiss_configs + ampi_configs,
         queries, gt, data, n,
-        exact_labels=("Flat L2",),
+        exact_labels=exact_labels,
     )
 
 
@@ -114,11 +138,17 @@ if __name__ == "__main__":
                              run("GloVe 1.18M  d=100", data, queries, gt, metric='cosine')))
 
     if "gist" in targets:
-        # Cap at 200k to stay within ~3 GB peak RAM (full 1M needs ~12 GB).
+        # Full 1M: GT from HDF5 (no brute-force alloc); training data loaded via
+        # mmap so the OS pages in on demand; AMPI C++ data buffer also mmap-backed.
+        # Peak RSS should stay ~4-5 GB on an 8 GB machine.
+        import os
+        gist_mmap_dir = str(DATA_DIR / "gist" / "_ampi_mmap")
+        os.makedirs(gist_mmap_dir, exist_ok=True)
         data, queries, gt = load_hdf5(DATA_DIR / "gist/gist-960-euclidean.hdf5",
-                                      n_train=200_000)
-        all_results.append(("GIST 200k  d=960",
-                             run("GIST 200k  d=960", data, queries, gt)))
+                                      mmap_dir=gist_mmap_dir)
+        all_results.append(("GIST 1M  d=960",
+                             run("GIST 1M  d=960", data, queries, gt,
+                                 data_path=gist_mmap_dir)))
 
     print()
     save_figures(all_results, family_style=_FAMILY_STYLE, suffix="_vs_faiss")

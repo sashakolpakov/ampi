@@ -46,7 +46,23 @@ See **DATABASE_PLAN.md** for the concrete phased implementation plan.
 
 ---
 
-## 2. Persistence Layer (Phase 2 — not started)
+## 2. Persistence Layer (Phase 2 — prerequisites done, implementation not started)
+
+### Phase-2 Prerequisites (branch `phase-2-prereqs`)
+- [x] `AMPIIndex::get_U_drift(c)` — returns `(d, F) float32` copy of the Oja sketch;
+      needed by the checkpoint serializer to snapshot per-cluster drift state.
+- [x] `SortedCone::get_axis_pairs(l)` — returns `(projs, ids)` for axis l; needed by
+      the checkpoint serializer to read cone pairs back out of C++.
+- [x] mmap-backed `_data_buf` (`data_path=` kwarg on `AMPIAffineFanIndex`): replaces
+      `np.empty` with `np.memmap`; OS pages in only touched clusters — prerequisite
+      for single-node GIST 1M on a 16 GB machine.
+- [x] `AMPIIndex::from_stream` C++ factory: assembles index from pre-built `SortedCone`
+      objects + existing mmap data file; skips `_build_cones` random mmap access.
+- [x] `StreamingBuildDispatcher` + `streaming_build()` (`ampi/streaming.py`): single
+      sequential pass over data — 50k-row sample for k-means, one streaming pass
+      accumulates per-(cluster,cone) projections in ≈72 MB RAM (n-independent), builds
+      `SortedCone` objects. Peak RSS ≈90 MB for GIST 1M d=960. Benchmark auto-selects
+      streaming for n > 200k when data_path is set.
 
 ### Write-Ahead Log
 - [ ] Append-only binary WAL: one record per mutation (INSERT|DELETE, global_id,
@@ -58,10 +74,6 @@ See **DATABASE_PLAN.md** for the concrete phased implementation plan.
 - [ ] Checkpoint serializer: header + centroids + axes + per-cluster cone pairs.
 - [ ] mmap-friendly layout for read-only serving while new checkpoint is being written.
 - [ ] Truncate WAL after successful checkpoint.
-- [ ] mmap-backed `_data_buf`: replace `np.empty` allocation with a memory-mapped
-      file so the OS pages in only the clusters being queried/inserted; prerequisite
-      for single-node GIST 1M on a 16 GB machine.  Natural side-effect of the
-      mmap-friendly checkpoint layout above.
 
 ---
 
@@ -121,9 +133,8 @@ All phases merged (branch `cpp-pipeline`).
 - [x] Fashion-MNIST (60k, d=784)
 - [x] SIFT-128 full 1M
 - [x] Recall@1 / Recall@100 curves (benchmarks/benchmark.py reports all three)
-- [x] GIST (1M, d=960) — run at 200k cap (full 1M needs ~12 GB peak; see BENCHMARKS.md §GIST)
-- [ ] GIST full 1M benchmark — blocked on mmap `_data_buf` (Phase 2); re-run once
-      mmap is in place to validate recall and QPS at full scale.
+- [x] GIST (1M, d=960) — 200k cap (historical); full 1M now unblocked via streaming build.
+- [ ] GIST full 1M benchmark — unblocked by `streaming_build`; run to validate recall/QPS.
 - [x] Profile per-cluster fan-axis variance to validate drift-detection threshold θ_drift
 
 ---

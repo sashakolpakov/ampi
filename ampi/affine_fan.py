@@ -352,12 +352,13 @@ class AMPIAffineFanIndex:
     def __init__(self, data, nlist=None, num_fans=16, seed=0, cone_top_k=1,
                  metric='l2', drift_theta=_DRIFT_THETA,
                  merge_interval=_MERGE_INTERVAL, eps_merge=_EPS_MERGE,
-                 merge_qe_ratio=_MERGE_QE_RATIO):
+                 merge_qe_ratio=_MERGE_QE_RATIO, data_path=None):
         self.metric           = _normalize_metric(metric)
         self.drift_theta      = float(drift_theta)
         self.merge_interval   = int(merge_interval)
         self.eps_merge        = float(eps_merge)
         self.merge_qe_ratio   = float(merge_qe_ratio)
+        self._data_path       = data_path
 
         self.data = np.ascontiguousarray(data, dtype=np.float32)
         if metric == 'cosine':
@@ -417,9 +418,24 @@ class AMPIAffineFanIndex:
         # Pre-allocated capacity buffers for data and deleted-mask.
         # Extra headroom avoids a reallocation on the first few adds;
         # buffer doubles when full (amortised O(1) per insert).
+        #
+        # When data_path is provided the data buffer is backed by a memory-
+        # mapped file (Phase-2 prerequisite).  The OS pages in only the
+        # clusters being accessed, so effective RSS stays proportional to the
+        # working set rather than the full dataset size.
         _HEADROOM = 1024
         _cap = self.n + _HEADROOM
-        self._data_buf      = np.empty((_cap, self.d), dtype=np.float32)
+        # Python-path (no C++ ext): use memmap so the OS can page out idle clusters.
+        # When the C++ ext is present it owns its own mmap (passed via data_path to
+        # from_build below), so we just use np.empty here as a temporary staging buffer.
+        if data_path is not None and not _HAS_EXT:
+            import os
+            self._data_buf_file = os.path.join(data_path, '_data_buf.dat')
+            self._data_buf = np.memmap(self._data_buf_file, mode='w+',
+                                       dtype='float32', shape=(_cap, self.d))
+        else:
+            self._data_buf_file = None
+            self._data_buf = np.empty((_cap, self.d), dtype=np.float32)
         self._data_buf[:self.n] = self.data
         self.data           = self._data_buf[:self.n]       # view
         self._del_mask_buf  = np.zeros(_cap, dtype=bool)
@@ -458,6 +474,7 @@ class AMPIAffineFanIndex:
                 self._data_buf, self._del_mask_buf.astype(np.uint8),
                 self.n,
                 self.cluster_global,
+                data_path=self._data_path or "",
             )
             self._cpp.set_merge_params(self.merge_interval, self.eps_merge,
                                        self.merge_qe_ratio)
@@ -465,6 +482,70 @@ class AMPIAffineFanIndex:
             self.cluster_cones = _CppConesProxy(self._cpp)
         else:
             self._cpp = None
+
+    # ── streaming factory ─────────────────────────────────────────────────────
+
+    @classmethod
+    def from_stream(cls, *, n, d, F, nlist, cone_top_k, metric, drift_theta,
+                    merge_interval, eps_merge, merge_qe_ratio,
+                    axes, centroids, cluster_global, cluster_counts, cones,
+                    data_path):
+        """Assemble an index from pre-built streaming components.
+
+        Called by streaming.streaming_build(); do not call directly.
+        Requires the C++ extension and a valid data_path/_cpp_data_buf.dat.
+        Bypasses k-means and _build_cones — no random mmap access.
+        """
+        if not _HAS_EXT:
+            raise RuntimeError(
+                "from_stream requires the compiled C++ extension. "
+                "Run `pip install -e .` to build it."
+            )
+
+        self = object.__new__(cls)
+        self.metric          = metric
+        self.drift_theta     = float(drift_theta)
+        self.merge_interval  = int(merge_interval)
+        self.eps_merge       = float(eps_merge)
+        self.merge_qe_ratio  = float(merge_qe_ratio)
+        self._data_path      = data_path
+        self.n               = n
+        self.d               = d
+        self.F               = F
+        self.cone_top_k      = cone_top_k
+        self.nlist           = nlist
+        self.axes            = np.ascontiguousarray(axes,      dtype=np.float32)
+        self.centroids       = np.ascontiguousarray(centroids, dtype=np.float32)
+        self.cluster_global  = cluster_global
+        self._point_cones    = {}
+
+        # Zero-sized staging buffers — C++ mmap owns the data after from_stream.
+        self._data_buf_file  = None
+        self._data_buf       = np.empty((0, d), dtype=np.float32)
+        self._del_mask_buf   = np.empty(0, dtype=bool)
+        self._deleted_mask   = np.empty(0, dtype=bool)
+        self._data_capacity  = 0
+        self._n_deleted      = 0
+        self._cluster_counts     = cluster_counts.copy()
+        self._cluster_tombstones = np.zeros(nlist, dtype=np.int64)
+        self._U_drift        = np.zeros((nlist, d, F), dtype=np.float32)
+        self._U_reorth_count = np.zeros(nlist, dtype=np.int32)
+        self.cluster_axes    = [None] * nlist
+        self._insert_count   = 0
+
+        self._cpp = _AMPIIndex.from_stream(
+            d, F, nlist, cone_top_k,
+            drift_theta, metric == 'cosine',
+            self.axes, self.centroids,
+            cluster_counts, n,
+            data_path or "",
+            cluster_global, cones,
+        )
+        self._cpp.set_merge_params(merge_interval, eps_merge, merge_qe_ratio)
+        self._refresh_views()
+        self.cluster_cones = _CppConesProxy(self._cpp)
+
+        return self
 
     # ── internal helpers ──────────────────────────────────────────────────────
 
@@ -748,8 +829,16 @@ class AMPIAffineFanIndex:
         # Grow buffers if at capacity (amortised O(1) via doubling).
         if self.n >= self._data_capacity:
             new_cap = self._data_capacity * 2
-            new_data_buf = np.empty((new_cap, self.d), dtype=np.float32)
-            new_data_buf[:self.n] = self._data_buf[:self.n]
+            if self._data_buf_file is not None:
+                # memmap: copy existing data before recreating the file at
+                # the larger size (mode='w+' truncates, so copy first).
+                tmp = self._data_buf[:self.n].copy()
+                new_data_buf = np.memmap(self._data_buf_file, mode='w+',
+                                         dtype='float32', shape=(new_cap, self.d))
+                new_data_buf[:self.n] = tmp
+            else:
+                new_data_buf = np.empty((new_cap, self.d), dtype=np.float32)
+                new_data_buf[:self.n] = self._data_buf[:self.n]
             self._data_buf = new_data_buf
             new_mask_buf = np.zeros(new_cap, dtype=bool)
             new_mask_buf[:self.n] = self._del_mask_buf[:self.n]

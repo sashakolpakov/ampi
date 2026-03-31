@@ -65,14 +65,14 @@ def _spike(d, axis, scale=1e3):
 
 _TESTS = []
 
-def test(fn):
+def _register(fn):
     _TESTS.append(fn)
     return fn
 
 
 # ── scenarios ────────────────────────────────────────────────────────────────
 
-@test
+@_register
 def insert_findability():
     """Inserted spike must be the exact nearest neighbour when queried."""
     idx, _, _ = _small_index()
@@ -84,7 +84,7 @@ def insert_findability():
     assert gid in ids, f"inserted spike (gid={gid}) not found as NN, got {ids}"
 
 
-@test
+@_register
 def delete_no_false_positive():
     """After deleting a spike, it must never appear in any query result."""
     idx, _, rng = _small_index()
@@ -108,7 +108,7 @@ def delete_no_false_positive():
         assert gid not in ids, f"deleted gid={gid} returned at window_size={w}"
 
 
-@test
+@_register
 def update_correctness():
     """After update(id, y): old id gone, new id findable at y."""
     idx, _, _ = _small_index()
@@ -128,7 +128,7 @@ def update_correctness():
     assert new_gid in ids_y, f"new gid={new_gid} not found at updated location"
 
 
-@test
+@_register
 def double_delete_is_noop():
     """Deleting the same id twice must not change _n_deleted after the first call."""
     idx, _, _ = _small_index()
@@ -142,7 +142,7 @@ def double_delete_is_noop():
         "_n_deleted changed on double delete"
 
 
-@test
+@_register
 def invalid_delete_raises():
     """delete() with an out-of-range id must raise IndexError."""
     idx, _, _ = _small_index()
@@ -154,7 +154,7 @@ def invalid_delete_raises():
             pass
 
 
-@test
+@_register
 def outlier_insert():
     """Insert a point far outside the training distribution; it must be findable."""
     idx, _, _ = _small_index()
@@ -166,7 +166,7 @@ def outlier_insert():
     assert gid in ids, f"outlier gid={gid} not found"
 
 
-@test
+@_register
 def zero_vector_insert():
     """Inserting a zero vector must not crash (edge case for normalisation)."""
     idx, _, _ = _small_index()
@@ -177,7 +177,7 @@ def zero_vector_insert():
     idx.query(z, k=5, window_size=50, probes=5, fan_probes=4)
 
 
-@test
+@_register
 def boundary_insert_cone_top_k2():
     """With cone_top_k=2 a boundary point lives in 2 clusters; delete removes it from both."""
     idx, _, rng = _small_index(K=2)
@@ -199,7 +199,7 @@ def boundary_insert_cone_top_k2():
     assert gid not in ids, f"cone_top_k=2 deleted gid={gid} still returned"
 
 
-@test
+@_register
 def bulk_add_recall():
     """Add 300 points; each must be findable (recall@1 >= 0.95 across added points)."""
     idx, data, rng = _small_index(n=2000, d=32)
@@ -218,7 +218,7 @@ def bulk_add_recall():
     assert rec >= 0.90, f"bulk-add recall@1 = {rec:.3f} < 0.90"
 
 
-@test
+@_register
 def high_deletion_recall():
     """Delete 20 % of original points; recall@10 on remaining must stay >= 0.80."""
     idx, data, rng = _small_index(n=2000, d=32, nlist=20, F=16)
@@ -253,7 +253,7 @@ def high_deletion_recall():
         assert not bad, f"deleted ids {bad} returned after deletion"
 
 
-@test
+@_register
 def tombstone_compaction_fires():
     """Exceed _TOMBSTONE_THRESHOLD in one cluster; _cluster_tombstones must reset."""
     from ampi.affine_fan import _TOMBSTONE_THRESHOLD
@@ -284,7 +284,7 @@ def tombstone_compaction_fires():
         "U_drift not cleared after _local_refresh"
 
 
-@test
+@_register
 def drift_detection_fires():
     """Insert many points along e_0; drift check must eventually trigger a refresh."""
     n, d = 1000, 32
@@ -312,7 +312,7 @@ def drift_detection_fires():
     assert len(ids) == 5, "query after drift inserts returned wrong number of results"
 
 
-@test
+@_register
 def all_cluster_points_deleted():
     """Delete every point in one cluster; subsequent queries must not crash or return those ids."""
     n, d, nlist = 500, 16, 5
@@ -332,7 +332,7 @@ def all_cluster_points_deleted():
         assert not bad, f"deleted cluster members {bad} returned in query"
 
 
-@test
+@_register
 def cosine_metric_add_delete():
     """add/delete work correctly under the cosine metric."""
     n, d = 2000, 32
@@ -352,7 +352,7 @@ def cosine_metric_add_delete():
     assert gid not in post, "cosine: deleted spike still returned"
 
 
-@test
+@_register
 def interleaved_mutations_and_queries():
     """Alternating add/delete/query must stay consistent at every step."""
     idx, _, rng = _small_index(n=1000, d=16, nlist=10, F=8)
@@ -385,7 +385,7 @@ def interleaved_mutations_and_queries():
                     f"step {step}: deleted ids {bad} returned in query"
 
 
-@test
+@_register
 def heavy_churn_recall():
     """200 adds + 200 deletes interleaved; recall@10 vs brute force >= 0.75."""
     n, d = 2000, 32
@@ -431,7 +431,7 @@ def heavy_churn_recall():
 
 # ── periodic merge ───────────────────────────────────────────────────────────
 
-@test
+@_register
 def periodic_merge_reduces_cluster_count():
     """Two near-identical tight clusters must be folded into one by periodic_merge."""
     rng = np.random.default_rng(20)
@@ -459,7 +459,7 @@ def periodic_merge_reduces_cluster_count():
         f"periodic_merge did not reduce cluster count: {non_empty_before} → {non_empty_after}"
 
 
-@test
+@_register
 def periodic_merge_recall_preserved():
     """Recall@5 must be maintained after a merge that folds two near-identical clusters."""
     rng = np.random.default_rng(21)
@@ -480,7 +480,7 @@ def periodic_merge_recall_preserved():
     assert rec >= 0.80, f"recall after periodic_merge = {rec:.3f} < 0.80"
 
 
-@test
+@_register
 def merge_interval_auto_triggers():
     """With merge_interval>0 auto-merge fires during add() calls without crashing."""
     rng  = np.random.default_rng(22)
@@ -498,7 +498,7 @@ def merge_interval_auto_triggers():
 
 # ── merge params and per-cluster axes ─────────────────────────────────────────
 
-@test
+@_register
 def merge_params_propagate_to_cpp():
     """Non-default merge_qe_ratio must reach the C++ layer."""
     idx, _, _ = _small_index(n=500, d=16, nlist=5, F=8)
@@ -516,7 +516,7 @@ def merge_params_propagate_to_cpp():
             "merge_qe_ratio=0.1 not propagated to C++"
 
 
-@test
+@_register
 def per_cluster_axes_populated_after_refresh():
     """After local_refresh with non-trivial U_drift, cluster axes are valid unit vectors.
 
@@ -574,7 +574,7 @@ def per_cluster_axes_populated_after_refresh():
 
 # ── sqeuclidean with mutations ────────────────────────────────────────────────
 
-@test
+@_register
 def sqeuclidean_add_delete():
     """add/delete/update work correctly under sqeuclidean metric; distances are non-negative."""
     rng  = np.random.default_rng(50)
@@ -605,7 +605,7 @@ def sqeuclidean_add_delete():
 
 # ── buffer / compaction / drift ───────────────────────────────────────────────
 
-@test
+@_register
 def buffer_grows_past_initial_capacity():
     """Insert enough points to exceed the 1024-point initial headroom."""
     rng  = np.random.default_rng(3)
@@ -619,7 +619,7 @@ def buffer_grows_past_initial_capacity():
         assert idx._cpp.n == n0 + 1100, "C++ n mismatch after buffer growth"
 
 
-@test
+@_register
 def compaction_triggers_on_high_tombstone_fraction():
     """Delete >threshold% of a cluster; cluster_global must contain only live points."""
     from ampi.affine_fan import _TOMBSTONE_THRESHOLD as _TT
@@ -649,7 +649,7 @@ def compaction_triggers_on_high_tombstone_fraction():
             f"cluster_global size after compaction: {len(c0_after)} != {n_c0 - n_del}"
 
 
-@test
+@_register
 def drift_detection_fires():
     """Insert many points along e_0; index must remain queryable after drift refresh."""
     rng  = np.random.default_rng(99)
@@ -677,7 +677,7 @@ def drift_detection_fires():
 
 # ── concurrent access ─────────────────────────────────────────────────────────
 
-@test
+@_register
 def concurrent_rw_no_crash():
     """2 reader threads + 1 writer + 1 deleter for 2 s — no crashes or exceptions."""
     idx, _, _ = _small_index(n=3000, d=32, nlist=10, F=8)
@@ -738,7 +738,67 @@ def concurrent_rw_no_crash():
     assert not errors, f"thread errors: {errors}"
 
 
-@test
+@_register
+def mmap_cpp_data_path():
+    """C++ mmap mode: data_path= creates a mmap file; queries and adds work correctly."""
+    import os, tempfile
+    rng = np.random.default_rng(77)
+    n, d = 2000, 32
+    data = rng.standard_normal((n, d)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = AMPIAffineFanIndex(data, nlist=10, num_fans=8, seed=0, data_path=tmp)
+        if idx._cpp is not None:
+            cpp_file = os.path.join(tmp, "_cpp_data_buf.dat")
+            assert os.path.exists(cpp_file), "C++ mmap file not created"
+        # Queries must be correct.
+        q = rng.standard_normal(d).astype(np.float32)
+        _, _, ids = idx.query(q, k=10, window_size=200, probes=idx.nlist, fan_probes=idx.F)
+        assert len(ids) == 10, f"mmap query returned {len(ids)} results"
+        # Streaming adds (may trigger mmap remap).
+        for _ in range(100):
+            idx.add(rng.standard_normal(d).astype(np.float32))
+        assert idx.n == n + 100, f"n wrong after adds: {idx.n}"
+        # Deleted points must not appear (use a spike far from the bulk so it's
+        # the exact NN at k=1).
+        spike = np.zeros(d, dtype=np.float32)
+        spike[0] = 1e4
+        gid = idx.add(spike)
+        _, _, before = idx.query(spike, k=1, window_size=200,
+                                 probes=idx.nlist, fan_probes=idx.F)
+        assert gid in before.tolist(), "mmap: inserted spike not found as NN"
+        idx.delete(gid)
+        _, _, after = idx.query(spike, k=5, window_size=200,
+                                probes=idx.nlist, fan_probes=idx.F)
+        assert gid not in after.tolist(), "mmap: deleted spike leaked"
+
+
+@_register
+def mmap_serialization_getters():
+    """get_U_drift and get_axis_pairs return correct shapes after mutations."""
+    import tempfile
+    rng = np.random.default_rng(88)
+    data = rng.standard_normal((1000, 32)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = AMPIAffineFanIndex(data, nlist=8, num_fans=4, seed=0, data_path=tmp)
+        if idx._cpp is None:
+            return
+        cpp = idx._cpp
+        for _ in range(50):
+            idx.add(rng.standard_normal(32).astype(np.float32))
+        for c in range(cpp.nlist):
+            U = cpp.get_U_drift(c)
+            assert U.shape == (cpp.d, cpp.F), \
+                f"get_U_drift({c}) shape {U.shape} != ({cpp.d}, {cpp.F})"
+            assert U.dtype == np.float32, f"get_U_drift dtype {U.dtype}"
+            if cpp.has_cones(c):
+                for f in range(cpp.F):
+                    projs, ids = cpp.get_cone(c, f).get_axis_pairs(0)
+                    assert projs.dtype == np.float32, "get_axis_pairs projs dtype"
+                    assert ids.dtype == np.uint32, "get_axis_pairs ids dtype"
+                    assert projs.shape == ids.shape, "get_axis_pairs shape mismatch"
+
+
+@_register
 def batch_correctness_after_mutations():
     """batch_add then batch_delete: deleted IDs must never appear in queries."""
     idx, _, rng = _small_index(n=2000, d=32, nlist=8, F=8)
@@ -758,6 +818,190 @@ def batch_correctness_after_mutations():
                                 probes=idx.nlist, fan_probes=idx.F)
         leaked = deleted_set & set(found.tolist())
         assert not leaked, f"batch-deleted ids {leaked} appeared in query"
+
+
+# ── streaming_build ───────────────────────────────────────────────────────────
+
+@_register
+def streaming_build_basic_recall():
+    """streaming_build recall@10 >= 0.75 on 3000-point data."""
+    import tempfile, os
+    from ampi.streaming import streaming_build
+
+    rng  = np.random.default_rng(200)
+    n, d = 3000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = streaming_build(
+            lambda s, e: data[s:e],
+            n=n, d=d, nlist=20, num_fans=8,
+            cone_top_k=1, seed=0,
+            data_path=os.path.join(tmp, 'idx'),
+        )
+        assert idx.n == n,  f"streaming n={idx.n} != {n}"
+        assert idx._cpp is not None, "streaming_build returned no C++ index"
+
+        qs    = rng.standard_normal((50, d)).astype('float32')
+        gt    = _brute_knn(data, qs, k=10)
+        found = [idx.query(q, k=10, window_size=200,
+                            probes=idx.nlist, fan_probes=idx.F)[2] for q in qs]
+        rec   = _recall(gt, found, k=10)
+        assert rec >= 0.75, f"streaming recall@10 = {rec:.3f} < 0.75"
+
+
+@_register
+def streaming_build_add_delete():
+    """After streaming_build: add spike → found as NN; delete → gone."""
+    import tempfile, os
+    from ampi.streaming import streaming_build
+
+    rng  = np.random.default_rng(201)
+    n, d = 2000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        idx   = streaming_build(lambda s, e: data[s:e], n=n, d=d,
+                                 nlist=16, num_fans=8, seed=0,
+                                 data_path=os.path.join(tmp, 'idx'))
+        spike = np.zeros(d, dtype='float32')
+        spike[0] = 1e4
+        gid   = idx.add(spike)
+
+        _, _, before = idx.query(spike, k=1, window_size=200,
+                                  probes=idx.nlist, fan_probes=idx.F)
+        assert gid in before.tolist(), "streaming: spike not found before delete"
+
+        idx.delete(gid)
+        _, _, after = idx.query(spike, k=5, window_size=200,
+                                 probes=idx.nlist, fan_probes=idx.F)
+        assert gid not in after.tolist(), "streaming: deleted spike leaked"
+
+
+@_register
+def streaming_build_cosine():
+    """streaming_build with cosine metric: distances in [0,1]; spike findable and deletable."""
+    import tempfile, os
+    from ampi.streaming import streaming_build
+
+    rng  = np.random.default_rng(202)
+    n, d = 2000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        idx = streaming_build(lambda s, e: data[s:e], n=n, d=d,
+                               nlist=16, num_fans=8, metric='cosine', seed=0,
+                               data_path=os.path.join(tmp, 'idx'))
+        assert idx.metric == 'cosine'
+        if idx._cpp is not None:
+            assert idx._cpp.cosine_metric is True, "cosine_metric not set in C++ layer"
+
+        spike = np.zeros(d, dtype='float32')
+        spike[0] = 1.0   # unit vector
+        gid = idx.add(spike)
+
+        _, dists, before = idx.query(spike, k=5, window_size=200,
+                                      probes=idx.nlist, fan_probes=idx.F)
+        assert gid in before.tolist(), "streaming cosine: spike not found"
+        assert (dists >= -1e-4).all() and (dists <= 1 + 1e-4).all(), \
+            f"streaming cosine: distances out of [0,1]: {dists}"
+
+        idx.delete(gid)
+        _, _, after = idx.query(spike, k=5, window_size=200,
+                                 probes=idx.nlist, fan_probes=idx.F)
+        assert gid not in after.tolist(), "streaming cosine: deleted spike leaked"
+
+
+@_register
+def streaming_build_matches_regular_recall():
+    """Streaming build recall must be within 15pp of regular build on same data+seed."""
+    import tempfile, os
+    from ampi.streaming import streaming_build
+
+    rng  = np.random.default_rng(203)
+    n, d = 3000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+    qs   = rng.standard_normal((50, d)).astype('float32')
+    gt   = _brute_knn(data, qs, k=10)
+
+    def _rec(found_list):
+        return _recall(gt, found_list, k=10)
+
+    idx_reg   = AMPIAffineFanIndex(data, nlist=20, num_fans=8, seed=0)
+    found_reg = [idx_reg.query(q, k=10, window_size=200,
+                                probes=idx_reg.nlist, fan_probes=idx_reg.F)[2] for q in qs]
+    rec_reg   = _rec(found_reg)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        idx_str   = streaming_build(lambda s, e: data[s:e], n=n, d=d,
+                                     nlist=20, num_fans=8, seed=0,
+                                     data_path=os.path.join(tmp, 'idx'))
+        found_str = [idx_str.query(q, k=10, window_size=200,
+                                    probes=idx_str.nlist, fan_probes=idx_str.F)[2] for q in qs]
+        rec_str   = _rec(found_str)
+
+    assert rec_str >= rec_reg - 0.15, \
+        f"streaming recall {rec_str:.3f} too far below regular {rec_reg:.3f} (gap > 15pp)"
+
+
+# ── bounds checks ────────────────────────────────────────────────────────────
+
+@_register
+def bounds_checks_raise_python_exceptions():
+    """Out-of-range / wrong-dimension arguments must raise Python exceptions, not segfault."""
+    idx, _, _ = _small_index(n=500, d=16, nlist=5, F=8)
+    if idx._cpp is None:
+        return
+
+    cpp   = idx._cpp
+    d_idx = idx.d
+    nl    = idx.nlist
+
+    # add: wrong dimension
+    try:
+        cpp.add(np.zeros(d_idx + 1, dtype='float32'))
+        assert False, "add: expected ValueError"
+    except ValueError:
+        pass
+
+    # batch_add: wrong column count
+    try:
+        cpp.batch_add(np.zeros((2, d_idx + 1), dtype='float32'))
+        assert False, "batch_add: expected ValueError"
+    except ValueError:
+        pass
+
+    # get_U_drift: out of range
+    for bad in (-1, nl):
+        try:
+            cpp.get_U_drift(bad)
+            assert False, f"get_U_drift({bad}): expected IndexError"
+        except IndexError:
+            pass
+
+    # get_cluster_global: out of range
+    for bad in (-1, nl):
+        try:
+            cpp.get_cluster_global(bad)
+            assert False, f"get_cluster_global({bad}): expected IndexError"
+        except IndexError:
+            pass
+
+    # get_cone: out of range
+    for bad_c, bad_f in ((-1, 0), (nl, 0), (0, -1), (0, idx.F)):
+        try:
+            cpp.get_cone(bad_c, bad_f)
+            assert False, f"get_cone({bad_c}, {bad_f}): expected IndexError"
+        except IndexError:
+            pass
+
+    # query: wrong dimension
+    try:
+        cpp.query(np.zeros(d_idx + 1, dtype='float32'),
+                  k=1, window_size=10, probes=1, fan_probes=1)
+        assert False, "query: expected ValueError"
+    except ValueError:
+        pass
 
 
 # ── runner ────────────────────────────────────────────────────────────────────
