@@ -138,17 +138,11 @@ if __name__ == "__main__":
                              run("GloVe 1.18M  d=100", data, queries, gt, metric='cosine')))
 
     if "gist" in targets:
-        # Full 1M: GT from HDF5 (no brute-force alloc); training data loaded via
-        # mmap so the OS pages in on demand; AMPI C++ data buffer also mmap-backed.
-        # Peak RSS should stay ~4-5 GB on an 8 GB machine.
-        import os
-        gist_mmap_dir = str(DATA_DIR / "gist" / "_ampi_mmap")
-        os.makedirs(gist_mmap_dir, exist_ok=True)
+        # Capped at 200k here; use benchmark_gist_large.py for the full 1M run.
         data, queries, gt = load_hdf5(DATA_DIR / "gist/gist-960-euclidean.hdf5",
-                                      mmap_dir=gist_mmap_dir)
-        all_results.append(("GIST 1M  d=960",
-                             run("GIST 1M  d=960", data, queries, gt,
-                                 data_path=gist_mmap_dir)))
+                                      n_train=200_000)
+        all_results.append(("GIST 200k  d=960",
+                             run("GIST 200k  d=960", data, queries, gt)))
 
     print()
     save_figures(all_results, family_style=_FAMILY_STYLE, suffix="_vs_faiss")

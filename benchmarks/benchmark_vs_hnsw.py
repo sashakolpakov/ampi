@@ -112,7 +112,7 @@ if __name__ == "__main__":
                              run("GloVe 1.18M  d=100", data, queries, gt, metric='cosine')))
 
     if "gist" in targets:
-        # Cap at 200k to stay within ~3 GB peak RAM (full 1M needs ~12 GB).
+        # Capped at 200k here; use benchmark_gist_large.py for the full 1M run.
         data, queries, gt = load_hdf5(DATA_DIR / "gist/gist-960-euclidean.hdf5",
                                       n_train=200_000)
         all_results.append(("GIST 200k  d=960",

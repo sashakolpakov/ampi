@@ -352,7 +352,8 @@ class AMPIAffineFanIndex:
     def __init__(self, data, nlist=None, num_fans=16, seed=0, cone_top_k=1,
                  metric='l2', drift_theta=_DRIFT_THETA,
                  merge_interval=_MERGE_INTERVAL, eps_merge=_EPS_MERGE,
-                 merge_qe_ratio=_MERGE_QE_RATIO, data_path=None):
+                 merge_qe_ratio=_MERGE_QE_RATIO, data_path=None,
+                 wal_path=None, wal_batch_size=1):
         self.metric           = _normalize_metric(metric)
         self.drift_theta      = float(drift_theta)
         self.merge_interval   = int(merge_interval)
@@ -483,13 +484,20 @@ class AMPIAffineFanIndex:
         else:
             self._cpp = None
 
+        # ── Phase-2 WAL ───────────────────────────────────────────────────────
+        if wal_path is not None:
+            from .wal import WALWriter
+            self._wal = WALWriter(wal_path, self.d, batch_size=wal_batch_size)
+        else:
+            self._wal = None
+
     # ── streaming factory ─────────────────────────────────────────────────────
 
     @classmethod
     def from_stream(cls, *, n, d, F, nlist, cone_top_k, metric, drift_theta,
                     merge_interval, eps_merge, merge_qe_ratio,
                     axes, centroids, cluster_global, cluster_counts, cones,
-                    data_path):
+                    data_path, wal_path=None, wal_batch_size=1):
         """Assemble an index from pre-built streaming components.
 
         Called by streaming.streaming_build(); do not call directly.
@@ -544,6 +552,12 @@ class AMPIAffineFanIndex:
         self._cpp.set_merge_params(merge_interval, eps_merge, merge_qe_ratio)
         self._refresh_views()
         self.cluster_cones = _CppConesProxy(self._cpp)
+
+        if wal_path is not None:
+            from .wal import WALWriter
+            self._wal = WALWriter(wal_path, d, batch_size=wal_batch_size)
+        else:
+            self._wal = None
 
         return self
 
@@ -814,8 +828,13 @@ class AMPIAffineFanIndex:
         if self._cpp is not None:
             gid = self._cpp.add(x)
             self._refresh_views()
+            if self._wal is not None:
+                self._wal.log_insert(gid, x)
             return gid
-        return self._py_add(x)
+        gid = self._py_add(x)
+        if self._wal is not None:
+            self._wal.log_insert(gid, x)
+        return gid
 
     def _py_add(self, x):
         """Python-path add (used when C++ ext unavailable)."""
@@ -953,8 +972,12 @@ class AMPIAffineFanIndex:
         if self._cpp is not None:
             self._cpp.remove(global_id)
             self._refresh_views()
+            if self._wal is not None:
+                self._wal.log_delete(global_id)
             return
         self._py_delete(global_id)
+        if self._wal is not None:
+            self._wal.log_delete(global_id)
 
     def batch_add(self, data):
         """Insert multiple vectors at once (single exclusive lock).
