@@ -70,7 +70,7 @@ class _StreamingDispatcher:
         Returns
         -------
         cones          : list[list[SortedCone]]  — shape (nlist, F)
-        cluster_global : list[np.ndarray int32]  — shape (nlist,)
+        cluster_global : list[np.ndarray int32]  — original gids per cluster
         """
         from ampi._ampi_ext import SortedCone
 
@@ -86,10 +86,9 @@ class _StreamingDispatcher:
 
         for c in range(self.nlist):
             lo, hi  = int(splits[c]), int(splits[c + 1])
-            c_local = sort_idx[lo:hi]                    # row indices in _all_projs
-            c_gids  = c_local.astype(np.int32)           # global IDs = row indices
-            n_c     = len(c_gids)
-            cluster_global.append(c_gids)
+            c_local = sort_idx[lo:hi].astype(np.int32)    # original gids in cluster c
+            n_c     = hi - lo
+            cluster_global.append(c_local)
 
             if n_c < 2:
                 cones.append([SortedCone(self.F) for _ in range(self.F)])
@@ -117,7 +116,7 @@ class _StreamingDispatcher:
                     c_cones.append(SortedCone(self.F))
                     continue
 
-                f_gids  = c_gids[f_local]    # (n_f,) global IDs
+                f_gids  = c_local[f_local]   # (n_f,) original gids for this cone
                 f_projs = c_projs[f_local]   # (n_f, F)
 
                 sorted_projs = np.empty((self.F, n_f), dtype=np.float32)

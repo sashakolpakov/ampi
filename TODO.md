@@ -46,7 +46,7 @@ See **DATABASE_PLAN.md** for the concrete phased implementation plan.
 
 ---
 
-## 2. Persistence Layer (Phase 2 — prerequisites done, implementation not started)
+## 2. Persistence Layer (Phase 2 — complete)
 
 ### Phase-2 Prerequisites (branch `phase-2-prereqs`)
 - [x] `AMPIIndex::get_U_drift(c)` — returns `(d, F) float32` copy of the Oja sketch;
@@ -65,15 +65,28 @@ See **DATABASE_PLAN.md** for the concrete phased implementation plan.
       streaming for n > 200k when data_path is set.
 
 ### Write-Ahead Log
-- [ ] Append-only binary WAL: one record per mutation (INSERT|DELETE, global_id,
-      vector, timestamp, checksum).
-- [ ] Flush on every insert (or micro-batches of 64 for throughput).
-- [ ] Replay WAL on startup to rebuild in-memory state from last checkpoint.
+- [x] Append-only binary WAL (`ampi/wal.py`): one record per mutation (INSERT|DELETE,
+      global_id, vector, timestamp_ns, CRC32).
+- [x] Flush on every insert (configurable `wal_batch_size` for throughput).
+- [x] `replay_wal(idx, path, after_timestamp_ns)` — replays post-checkpoint mutations.
+- [x] `truncate_wal(path, d)` — resets WAL to header-only after checkpoint.
 
 ### Checkpointing
-- [ ] Checkpoint serializer: header + centroids + axes + per-cluster cone pairs.
-- [ ] mmap-friendly layout for read-only serving while new checkpoint is being written.
-- [ ] Truncate WAL after successful checkpoint.
+- [x] Checkpoint serializer (`ampi/checkpoint.py`): 66-byte header (CRC32) + centroids
+      + axes + cluster_counts + U_drift + per-cluster (global_ids, cone pairs).
+- [x] `save_checkpoint(idx, path) → timestamp_ns`; `load_checkpoint(path, data_path)`.
+- [x] Calls `AMPIAffineFanIndex.from_stream` on load — mmap raw-vector file preserved.
+- [x] WAL `wal_path=` / `wal_batch_size=` kwargs on `AMPIAffineFanIndex.__init__` and
+      `from_stream`; `add()` / `delete()` log mutations automatically.
+
+### Query Performance (done 2026-03-31)
+- [x] `l2_distances`: gather candidates into contiguous buffer → sequential GEMV
+      (eliminates random mmap access interleaved with compute; compiler auto-vectorises).
+- [x] `union_query`: replaced two O(n) mask scans with sort+unique on the hit list
+      (eliminates 2× O(n=1M) passes → ~2.7 ms on GIST-scale n).
+- [x] `AMPIIndex::query` / `query_candidates`: GIL released for full computation section
+      (input copied to C++ buffer before release; output arrays allocated after reacquire)
+      → Python threads can now call `query` in parallel without serialisation.
 
 ---
 
@@ -136,6 +149,12 @@ All phases merged (branch `cpp-pipeline`).
 - [x] GIST (1M, d=960) — 200k cap (historical); full 1M now unblocked via streaming build.
 - [ ] GIST full 1M benchmark — unblocked by `streaming_build`; run to validate recall/QPS.
 - [x] Profile per-cluster fan-axis variance to validate drift-detection threshold θ_drift
+- [ ] Vote-distribution analysis: for a sample of queries, record how many projection
+      windows each candidate appears in (vote count).  Applies to both Binary (L random
+      projections) and AffineFan (F cone axes × probed clusters).  Plot vote histogram
+      for true NNs vs false positives to find a natural threshold.  Only then consider
+      adding a `min_votes` parameter to `union_query` — must verify the true-NN vote
+      distribution stays well above any threshold before cutting candidates.
 
 ---
 

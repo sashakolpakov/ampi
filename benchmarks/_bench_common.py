@@ -91,7 +91,9 @@ def load_hdf5(path, n_train=None, normalize=False, mmap_dir=None):
         d       = f["train"].shape[1]
         n       = n_total if n_train is None else min(n_train, n_total)
         queries = f["test"][:N_QUERIES].astype(np.float32)
-        if "neighbors" in f and n_train is None:
+        if n_train is not None and n_train > n_total:
+            print(f"  [warn] n_train={n_train:,} > dataset size {n_total:,}; capping.")
+        if "neighbors" in f and n >= n_total:
             gt = f["neighbors"][:N_QUERIES, :K_MAX].astype(np.int32)
             precomputed_gt = True
         else:
@@ -396,10 +398,12 @@ def build_ampi_configs(data, queries, gt, metric='l2', data_path=None):
 
     idx_bin = _build(f"Binary   L={L2}", AMPIBinaryIndex, num_projections=L2, seed=0)
 
-    # Tune alpha = nlist / sqrt(n) via GP-BO on a data subsample
+    # Tune alpha = nlist / sqrt(n) via GP-BO on a data subsample.
+    # Use strided sequential access so mmap pages are read in order (no page-fault storm).
     print("  Tuning AFan parameters on sample...", flush=True)
-    n_sample    = max(10_000, min(100_000, int(n * 0.2)))
-    data_sample = data[np.random.choice(n, n_sample, replace=False)]
+    n_sample    = max(10_000, min(50_000, int(n * 0.1)))
+    step        = max(1, n // n_sample)
+    data_sample = np.array(data[::step][:n_sample], dtype=np.float32)
     tune_qs     = queries[:TUNE_SAMPLE]
     gt_sample   = _brute_knn(data_sample, tune_qs, K)
 
