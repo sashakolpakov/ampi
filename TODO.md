@@ -149,12 +149,14 @@ All phases merged (branch `cpp-pipeline`).
 - [x] GIST (1M, d=960) — 200k cap (historical); full 1M now unblocked via streaming build.
 - [ ] GIST full 1M benchmark — unblocked by `streaming_build`; run to validate recall/QPS.
 - [x] Profile per-cluster fan-axis variance to validate drift-detection threshold θ_drift
-- [ ] Vote-distribution analysis: for a sample of queries, record how many projection
-      windows each candidate appears in (vote count).  Applies to both Binary (L random
-      projections) and AffineFan (F cone axes × probed clusters).  Plot vote histogram
-      for true NNs vs false positives to find a natural threshold.  Only then consider
-      adding a `min_votes` parameter to `union_query` — must verify the true-NN vote
-      distribution stays well above any threshold before cutting candidates.
+- [x] Vote-distribution analysis: implemented `query_candidates_with_votes` for both
+      Binary and AffineFan (branch `vote-distribution`).  Finding: no usable signal —
+      within the windows the index already opens, true-NN and false-positive vote-count
+      distributions are nearly identical.  Root cause: random projections (Binary) have
+      no geometric preference for true NNs over false positives that lie close in 1D;
+      cone members (AffineFan) are already filtered to be close in projection space so
+      true NNs don't stand out.  Signal would emerge only at very large n with tiny
+      windows, which would crater recall.  `min_votes` pruning is not viable.
 
 ---
 

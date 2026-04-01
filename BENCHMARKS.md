@@ -239,6 +239,53 @@ HNSW ef=50 achieves R@10=0.932 at 316 QPS — strong for high-d.  At matched rec
 
 ---
 
+### GIST 250k  ·  d=960  ·  HNSW build: ~420 s (7 min, est.)
+
+> Built via `benchmark_gist_large.py --n 250000`.  FAISS skipped (estimated 1.9 GB
+> exceeds available RAM budget).  GP-BO chose F=32.
+
+| Method | R@1 | R@10 | R@100 | QPS | Cands |
+|---|---:|---:|---:|---:|---:|
+| HNSW ef=100 | 0.945 | 0.920 | 0.824 | **249** | — |
+| HNSW ef=200 | 0.990 | 0.972 | 0.920 | 116 | — |
+| HNSW ef=400 | 1.000 | **0.990** | 0.967 | 46 | — |
+| AFan K=1 cp=20 fp=32 w=18 | 0.880 | 0.869 | 0.789 | **56** | **8,851** |
+| AFan K=1 cp=50 fp=32 w=18 | 0.970 | **0.968** | 0.935 | 25 | **22,923** |
+| AFan K=2 cp=50 fp=32 w=18 | 0.970 | **0.968** | 0.935 | 25 | **22,923** |
+
+AFan reaches R@10=0.968 with 22,923 candidates — within 0.022 of HNSW ef=400 (0.990)
+and ahead of HNSW ef=200 (0.972) in recall at comparable QPS (25 vs 116).  HNSW
+has a large QPS advantage at equivalent recall; the gap will shrink as the C++ query
+path matures.
+
+---
+
+---
+
+## GIST 500k  ·  d=960  ·  streaming build  ·  AMPI only
+
+> Built via `benchmark_gist_large.py --n 500000 --no-hnsw`.  FAISS and HNSW
+> skipped (RAM budget).  Index built with `streaming_build`; peak RSS ≈90 MB
+> during build.  GP-BO chose F=64.
+>
+> **QPS note:** reported QPS is cold-mmap (first run of each config).  A second run
+> of the same config shows 3–6× higher QPS due to OS page-cache warming — this
+> is not a real throughput gain.  Treat QPS figures here as lower bounds.
+
+| Method | R@1 | R@10 | R@100 | QPS | Cands |
+|---|---:|---:|---:|---:|---:|
+| AFan K=1 cp=10 fp=64 w=26 | 0.785 | 0.730 | 0.635 | 11 | **6,346** |
+| AFan K=1 cp=20 fp=64 w=26 | 0.905 | 0.853 | 0.781 | 3 | **14,030** |
+| AFan K=1 cp=50 fp=64 w=26 | 0.965 | **0.962** | 0.930 | 2 | **33,677** |
+| AFan K=2 cp=50 fp=64 w=26 | 0.965 | **0.962** | 0.930 | 8 | **33,677** |
+
+R@10=0.962 at 500k vectors with 33,677 candidates (~6.7% of corpus).  The very low
+cold-mmap QPS (2–11) reflects page-fault storms: 33k candidates scattered across a
+1.84 GB file trigger hundreds of OS page faults per query.  Cluster-sorted mmap
+layout (TODO) would eliminate this; warm-cache runs already show 3–6× improvement.
+
+---
+
 ## Summary
 
 **vs FAISS IVF (static):** AMPI uses 2–3× fewer candidates on MNIST/Fashion for
