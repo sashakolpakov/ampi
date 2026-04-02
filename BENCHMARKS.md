@@ -331,6 +331,53 @@ or data-adapted initial axes would improve recall at fixed candidate budget.
 
 ---
 
+## Sketch-based lazy rerank (`sketch-rerank` branch)
+
+**Concept:** store a compact sketch `sketch[gid, f] = dot(x_gid, global_axis_f)` (n×F
+floats, RAM-resident) for all vectors.  Bessel's inequality gives a provable lower
+bound: `sketch_dist(q, x) ≤ ||q-x||²`.  Before touching the mmap for a candidate,
+check if its sketch lower bound already exceeds the current kth-nearest threshold.
+If so, skip the mmap read entirely.
+
+**Algorithm (two-pass):**
+1. Compute sketch distance for all m candidates (pure RAM).
+2. Exact rerank top-M₂ = max(3k, 50) by sketch distance (mmap reads).
+3. For remaining m−M₂ candidates: skip if `sketch_dist > kth_sq`; otherwise exact.
+
+**GIST 200k · d=960 · F=32 · warm cache (after streaming build):**
+
+| Config | R@1 | R@10 | R@100 | QPS | vs baseline |
+|---|---:|---:|---:|---:|---:|
+| AFan K=1 cp=5  fp=32 w=12 | 0.680 | 0.584 | 0.463 | 102 | — |
+| AFan K=1 cp=10 fp=32 w=14 | 0.825 | 0.744 | 0.628 | 114 | — |
+| AFan K=1 cp=20 fp=32 w=16 | 0.915 | 0.871 | 0.786 |  62 | — |
+| AFan K=1 cp=30 fp=32 w=16 | 0.940 | 0.928 | 0.861 |  43 | — |
+| AFan K=1 cp=50 fp=32 w=16 | 0.980 | **0.975** | 0.936 |  28 | **31 QPS on main** |
+
+**Sketch pruning analysis (cp=50, fp=32, w=16):**
+- Raw candidates per query: mean ≈ 21,000  (vs ~16,760 from BENCHMARKS baseline, measuring identical
+  workload shows the window search produces a variable candidate set)
+- M₂ = max(3×100, 50) = 300: only **1.4%** of candidates get guaranteed exact evaluation
+- **98.6%** of candidates subject to sketch pruning
+- Sketch lower bound coverage: F/d = 32/960 ≈ **3.3%** — very loose in high-d
+
+**Finding:** warm-cache QPS (28) is slightly below baseline (31) because the sketch
+computation cost (21k × 32 inner products) outweighs the savings from mmap skips when
+OS pages are already hot after the streaming build.  Recall is preserved (0.975 vs 0.964)
+and may be marginally improved because the ordered candidate evaluation (sketch-first
+ranking) reaches a tighter kth_sq after pass 1.
+
+**When sketch-rerank wins:**
+- **Cold mmap:** pages evicted between queries (large n, low query rate) — sketch avoids
+  up to 98% of random page faults.
+- **Lower d (e.g. SIFT d=128, F=16 → F/d=12.5%):** coverage is ~4× better, lower bound
+  is tighter, pass-2 pruning is more effective.
+- **Larger candidate sets:** scales with m; sketch overhead is linear in m×F.
+
+**RAM cost:** 200k × 32 × 4 bytes = **25.6 MB** added to resident memory.
+
+---
+
 ## Notes
 
 - **Candidate count** is the primary efficiency metric: it measures how many

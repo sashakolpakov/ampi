@@ -225,6 +225,18 @@ def streaming_build(
     # ── Step 5: build SortedCone objects from projection buffers ─────────────
     cones, cluster_global = dispatcher.build_cones()
 
+    # ── Step 5.5: compute and save sketch table ───────────────────────────────
+    # sketch[gid, f] = dot(x_gid, global_axis_f)
+    #                = centered_proj[gid, f] + dot(centroid_c, axis_f)
+    # Bessel: ||sketch(q) - sketch(x)||² ≤ ||q - x||²  (lower bound on true L2)
+    if data_path is not None:
+        cent_proj = (centroids @ axes.T).astype(np.float32)          # (nlist, F)
+        sketch = (dispatcher._all_projs
+                  + cent_proj[dispatcher._assignments]).astype(np.float32)  # (n, F)
+        sketch.tofile(os.path.join(data_path, '_sketch.dat'))
+    else:
+        sketch = None
+
     # ── Step 6: assemble via C++ from_stream (no _build_cones random access) ──
     cluster_counts = np.array([len(g) for g in cluster_global], dtype=np.int64)
 

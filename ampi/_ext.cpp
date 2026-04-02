@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <fcntl.h>    // open, O_CREAT, O_RDWR
+#include <fstream>    // std::ifstream (sketch load)
 #include <sys/mman.h> // mmap, munmap, MAP_SHARED, PROT_READ, PROT_WRITE
 #include <unistd.h>   // ftruncate, close
 
@@ -478,6 +479,11 @@ public:
     // Populated by _compute_cluster_axes() during _local_refresh.
     std::vector<std::vector<float>>      cluster_axes;    // [nlist]
 
+    // Sketch table: sketch[gid*F + f] = dot(x_gid, global_axis_f).
+    // Bessel: ||sketch(q) - sketch(x)||² ≤ ||q - x||² for any orthonormal A.
+    // Used as a cheap in-RAM lower bound to prune candidates before mmap access.
+    std::vector<float> sketch;   // capacity × F, row-major
+
     // point_cones[gid] = {(cluster, fan), ...}
     std::vector<std::vector<std::pair<uint16_t,uint16_t>>> point_cones;
 
@@ -514,6 +520,7 @@ public:
           cluster_cones(std::move(o.cluster_cones)),
           cluster_has_cones(std::move(o.cluster_has_cones)),
           cluster_axes(std::move(o.cluster_axes)),
+          sketch(std::move(o.sketch)),
           point_cones(std::move(o.point_cones)),
           merge_interval(o.merge_interval),
           eps_merge(o.eps_merge),
@@ -637,6 +644,7 @@ public:
                 idx._build_cones(c, idx.cluster_global[c]);
         }
 
+        idx._build_sketch_all();
         return idx;
     }
 
@@ -748,6 +756,22 @@ public:
             }
         }
 
+        // Load pre-computed sketch from data_path/_sketch.dat if present;
+        // otherwise compute from mmap via BLAS (sequential scan, OS-prefetchable).
+        idx.sketch.resize((size_t)n_total * F, 0.f);
+        {
+            std::string sketch_path = data_path + "/_sketch.dat";
+            std::ifstream sf(sketch_path, std::ios::binary);
+            size_t expected = (size_t)n_total * F * sizeof(float);
+            if (sf.good()) {
+                sf.read(reinterpret_cast<char*>(idx.sketch.data()), (std::streamsize)expected);
+                if (!sf || (size_t)sf.gcount() != expected)
+                    idx._build_sketch_all();   // partial read → recompute
+            } else {
+                idx._build_sketch_all();
+            }
+        }
+
         return idx;
     }
 
@@ -834,6 +858,7 @@ public:
 
         std::copy(x, x + d, _data_ptr + (size_t)n * d);
         del_mask[n] = 0;
+        _update_sketch_point(global_id, x);
         ++n;
 
         if (point_cones.size() <= global_id)
@@ -1039,6 +1064,14 @@ public:
             centroids.data(), dummy);
     }
 
+    py::array_t<float> get_sketch() {
+        py::capsule dummy(sketch.data(), [](void*){});
+        return py::array_t<float>(
+            {(py::ssize_t)n, (py::ssize_t)F},
+            {(py::ssize_t)(F * sizeof(float)), (py::ssize_t)sizeof(float)},
+            sketch.data(), dummy);
+    }
+
     bool has_cones(int c) const {
         return c >= 0 && c < nlist && cluster_has_cones[c];
     }
@@ -1111,9 +1144,18 @@ public:
         // Copy query to a local C++ buffer so the GIL can be released for
         // the entire computation section below.
         std::vector<float> q_buf(d);
+        std::vector<float> q_sketch(F);
         {
             auto Q = q_np.unchecked<1>();
             for (int j = 0; j < d; ++j) q_buf[j] = Q(j);
+            // Compute global sketch projection while GIL is still held.
+            const float* ax = axes.data();
+            for (int f = 0; f < F; ++f) {
+                float acc = 0.f;
+                const float* row = ax + (size_t)f * d;
+                for (int j = 0; j < d; ++j) acc += q_buf[j] * row[j];
+                q_sketch[f] = acc;
+            }
         }
         const float* qptr = q_buf.data();
 
@@ -1254,17 +1296,71 @@ public:
                 if (!del_mask[i]) cands.push_back(i);
         }
 
-            // Final L2 rerank
+            // Final rerank — sketch-pruned two-pass.
+            // Pass 1: rank all m candidates by sketch lower-bound (in RAM).
+            //         Compute exact dist for top-M2 only (mmap access).
+            // Pass 2: for the remaining candidates, prune by lower bound;
+            //         compute exact only for survivors.
+            // Correctness: sketch_dist ≤ true_dist (Bessel), so no false negatives.
             int m = (int)cands.size();
-            std::vector<float> sq_dists(m);
-            for (int i = 0; i < m; ++i) {
-                const float* p = _data_ptr + (size_t)cands[i] * d;
-                float acc = 0.f;
-                for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
-                sq_dists[i] = acc;
+            int actual_k = std::min(k, m);
+            int M2 = (m > 3 * k) ? std::min(m, std::max(3 * k, 50)) : m;
+
+            std::vector<float> sq_dists(m, std::numeric_limits<float>::infinity());
+
+            if (M2 >= m || sketch.empty()) {
+                // Small candidate set or no sketch — skip sketch overhead, exact rerank all.
+                for (int i = 0; i < m; ++i) {
+                    const float* p = _data_ptr + (size_t)cands[i] * d;
+                    float acc = 0.f;
+                    for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
+                    sq_dists[i] = acc;
+                }
+            } else {
+                // Compute sketch distances for all m candidates (pure RAM).
+                std::vector<float> sk_dists(m);
+                const float* sk_table = sketch.data();
+                const float* qsk      = q_sketch.data();
+                for (int i = 0; i < m; ++i) {
+                    const float* sk = sk_table + (size_t)cands[i] * F;
+                    float acc = 0.f;
+                    for (int f = 0; f < F; ++f) { float df = qsk[f]-sk[f]; acc += df*df; }
+                    sk_dists[i] = acc;
+                }
+
+                // Partial-sort: indices of top-M2 by sketch distance.
+                std::vector<int> order(m);
+                std::iota(order.begin(), order.end(), 0);
+                std::nth_element(order.begin(), order.begin() + M2, order.end(),
+                    [&](int a, int b){ return sk_dists[a] < sk_dists[b]; });
+
+                // Pass 1: exact distances for top-M2 (mmap access).
+                for (int ii = 0; ii < M2; ++ii) {
+                    int i = order[ii];
+                    const float* p = _data_ptr + (size_t)cands[i] * d;
+                    float acc = 0.f;
+                    for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
+                    sq_dists[i] = acc;
+                }
+
+                // kth exact distance among top-M2 (upper bound on true kth-neighbor dist).
+                std::vector<float> top_m2(M2);
+                for (int ii = 0; ii < M2; ++ii) top_m2[ii] = sq_dists[order[ii]];
+                std::nth_element(top_m2.begin(), top_m2.begin() + actual_k - 1, top_m2.end());
+                float kth_sq = top_m2[actual_k - 1];
+
+                // Pass 2: remaining candidates — prune by lower bound, exact for survivors.
+                for (int ii = M2; ii < m; ++ii) {
+                    int i = order[ii];
+                    if (sk_dists[i] > kth_sq) continue;    // safe: lower bound > threshold
+                    const float* p = _data_ptr + (size_t)cands[i] * d;
+                    float acc = 0.f;
+                    for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
+                    sq_dists[i] = acc;
+                    if (acc < kth_sq) kth_sq = acc;        // tighten threshold
+                }
             }
 
-            int actual_k = std::min(k, m);
             std::vector<int> top_idx(m);
             std::iota(top_idx.begin(), top_idx.end(), 0);
             std::nth_element(top_idx.begin(), top_idx.begin() + actual_k, top_idx.end(),
@@ -1514,7 +1610,34 @@ private:
         }
         del_mask.resize(new_cap, 0);
         point_cones.resize(new_cap);
+        sketch.resize((size_t)new_cap * F, 0.f);
         capacity = new_cap;
+    }
+
+    // Compute sketch[gid*F .. +F] = x @ global_axes^T  (F dot products).
+    // x is the raw (un-normalised, un-centered) stored vector.
+    void _update_sketch_point(uint32_t gid, const float* x) {
+        float* sk = sketch.data() + (size_t)gid * F;
+        const float* ax = axes.data();
+        for (int f = 0; f < F; ++f) {
+            float acc = 0.f;
+            const float* row = ax + (size_t)f * d;
+            for (int j = 0; j < d; ++j) acc += x[j] * row[j];
+            sk[f] = acc;
+        }
+    }
+
+    // Build sketch for all live points via BLAS: sketch (n×F) = data (n×d) @ axes^T (F×d).
+    void _build_sketch_all() {
+        sketch.assign((size_t)capacity * F, 0.f);
+        if (n == 0) return;
+        // Gather live rows into a contiguous buffer, then GEMM.
+        // For mmap-backed data the sequential read is OS-prefetchable.
+        ampi::sgemm((int)n, F, d,
+                    _data_ptr, d,
+                    axes.data(), d,
+                    sketch.data(), F,
+                    /*transA=*/false, /*transB=*/true);
     }
 
     bool _update_drift_and_check(int c, const float* v) {
@@ -2033,6 +2156,10 @@ PYBIND11_MODULE(_ampi_ext, m) {
              "Zero-copy (n,) uint8 numpy view (1 = deleted).")
         .def("get_centroids",      &AMPIIndex::get_centroids,
              "Zero-copy (nlist, d) float32 numpy view of centroids.")
+        .def("get_sketch",         &AMPIIndex::get_sketch,
+             "Zero-copy (n, F) float32 view of global-axis sketch table.\n\n"
+             "sketch[gid, f] = dot(x_gid, global_axis_f).\n"
+             "||sketch(q)-sketch(x)||² ≤ ||q-x||² (Bessel lower bound).")
         .def("has_cones",          &AMPIIndex::has_cones, py::arg("c"),
              "True if cluster c has initialised SortedCones.")
         .def("get_cluster_global", &AMPIIndex::get_cluster_global, py::arg("c"),
