@@ -465,8 +465,9 @@ public:
     // Stored behind unique_ptr so AMPIIndex remains movable (shared_mutex is not).
     std::unique_ptr<std::shared_mutex> p_mutex = std::make_unique<std::shared_mutex>();
 
-    std::vector<float> axes;       // F * d (immutable after build)
-    std::vector<float> centroids;  // nlist * d (EMA-updated)
+    std::vector<float> axes;                // F * d (immutable after build)
+    std::vector<float> centroids;           // nlist * d (EMA-updated)
+    std::vector<float> centroid_norms_sq;   // nlist floats: ||centroid_c||²
 
     std::vector<int64_t>  cluster_counts;
     std::vector<int64_t>  cluster_tombstones;
@@ -516,6 +517,7 @@ public:
           drift_theta(o.drift_theta), cosine_metric(o.cosine_metric),
           axes(std::move(o.axes)),
           centroids(std::move(o.centroids)),
+          centroid_norms_sq(std::move(o.centroid_norms_sq)),
           cluster_counts(std::move(o.cluster_counts)),
           cluster_tombstones(std::move(o.cluster_tombstones)),
           U_drift(std::move(o.U_drift)),
@@ -650,6 +652,7 @@ public:
 
         idx._build_sketch_all();
         idx._build_norms_all();
+        idx._build_centroid_norms();
         return idx;
     }
 
@@ -777,6 +780,7 @@ public:
             }
         }
         idx._build_norms_all();
+        idx._build_centroid_norms();
 
         return idx;
     }
@@ -872,16 +876,19 @@ public:
             point_cones.resize(global_id + 1);
         point_cones[global_id].clear();
 
-        // Top-K cluster assignment
+        // Top-K cluster assignment — ||x − cent_c||² = x_sq + ||cent_c||² − 2*(cent_c·x)
         int K_c = std::min(cone_top_k, nlist);
         std::vector<std::pair<float,int>> cdists(nlist);
-        for (int c = 0; c < nlist; ++c) {
-            float acc = 0.f;
-            const float* cent = &centroids[c * d];
-            for (int j = 0; j < d; ++j) {
-                float diff = cent[j] - x[j]; acc += diff * diff;
-            }
-            cdists[c] = {acc, c};
+        {
+            float x_sq = norms[global_id];   // set by _update_norm_point above
+            std::vector<float> c_dots(nlist);
+            ampi::sgemm(nlist, 1, d,
+                        centroids.data(), d,
+                        x, 1,
+                        c_dots.data(), 1,
+                        /*transA=*/false, /*transB=*/false);
+            for (int c = 0; c < nlist; ++c)
+                cdists[c] = {x_sq + centroid_norms_sq[c] - 2.f * c_dots[c], c};
         }
         std::nth_element(cdists.begin(), cdists.begin() + K_c, cdists.end());
         std::sort(cdists.begin(), cdists.begin() + K_c);
@@ -901,10 +908,12 @@ public:
             // Project onto per-cluster axes (or global if not yet computed).
             const float* local_axes_c = cluster_axes[c].empty()
                                         ? axes.data() : cluster_axes[c].data();
-            std::vector<float> proj(F, 0.f);
-            for (int l = 0; l < F; ++l)
-                for (int j = 0; j < d; ++j)
-                    proj[l] += centered[j] * local_axes_c[l * d + j];
+            std::vector<float> proj(F);
+            ampi::sgemm(F, 1, d,
+                        local_axes_c, d,
+                        centered.data(), 1,
+                        proj.data(), 1,
+                        /*transA=*/false, /*transB=*/false);
 
             // Top-K fan cones by |normed proj|
             int K_f = std::min(cone_top_k, F);
@@ -942,8 +951,12 @@ public:
             int64_t N = cluster_counts[c];
             float inv_Np1 = 1.f / float(N + 1);
             float* cp = &centroids[c * d];
-            for (int j = 0; j < d; ++j)
+            float nsq = 0.f;
+            for (int j = 0; j < d; ++j) {
                 cp[j] = (float(N) * cp[j] + x[j]) * inv_Np1;
+                nsq += cp[j] * cp[j];
+            }
+            centroid_norms_sq[c] = nsq;
             cluster_counts[c] = N + 1;
 
             // Drift EMA + power iteration
@@ -1156,13 +1169,11 @@ public:
             auto Q = q_np.unchecked<1>();
             for (int j = 0; j < d; ++j) q_buf[j] = Q(j);
             // Compute global sketch projection while GIL is still held.
-            const float* ax = axes.data();
-            for (int f = 0; f < F; ++f) {
-                float acc = 0.f;
-                const float* row = ax + (size_t)f * d;
-                for (int j = 0; j < d; ++j) acc += q_buf[j] * row[j];
-                q_sketch[f] = acc;
-            }
+            ampi::sgemm(F, 1, d,
+                        axes.data(), d,
+                        q_buf.data(), 1,
+                        q_sketch.data(), 1,
+                        /*transA=*/false, /*transB=*/false);
         }
         const float* qptr = q_buf.data();
         float q_sq = 0.f;
@@ -1177,13 +1188,18 @@ public:
             std::shared_lock<std::shared_mutex> lk(*p_mutex);
 
         // ── Step 1: top probes clusters ───────────────────────────────────────
+        // ||q − cent_c||² = q_sq + ||cent_c||² − 2*(cent_c·q)
         int K_c = std::min(probes, nlist);
         std::vector<std::pair<float,int>> cdists(nlist);
-        for (int c = 0; c < nlist; ++c) {
-            float acc = 0.f;
-            const float* cent = &centroids[c * d];
-            for (int j = 0; j < d; ++j) { float diff = cent[j]-qptr[j]; acc += diff*diff; }
-            cdists[c] = {acc, c};
+        {
+            std::vector<float> c_dots(nlist);
+            ampi::sgemm(nlist, 1, d,
+                        centroids.data(), d,
+                        qptr, 1,
+                        c_dots.data(), 1,
+                        /*transA=*/false, /*transB=*/false);
+            for (int c = 0; c < nlist; ++c)
+                cdists[c] = {q_sq + centroid_norms_sq[c] - 2.f * c_dots[c], c};
         }
         std::nth_element(cdists.begin(), cdists.begin() + K_c, cdists.end());
         std::sort(cdists.begin(), cdists.begin() + K_c);
@@ -1218,13 +1234,12 @@ public:
             // Use per-cluster axes if available, else global.
             const float* local_axes_c = cluster_axes[c].empty()
                                         ? axes.data() : cluster_axes[c].data();
-            std::vector<float> q_proj(F, 0.f);
-            for (int l = 0; l < F; ++l) {
-                const float* al = local_axes_c + l * d;
-                float dot = 0.f;
-                for (int j = 0; j < d; ++j) dot += q_centered[j] * al[j];
-                q_proj[l] = dot;
-            }
+            std::vector<float> q_proj(F);
+            ampi::sgemm(F, 1, d,
+                        local_axes_c, d,
+                        q_centered.data(), 1,
+                        q_proj.data(), 1,
+                        /*transA=*/false, /*transB=*/false);
 
             int K_f = std::min(fan_probes, F);
             std::vector<std::pair<float,int>> fsc(F);
@@ -1409,9 +1424,10 @@ public:
                                   ", got " + std::to_string(q_np.shape(0)));
 
         std::vector<float> q_buf(d);
+        float q_sq = 0.f;
         {
             auto Q = q_np.unchecked<1>();
-            for (int j = 0; j < d; ++j) q_buf[j] = Q(j);
+            for (int j = 0; j < d; ++j) { q_buf[j] = Q(j); q_sq += Q(j) * Q(j); }
         }
         const float* qptr = q_buf.data();
 
@@ -1421,13 +1437,18 @@ public:
             py::gil_scoped_release rel;
             std::shared_lock<std::shared_mutex> lk(*p_mutex);
 
+        // ||q − cent_c||² = q_sq + ||cent_c||² − 2*(cent_c·q)
         int K_c = std::min(probes, nlist);
         std::vector<std::pair<float,int>> cdists(nlist);
-        for (int c = 0; c < nlist; ++c) {
-            float acc = 0.f;
-            const float* cent = &centroids[c * d];
-            for (int j = 0; j < d; ++j) { float diff = cent[j]-qptr[j]; acc += diff*diff; }
-            cdists[c] = {acc, c};
+        {
+            std::vector<float> c_dots(nlist);
+            ampi::sgemm(nlist, 1, d,
+                        centroids.data(), d,
+                        qptr, 1,
+                        c_dots.data(), 1,
+                        /*transA=*/false, /*transB=*/false);
+            for (int c = 0; c < nlist; ++c)
+                cdists[c] = {q_sq + centroid_norms_sq[c] - 2.f * c_dots[c], c};
         }
         std::nth_element(cdists.begin(), cdists.begin() + K_c, cdists.end());
         std::sort(cdists.begin(), cdists.begin() + K_c);
@@ -1456,13 +1477,12 @@ public:
 
             const float* local_axes_c = cluster_axes[c].empty()
                                         ? axes.data() : cluster_axes[c].data();
-            std::vector<float> q_proj(F, 0.f);
-            for (int l = 0; l < F; ++l) {
-                const float* al = local_axes_c + l * d;
-                float dot = 0.f;
-                for (int j = 0; j < d; ++j) dot += q_centered[j] * al[j];
-                q_proj[l] = dot;
-            }
+            std::vector<float> q_proj(F);
+            ampi::sgemm(F, 1, d,
+                        local_axes_c, d,
+                        q_centered.data(), 1,
+                        q_proj.data(), 1,
+                        /*transA=*/false, /*transB=*/false);
 
             int K_f = std::min(fan_probes, F);
             std::vector<std::pair<float,int>> fsc(F);
@@ -1621,17 +1641,15 @@ private:
         capacity = new_cap;
     }
 
-    // Compute sketch[gid*F .. +F] = x @ global_axes^T  (F dot products).
+    // Compute sketch[gid*F .. +F] = axes[F×d] @ x[d]  — single BLAS call.
     // x is the raw (un-normalised, un-centered) stored vector.
     void _update_sketch_point(uint32_t gid, const float* x) {
         float* sk = sketch.data() + (size_t)gid * F;
-        const float* ax = axes.data();
-        for (int f = 0; f < F; ++f) {
-            float acc = 0.f;
-            const float* row = ax + (size_t)f * d;
-            for (int j = 0; j < d; ++j) acc += x[j] * row[j];
-            sk[f] = acc;
-        }
+        ampi::sgemm(F, 1, d,
+                    axes.data(), d,
+                    x, 1,
+                    sk, 1,
+                    /*transA=*/false, /*transB=*/false);
     }
 
     // Build sketch for all live points via BLAS: sketch (n×F) = data (n×d) @ axes^T (F×d).
@@ -1647,18 +1665,55 @@ private:
                     /*transA=*/false, /*transB=*/true);
     }
 
-    // Precompute norms[i] = ||x_i||² for all live points (sequential scan).
+    // Precompute centroid_norms_sq[c] = ||centroid_c||² for all clusters.
+    // Called once after build and kept up-to-date on EMA updates and merges.
+    void _build_centroid_norms() {
+        centroid_norms_sq.assign(nlist, 0.f);
+        for (int c = 0; c < nlist; ++c) {
+            const float* cp = &centroids[c * d];
+            float nsq = 0.f;
+            for (int j = 0; j < d; ++j) nsq += cp[j] * cp[j];
+            centroid_norms_sq[c] = nsq;
+        }
+    }
+
+    // Precompute norms[i] = ||x_i||² for all live points.
     // Invariant: global_id == sequential position in _data_ptr (deletes never
     // compact the buffer, so _data_ptr[i*d] always holds the vector for global_id i).
     // Deleted points are skipped — their norms are never read by _rerank_blas.
+    //
+    // Strategy: process rows in chunks; square each live row into a contiguous
+    // buffer, then call sgemm(B, 1, d) @ ones[d] to reduce the squares to a
+    // scalar per row — same BLAS backend used by _rerank_blas and _build_sketch_all.
     void _build_norms_all() {
         norms.assign(capacity, 0.f);
-        for (uint32_t i = 0; i < n; ++i) {
-            if (del_mask[i]) continue;
-            const float* p = _data_ptr + (size_t)i * d;
-            float ns = 0.f;
-            for (int j = 0; j < d; ++j) ns += p[j] * p[j];
-            norms[i] = ns;
+        if (n == 0) return;
+
+        const int CHUNK = 1024;
+        std::vector<float> sq_buf((size_t)CHUNK * d);
+        std::vector<float> ones(d, 1.0f);
+
+        for (uint32_t base = 0; base < n; base += (uint32_t)CHUNK) {
+            int B = (int)std::min((uint32_t)CHUNK, n - base);
+
+            // Square live rows into sq_buf; zero deleted rows so GEMM writes
+            // 0 into norms[i] (harmless — those entries are never read).
+            for (int b = 0; b < B; ++b) {
+                float* dst = sq_buf.data() + (size_t)b * d;
+                if (del_mask[base + b]) {
+                    std::memset(dst, 0, (size_t)d * sizeof(float));
+                    continue;
+                }
+                const float* src = _data_ptr + (size_t)(base + b) * d;
+                for (int j = 0; j < d; ++j) dst[j] = src[j] * src[j];
+            }
+
+            // norms[base : base+B] = sq_buf[B×d] @ ones[d×1]
+            ampi::sgemm(B, 1, d,
+                        sq_buf.data(), d,
+                        ones.data(), 1,
+                        norms.data() + base, 1,
+                        /*transA=*/false, /*transB=*/false);
         }
     }
 
@@ -1882,11 +1937,16 @@ private:
         float* mu_k      = &centroids[keep * d];
         const float* mu_f = &centroids[fold * d];
         float inv_N = 1.0f / (float)N_total;
-        for (int j = 0; j < d; ++j)
+        float nsq = 0.f;
+        for (int j = 0; j < d; ++j) {
             mu_k[j] = ((float)N_k * mu_k[j] + (float)N_f * mu_f[j]) * inv_N;
+            nsq += mu_k[j] * mu_k[j];
+        }
+        centroid_norms_sq[keep] = nsq;
         // Redirect fold's centroid so new inserts near that region go to keep.
         for (int j = 0; j < d; ++j)
             centroids[fold * d + j] = mu_k[j];
+        centroid_norms_sq[fold] = nsq;
 
         // Append fold's live points to keep's cluster_global.
         auto& cg_fold = cluster_global[fold];
