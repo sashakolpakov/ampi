@@ -1648,9 +1648,13 @@ private:
     }
 
     // Precompute norms[i] = ||x_i||² for all live points (sequential scan).
+    // Invariant: global_id == sequential position in _data_ptr (deletes never
+    // compact the buffer, so _data_ptr[i*d] always holds the vector for global_id i).
+    // Deleted points are skipped — their norms are never read by _rerank_blas.
     void _build_norms_all() {
         norms.assign(capacity, 0.f);
         for (uint32_t i = 0; i < n; ++i) {
+            if (del_mask[i]) continue;
             const float* p = _data_ptr + (size_t)i * d;
             float ns = 0.f;
             for (int j = 0; j < d; ++j) ns += p[j] * p[j];

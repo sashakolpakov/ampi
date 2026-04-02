@@ -1004,6 +1004,70 @@ def bounds_checks_raise_python_exceptions():
         pass
 
 
+# ── _build_norms_all / _rerank_blas correctness ──────────────────────────────
+
+@_register
+def rerank_blas_norms_at_construction():
+    """Returned sq_dists must match exact L2² distances — verifies _build_norms_all
+    populated norms[global_id] correctly at construction so _rerank_blas can use them."""
+    rng  = np.random.default_rng(400)
+    n, d = 500, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+    idx  = AMPIAffineFanIndex(data, nlist=16, num_fans=8, seed=0)
+    if idx._cpp is None:
+        return  # no C++ ext; skip
+
+    cpp = idx._cpp
+    q   = rng.standard_normal(d).astype('float32')
+    k   = 20
+
+    sq_dists_cpp, ids_cpp = cpp.query(
+        q, k=k, window_size=500, probes=idx.nlist, fan_probes=idx.F)
+
+    # Exact sq distances for the returned ids.
+    exact = np.sum((data[ids_cpp.astype(int)] - q) ** 2, axis=1).astype('float32')
+    np.testing.assert_allclose(
+        sq_dists_cpp, exact, rtol=1e-4, atol=1e-4,
+        err_msg="sq_dists from _rerank_blas disagree with exact L2² — norms likely wrong")
+
+
+@_register
+def rerank_blas_norms_after_deletion():
+    """After deleting ~half the points, sq_dists for survivors must still be exact.
+    Confirms that del_mask skipping in _build_norms_all does not corrupt live norms,
+    and that norms[global_id] indexing stays correct across the deleted gaps."""
+    rng  = np.random.default_rng(401)
+    n, d = 600, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+    idx  = AMPIAffineFanIndex(data, nlist=16, num_fans=8, seed=0)
+    if idx._cpp is None:
+        return
+
+    cpp = idx._cpp
+
+    # Delete every other point from the first half — creates gaps in global_id space.
+    deleted = set(range(0, n // 2, 2))
+    for gid in deleted:
+        cpp.remove(gid)
+
+    q = rng.standard_normal(d).astype('float32')
+    k = 10
+
+    sq_dists_cpp, ids_cpp = cpp.query(
+        q, k=k, window_size=500, probes=idx.nlist, fan_probes=idx.F)
+
+    # No deleted id should appear.
+    leaked = set(ids_cpp.tolist()) & deleted
+    assert not leaked, f"deleted ids {leaked} appeared in query results"
+
+    # Exact sq distances for the returned ids must match.
+    ids_int = ids_cpp.astype(int)
+    exact = np.sum((data[ids_int] - q) ** 2, axis=1).astype('float32')
+    np.testing.assert_allclose(
+        sq_dists_cpp, exact, rtol=1e-4, atol=1e-4,
+        err_msg="sq_dists wrong after deletion — norms[global_id] indexing broken")
+
+
 # ── runner ────────────────────────────────────────────────────────────────────
 
 def main():
