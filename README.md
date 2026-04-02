@@ -66,8 +66,11 @@ query loop, cone build, and local refresh.  A `std::shared_mutex` allows
 concurrent reads with serialised writes.  `project_data` dispatches to
 `cblas_sgemm` via `ampi/_gemm.hpp` (Accelerate on macOS, OpenBLAS / MKL on
 Linux/Windows, or a tiled AVX2/NEON micro-kernel fallback) — 20–112× faster
-than a scalar loop.  A numba JIT fallback is used automatically when the
-compiled extension is absent.
+than a scalar loop.  L2 reranking also uses BLAS: candidates are gathered into
+a contiguous buffer and distances computed as a single matrix-vector multiply
+using precomputed norms (`‖xᵢ‖²` stored at insert time), eliminating all
+scalar distance loops from the query hot path.  A numba JIT fallback is used
+automatically when the compiled extension is absent.
 
 ---
 

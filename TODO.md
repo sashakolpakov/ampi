@@ -88,6 +88,29 @@ See **DATABASE_PLAN.md** for the concrete phased implementation plan.
       (input copied to C++ buffer before release; output arrays allocated after reacquire)
       → Python threads can now call `query` in parallel without serialisation.
 
+### Sketch-based lazy rerank (done 2026-04-01)
+- [x] `sketch[gid, f] = dot(x_gid, global_axis_f)` stored in RAM (n×F float32, ~26 MB at 200k).
+- [x] Bessel lower bound: `sketch_dist(q,x) ≤ ||q-x||²` — safe to prune without false negatives.
+- [x] Two-pass query: exact for top-M₂=max(3k,50) sketch-ordered candidates; prune rest via bound.
+- [x] `_build_sketch_all()` (sgemm) used by `from_build`; `_update_sketch_point()` used by `add()`.
+- [x] Streaming build saves `_sketch.dat`; `from_stream` auto-loads it (falls back to sgemm).
+- [x] GIST 200k warm-cache result: recall preserved (R@10 0.975 vs 0.964), QPS ≈28 vs 31.
+      Warm cache: sketch overhead > mmap savings. Cold cache and lower d (SIFT d=128, F/d=12.5%)
+      would show larger gains. Full analysis in BENCHMARKS.md.
+
+### BLAS rerank (done 2026-04-02)
+- [x] `norms[gid] = ||x_gid||²` stored in RAM (n×float32, ~0.8 MB at 200k); built by
+      `_build_norms_all()`, updated by `_update_norm_point()` on every insert.
+- [x] `_rerank_blas(cands, qptr, q_sq, sq_dists)`: gather + single SGEMM call +
+      finalise via `q_sq + norms[cands[i]] - 2·dot`. Replaces all scalar L2 loops in
+      the query hot path (no-sketch branch, sketch pass-1 batch, sketch pass-2 survivors,
+      and the coverage-check `dists_tmp` loop).
+- [x] Standalone `l2_distances` scalar dot loop also replaced with `ampi::sgemm`.
+- [x] `from_build` and `from_stream` both call `_build_norms_all()` after `_build_sketch_all()`.
+- [x] Net benchmark gains: GIST +138% over sketch-only (regression reversed, +23% net
+      over pre-sketch); Fashion +65% net; GloVe +33% net; SIFT +20% net.
+      Full analysis in BENCHMARKS.md.
+
 ---
 
 ## 3. Distributed Architecture (Phase 3 — not started)

@@ -118,14 +118,13 @@ py::array_t<float> l2_distances(
         row_norms2[i] = ns;
     }
 
-    // dots[i] = gathered[i,:] · q  — sequential access, auto-vectorised by compiler
+    // dots[i] = gathered[i,:] · q  — single BLAS SGEMM call
     std::vector<float> dots(m, 0.f);
-    for (int64_t i = 0; i < m; ++i) {
-        const float* row = gathered.data() + i * d;
-        float dot = 0.f;
-        for (int64_t j = 0; j < d; ++j) dot += row[j] * qptr[j];
-        dots[i] = dot;
-    }
+    ampi::sgemm((int)m, 1, (int)d,
+                gathered.data(), (int)d,
+                qptr, 1,
+                dots.data(), 1,
+                false, false);
 
     for (int64_t i = 0; i < m; ++i)
         out_buf(i) = row_norms2[i] + q_norm2 - 2.f * dots[i];
@@ -484,6 +483,10 @@ public:
     // Used as a cheap in-RAM lower bound to prune candidates before mmap access.
     std::vector<float> sketch;   // capacity × F, row-major
 
+    // Precomputed squared L2 norms: norms[gid] = ||x_gid||².
+    // Used by _rerank_blas to avoid recomputing per-row norms during gather.
+    std::vector<float> norms;    // capacity, one float per point
+
     // point_cones[gid] = {(cluster, fan), ...}
     std::vector<std::vector<std::pair<uint16_t,uint16_t>>> point_cones;
 
@@ -521,6 +524,7 @@ public:
           cluster_has_cones(std::move(o.cluster_has_cones)),
           cluster_axes(std::move(o.cluster_axes)),
           sketch(std::move(o.sketch)),
+          norms(std::move(o.norms)),
           point_cones(std::move(o.point_cones)),
           merge_interval(o.merge_interval),
           eps_merge(o.eps_merge),
@@ -645,6 +649,7 @@ public:
         }
 
         idx._build_sketch_all();
+        idx._build_norms_all();
         return idx;
     }
 
@@ -771,6 +776,7 @@ public:
                 idx._build_sketch_all();
             }
         }
+        idx._build_norms_all();
 
         return idx;
     }
@@ -859,6 +865,7 @@ public:
         std::copy(x, x + d, _data_ptr + (size_t)n * d);
         del_mask[n] = 0;
         _update_sketch_point(global_id, x);
+        _update_norm_point(global_id, x);
         ++n;
 
         if (point_cones.size() <= global_id)
@@ -1158,6 +1165,8 @@ public:
             }
         }
         const float* qptr = q_buf.data();
+        float q_sq = 0.f;
+        for (int j = 0; j < d; ++j) q_sq += qptr[j] * qptr[j];
 
         // Results filled by the GIL-free section.
         std::vector<float>    result_dists;
@@ -1265,12 +1274,7 @@ public:
             // Compute kth squared distance for coverage check
             int m = (int)cands.size();
             std::vector<float> dists_tmp(m);
-            for (int i = 0; i < m; ++i) {
-                const float* p = _data_ptr + (size_t)cands[i] * d;
-                float acc = 0.f;
-                for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
-                dists_tmp[i] = acc;
-            }
+            _rerank_blas(cands, qptr, q_sq, dists_tmp);
             std::nth_element(dists_tmp.begin(), dists_tmp.begin() + k - 1, dists_tmp.end());
             float kth_sq   = dists_tmp[k - 1];
             float kth_proj = std::sqrt(std::max(0.f, kth_sq));
@@ -1309,13 +1313,8 @@ public:
             std::vector<float> sq_dists(m, std::numeric_limits<float>::infinity());
 
             if (M2 >= m || sketch.empty()) {
-                // Small candidate set or no sketch — skip sketch overhead, exact rerank all.
-                for (int i = 0; i < m; ++i) {
-                    const float* p = _data_ptr + (size_t)cands[i] * d;
-                    float acc = 0.f;
-                    for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
-                    sq_dists[i] = acc;
-                }
+                // Small candidate set or no sketch — BLAS rerank all at once.
+                _rerank_blas(cands, qptr, q_sq, sq_dists);
             } else {
                 // Compute sketch distances for all m candidates (pure RAM).
                 std::vector<float> sk_dists(m);
@@ -1334,13 +1333,13 @@ public:
                 std::nth_element(order.begin(), order.begin() + M2, order.end(),
                     [&](int a, int b){ return sk_dists[a] < sk_dists[b]; });
 
-                // Pass 1: exact distances for top-M2 (mmap access).
-                for (int ii = 0; ii < M2; ++ii) {
-                    int i = order[ii];
-                    const float* p = _data_ptr + (size_t)cands[i] * d;
-                    float acc = 0.f;
-                    for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
-                    sq_dists[i] = acc;
+                // Pass 1: BLAS exact distances for top-M2 candidates (mmap access).
+                {
+                    std::vector<uint32_t> pass1_cands(M2);
+                    for (int ii = 0; ii < M2; ++ii) pass1_cands[ii] = cands[order[ii]];
+                    std::vector<float> pass1_dists(M2);
+                    _rerank_blas(pass1_cands, qptr, q_sq, pass1_dists);
+                    for (int ii = 0; ii < M2; ++ii) sq_dists[order[ii]] = pass1_dists[ii];
                 }
 
                 // kth exact distance among top-M2 (upper bound on true kth-neighbor dist).
@@ -1349,15 +1348,22 @@ public:
                 std::nth_element(top_m2.begin(), top_m2.begin() + actual_k - 1, top_m2.end());
                 float kth_sq = top_m2[actual_k - 1];
 
-                // Pass 2: remaining candidates — prune by lower bound, exact for survivors.
-                for (int ii = M2; ii < m; ++ii) {
-                    int i = order[ii];
-                    if (sk_dists[i] > kth_sq) continue;    // safe: lower bound > threshold
-                    const float* p = _data_ptr + (size_t)cands[i] * d;
-                    float acc = 0.f;
-                    for (int j = 0; j < d; ++j) { float diff = p[j]-qptr[j]; acc += diff*diff; }
-                    sq_dists[i] = acc;
-                    if (acc < kth_sq) kth_sq = acc;        // tighten threshold
+                // Pass 2: collect surviving candidates, BLAS rerank in one batch.
+                {
+                    std::vector<int> survivors;
+                    survivors.reserve(m - M2);
+                    for (int ii = M2; ii < m; ++ii)
+                        if (sk_dists[order[ii]] <= kth_sq)   // safe: lower bound ≤ threshold
+                            survivors.push_back(order[ii]);
+                    if (!survivors.empty()) {
+                        std::vector<uint32_t> surv_cands(survivors.size());
+                        for (int s = 0; s < (int)survivors.size(); ++s)
+                            surv_cands[s] = cands[survivors[s]];
+                        std::vector<float> surv_dists(survivors.size());
+                        _rerank_blas(surv_cands, qptr, q_sq, surv_dists);
+                        for (int s = 0; s < (int)survivors.size(); ++s)
+                            sq_dists[survivors[s]] = surv_dists[s];
+                    }
                 }
             }
 
@@ -1611,6 +1617,7 @@ private:
         del_mask.resize(new_cap, 0);
         point_cones.resize(new_cap);
         sketch.resize((size_t)new_cap * F, 0.f);
+        norms.resize(new_cap, 0.f);
         capacity = new_cap;
     }
 
@@ -1638,6 +1645,48 @@ private:
                     axes.data(), d,
                     sketch.data(), F,
                     /*transA=*/false, /*transB=*/true);
+    }
+
+    // Precompute norms[i] = ||x_i||² for all live points (sequential scan).
+    void _build_norms_all() {
+        norms.assign(capacity, 0.f);
+        for (uint32_t i = 0; i < n; ++i) {
+            const float* p = _data_ptr + (size_t)i * d;
+            float ns = 0.f;
+            for (int j = 0; j < d; ++j) ns += p[j] * p[j];
+            norms[i] = ns;
+        }
+    }
+
+    // Store norms[gid] = ||x||² for a single freshly-inserted point.
+    void _update_norm_point(uint32_t gid, const float* x) {
+        if (gid >= (uint32_t)norms.size()) norms.resize(gid + 1, 0.f);
+        float ns = 0.f;
+        for (int j = 0; j < d; ++j) ns += x[j] * x[j];
+        norms[gid] = ns;
+    }
+
+    // Batch exact L2 rerank using BLAS SGEMM + precomputed norms.
+    // sq_dists must be pre-sized to cands.size(). Overwrites sq_dists.
+    // ||q - xi||² = q_sq + norms[i] - 2 * dot(xi, q)
+    void _rerank_blas(const std::vector<uint32_t>& cands, const float* qptr,
+                      float q_sq, std::vector<float>& sq_dists) {
+        int m = (int)cands.size();
+        if (m == 0) return;
+        // Gather candidate rows into a contiguous buffer (sequential write).
+        std::vector<float> gathered((size_t)m * d);
+        for (int i = 0; i < m; ++i)
+            memcpy(gathered.data() + (size_t)i * d,
+                   _data_ptr + (size_t)cands[i] * d, (size_t)d * sizeof(float));
+        // dots[i] = gathered[i,:] · q  — single SGEMM call, Accelerate/OpenBLAS/MKL
+        ampi::sgemm(m, 1, d,
+                    gathered.data(), d,
+                    qptr, 1,
+                    sq_dists.data(), 1,
+                    /*transA=*/false, /*transB=*/false);
+        // finalise: ||q - xi||² = q_sq + ||xi||² - 2*dot
+        for (int i = 0; i < m; ++i)
+            sq_dists[i] = q_sq + norms[cands[i]] - 2.f * sq_dists[i];
     }
 
     bool _update_drift_and_check(int c, const float* v) {

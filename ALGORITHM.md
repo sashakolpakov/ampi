@@ -361,11 +361,20 @@ expected-value analysis.
 Compute squared L2 distances for all collected candidates:
 
 ```
-dist²(q, xᵢ) = Σⱼ (qⱼ − xᵢⱼ)²    ∀ i ∈ cands
+dist²(q, xᵢ) = ‖q‖² + ‖xᵢ‖² − 2·〈q, xᵢ〉    ∀ i ∈ cands
 ```
 
-Return the k indices with smallest dist².  Implemented via `l2_distances`
-(C++ or numba JIT) + `np.argsort`.  Cost: O(|cands| · d).
+Implemented via `_rerank_blas` in C++:
+
+1. **Gather** — copy candidate vectors into a contiguous `m × d` buffer.
+2. **SGEMM** — call `ampi::sgemm(m, 1, d, ...)` to compute all `m` dot
+   products `〈xᵢ, q〉` in a single matrix-vector multiply.
+3. **Finalise** — `dist²(q,xᵢ) = q_sq + norms[i] − 2·dot[i]` where
+   `q_sq = ‖q‖²` (computed once per query) and `norms[i] = ‖xᵢ‖²`
+   (precomputed at build time, updated on every insert).
+
+Return the k indices with smallest dist².  Cost: O(|cands| · d), but with
+BLAS-level throughput — no scalar inner loops remain in the query hot path.
 
 ### 4.5 Adaptive window expansion with early stopping
 
