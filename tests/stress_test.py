@@ -73,7 +73,7 @@ def _register(fn):
 # ── scenarios ────────────────────────────────────────────────────────────────
 
 @_register
-def insert_findability():
+def test_insert_findability():
     """Inserted spike must be the exact nearest neighbour when queried."""
     idx, _, _ = _small_index()
     d   = idx.d
@@ -85,7 +85,7 @@ def insert_findability():
 
 
 @_register
-def delete_no_false_positive():
+def test_delete_no_false_positive():
     """After deleting a spike, it must never appear in any query result."""
     idx, _, rng = _small_index()
     d   = idx.d
@@ -109,7 +109,7 @@ def delete_no_false_positive():
 
 
 @_register
-def update_correctness():
+def test_update_correctness():
     """After update(id, y): old id gone, new id findable at y."""
     idx, _, _ = _small_index()
     d = idx.d
@@ -129,7 +129,7 @@ def update_correctness():
 
 
 @_register
-def double_delete_is_noop():
+def test_double_delete_is_noop():
     """Deleting the same id twice must not change _n_deleted after the first call."""
     idx, _, _ = _small_index()
     gid = idx.add(_spike(idx.d, 0))
@@ -143,7 +143,7 @@ def double_delete_is_noop():
 
 
 @_register
-def invalid_delete_raises():
+def test_invalid_delete_raises():
     """delete() with an out-of-range id must raise IndexError."""
     idx, _, _ = _small_index()
     for bad in (-1, idx.n, idx.n + 9999):
@@ -155,7 +155,7 @@ def invalid_delete_raises():
 
 
 @_register
-def outlier_insert():
+def test_outlier_insert():
     """Insert a point far outside the training distribution; it must be findable."""
     idx, _, _ = _small_index()
     d   = idx.d
@@ -167,7 +167,7 @@ def outlier_insert():
 
 
 @_register
-def zero_vector_insert():
+def test_zero_vector_insert():
     """Inserting a zero vector must not crash (edge case for normalisation)."""
     idx, _, _ = _small_index()
     z   = np.zeros(idx.d, dtype='float32')
@@ -178,7 +178,7 @@ def zero_vector_insert():
 
 
 @_register
-def boundary_insert_cone_top_k2():
+def test_boundary_insert_cone_top_k2():
     """With cone_top_k=2 a boundary point lives in 2 clusters; delete removes it from both."""
     idx, _, rng = _small_index(K=2)
     d = idx.d
@@ -200,7 +200,7 @@ def boundary_insert_cone_top_k2():
 
 
 @_register
-def bulk_add_recall():
+def test_bulk_add_recall():
     """Add 300 points; each must be findable (recall@1 >= 0.95 across added points)."""
     idx, data, rng = _small_index(n=2000, d=32)
     extras = rng.standard_normal((300, idx.d)).astype('float32')
@@ -219,7 +219,7 @@ def bulk_add_recall():
 
 
 @_register
-def high_deletion_recall():
+def test_high_deletion_recall():
     """Delete 20 % of original points; recall@10 on remaining must stay >= 0.80."""
     idx, data, rng = _small_index(n=2000, d=32, nlist=20, F=16)
     n_del = 400
@@ -254,7 +254,7 @@ def high_deletion_recall():
 
 
 @_register
-def tombstone_compaction_fires():
+def test_tombstone_compaction_fires():
     """Exceed _TOMBSTONE_THRESHOLD in one cluster; _cluster_tombstones must reset."""
     from ampi.affine_fan import _TOMBSTONE_THRESHOLD
 
@@ -285,7 +285,7 @@ def tombstone_compaction_fires():
 
 
 @_register
-def drift_detection_fires():
+def test_drift_detection_simple():
     """Insert many points along e_0; drift check must eventually trigger a refresh."""
     n, d = 1000, 32
     nlist = 10
@@ -313,7 +313,7 @@ def drift_detection_fires():
 
 
 @_register
-def all_cluster_points_deleted():
+def test_all_cluster_points_deleted():
     """Delete every point in one cluster; subsequent queries must not crash or return those ids."""
     n, d, nlist = 500, 16, 5
     rng  = np.random.default_rng(11)
@@ -333,7 +333,7 @@ def all_cluster_points_deleted():
 
 
 @_register
-def cosine_metric_add_delete():
+def test_cosine_metric_add_delete():
     """add/delete work correctly under the cosine metric."""
     n, d = 2000, 32
     rng  = np.random.default_rng(13)
@@ -353,7 +353,7 @@ def cosine_metric_add_delete():
 
 
 @_register
-def interleaved_mutations_and_queries():
+def test_interleaved_mutations_and_queries():
     """Alternating add/delete/query must stay consistent at every step."""
     idx, _, rng = _small_index(n=1000, d=16, nlist=10, F=8)
     d = idx.d
@@ -386,7 +386,7 @@ def interleaved_mutations_and_queries():
 
 
 @_register
-def heavy_churn_recall():
+def test_heavy_churn_recall():
     """200 adds + 200 deletes interleaved; recall@10 vs brute force >= 0.75."""
     n, d = 2000, 32
     rng  = np.random.default_rng(17)
@@ -432,7 +432,7 @@ def heavy_churn_recall():
 # ── periodic merge ───────────────────────────────────────────────────────────
 
 @_register
-def periodic_merge_reduces_cluster_count():
+def test_periodic_merge_reduces_cluster_count():
     """Two near-identical tight clusters must be folded into one by periodic_merge."""
     rng = np.random.default_rng(20)
     d   = 16
@@ -460,7 +460,7 @@ def periodic_merge_reduces_cluster_count():
 
 
 @_register
-def periodic_merge_recall_preserved():
+def test_periodic_merge_recall_preserved():
     """Recall@5 must be maintained after a merge that folds two near-identical clusters."""
     rng = np.random.default_rng(21)
     d   = 16
@@ -481,7 +481,7 @@ def periodic_merge_recall_preserved():
 
 
 @_register
-def merge_interval_auto_triggers():
+def test_merge_interval_auto_triggers():
     """With merge_interval>0 auto-merge fires during add() calls without crashing."""
     rng  = np.random.default_rng(22)
     d    = 16
@@ -499,7 +499,7 @@ def merge_interval_auto_triggers():
 # ── merge params and per-cluster axes ─────────────────────────────────────────
 
 @_register
-def merge_params_propagate_to_cpp():
+def test_merge_params_propagate_to_cpp():
     """Non-default merge_qe_ratio must reach the C++ layer."""
     idx, _, _ = _small_index(n=500, d=16, nlist=5, F=8)
     if idx._cpp is None:
@@ -517,7 +517,7 @@ def merge_params_propagate_to_cpp():
 
 
 @_register
-def per_cluster_axes_populated_after_refresh():
+def test_per_cluster_axes_populated_after_refresh():
     """After local_refresh with non-trivial U_drift, cluster axes are valid unit vectors.
 
     Python path: sets U_drift directly, calls _local_refresh, checks cluster_axes.
@@ -575,7 +575,7 @@ def per_cluster_axes_populated_after_refresh():
 # ── sqeuclidean with mutations ────────────────────────────────────────────────
 
 @_register
-def sqeuclidean_add_delete():
+def test_sqeuclidean_add_delete():
     """add/delete/update work correctly under sqeuclidean metric; distances are non-negative."""
     rng  = np.random.default_rng(50)
     data = rng.standard_normal((500, 16)).astype('float32')
@@ -606,7 +606,7 @@ def sqeuclidean_add_delete():
 # ── buffer / compaction / drift ───────────────────────────────────────────────
 
 @_register
-def buffer_grows_past_initial_capacity():
+def test_buffer_grows_past_initial_capacity():
     """Insert enough points to exceed the 1024-point initial headroom."""
     rng  = np.random.default_rng(3)
     data = rng.standard_normal((50, 32)).astype('float32')
@@ -620,7 +620,7 @@ def buffer_grows_past_initial_capacity():
 
 
 @_register
-def compaction_triggers_on_high_tombstone_fraction():
+def test_compaction_triggers_on_high_tombstone_fraction():
     """Delete >threshold% of a cluster; cluster_global must contain only live points."""
     from ampi.affine_fan import _TOMBSTONE_THRESHOLD as _TT
     rng  = np.random.default_rng(4)
@@ -650,7 +650,7 @@ def compaction_triggers_on_high_tombstone_fraction():
 
 
 @_register
-def drift_detection_fires():
+def test_drift_detection_perpendicular():
     """Insert many points along e_0; index must remain queryable after drift refresh."""
     rng  = np.random.default_rng(99)
     data = rng.standard_normal((1000, 32)).astype('float32')
@@ -678,7 +678,7 @@ def drift_detection_fires():
 # ── concurrent access ─────────────────────────────────────────────────────────
 
 @_register
-def concurrent_rw_no_crash():
+def test_concurrent_rw_no_crash():
     """2 reader threads + 1 writer + 1 deleter for 2 s — no crashes or exceptions."""
     idx, _, _ = _small_index(n=3000, d=32, nlist=10, F=8)
     cpp = idx._cpp
@@ -739,7 +739,7 @@ def concurrent_rw_no_crash():
 
 
 @_register
-def mmap_cpp_data_path():
+def test_mmap_cpp_data_path():
     """C++ mmap mode: data_path= creates a mmap file; queries and adds work correctly."""
     import os, tempfile
     rng = np.random.default_rng(77)
@@ -773,7 +773,7 @@ def mmap_cpp_data_path():
 
 
 @_register
-def mmap_serialization_getters():
+def test_mmap_serialization_getters():
     """get_U_drift and get_axis_pairs return correct shapes after mutations."""
     import tempfile
     rng = np.random.default_rng(88)
@@ -799,7 +799,7 @@ def mmap_serialization_getters():
 
 
 @_register
-def batch_correctness_after_mutations():
+def test_batch_correctness_after_mutations():
     """batch_add then batch_delete: deleted IDs must never appear in queries."""
     idx, _, rng = _small_index(n=2000, d=32, nlist=8, F=8)
     if idx._cpp is None:
@@ -823,7 +823,7 @@ def batch_correctness_after_mutations():
 # ── streaming_build ───────────────────────────────────────────────────────────
 
 @_register
-def streaming_build_basic_recall():
+def test_streaming_build_basic_recall():
     """streaming_build recall@10 >= 0.75 on 3000-point data."""
     import tempfile, os
     from ampi.streaming import streaming_build
@@ -851,7 +851,7 @@ def streaming_build_basic_recall():
 
 
 @_register
-def streaming_build_add_delete():
+def test_streaming_build_add_delete():
     """After streaming_build: add spike → found as NN; delete → gone."""
     import tempfile, os
     from ampi.streaming import streaming_build
@@ -879,7 +879,7 @@ def streaming_build_add_delete():
 
 
 @_register
-def streaming_build_cosine():
+def test_streaming_build_cosine():
     """streaming_build with cosine metric: distances in [0,1]; spike findable and deletable."""
     import tempfile, os
     from ampi.streaming import streaming_build
@@ -913,7 +913,7 @@ def streaming_build_cosine():
 
 
 @_register
-def streaming_build_matches_regular_recall():
+def test_streaming_build_matches_regular_recall():
     """Streaming build recall must be within 15pp of regular build on same data+seed."""
     import tempfile, os
     from ampi.streaming import streaming_build
@@ -947,7 +947,7 @@ def streaming_build_matches_regular_recall():
 # ── bounds checks ────────────────────────────────────────────────────────────
 
 @_register
-def bounds_checks_raise_python_exceptions():
+def test_bounds_checks_raise_python_exceptions():
     """Out-of-range / wrong-dimension arguments must raise Python exceptions, not segfault."""
     idx, _, _ = _small_index(n=500, d=16, nlist=5, F=8)
     if idx._cpp is None:
@@ -1007,7 +1007,7 @@ def bounds_checks_raise_python_exceptions():
 # ── _build_norms_all / _rerank_blas correctness ──────────────────────────────
 
 @_register
-def rerank_blas_norms_at_construction():
+def test_rerank_blas_norms_at_construction():
     """Returned sq_dists must match exact L2² distances — verifies _build_norms_all
     populated norms[global_id] correctly at construction so _rerank_blas can use them."""
     rng  = np.random.default_rng(400)
@@ -1032,7 +1032,7 @@ def rerank_blas_norms_at_construction():
 
 
 @_register
-def rerank_blas_norms_after_deletion():
+def test_rerank_blas_norms_after_deletion():
     """After deleting ~half the points, sq_dists for survivors must still be exact.
     Confirms that del_mask skipping in _build_norms_all does not corrupt live norms,
     and that norms[global_id] indexing stays correct across the deleted gaps."""
