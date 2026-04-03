@@ -3,8 +3,6 @@
 Runs without large datasets; uses a small synthetic index (n=2000, d=32).
 """
 import os
-import struct
-import tempfile
 
 import numpy as np
 import pytest
@@ -17,7 +15,7 @@ from ampi.wal import (
 from ampi.checkpoint import save_checkpoint, load_checkpoint
 
 try:
-    from ampi._ampi_ext import AMPIIndex as _AMPIIndex
+    import ampi._ampi_ext  # noqa: F401
     _HAS_EXT = True
 except ImportError:
     _HAS_EXT = False
@@ -162,7 +160,7 @@ class TestCheckpoint:
         )
         rec_before = _recall10(idx)
 
-        ts = save_checkpoint(idx, ckpt)
+        save_checkpoint(idx, ckpt)
         assert os.path.getsize(ckpt) > 0
 
         idx2 = load_checkpoint(ckpt, data_path=mmap_dir)

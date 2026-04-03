@@ -204,7 +204,8 @@ def test_bulk_add_recall():
     """Add 300 points; each must be findable (recall@1 >= 0.95 across added points)."""
     idx, data, rng = _small_index(n=2000, d=32)
     extras = rng.standard_normal((300, idx.d)).astype('float32')
-    new_ids = np.array([idx.add(e) for e in extras], dtype=np.int32)
+    for e in extras:
+        idx.add(e)
 
     # Ground truth: brute force over the full (original + inserted) data.
     all_data = idx.data   # already extended by add()
@@ -292,9 +293,6 @@ def test_drift_detection_simple():
     rng  = np.random.default_rng(99)
     data = rng.standard_normal((n, d)).astype('float32')
     idx  = AMPIAffineFanIndex(data, nlist=nlist, num_fans=16, seed=99, cone_top_k=1)
-
-    # Pick a cluster and record its initial U_drift norm.
-    c = 0
 
     # Insert 200 points very strongly aligned with e_0 — biased direction.
     e0 = np.zeros(d, dtype='float32')
@@ -533,7 +531,8 @@ def test_per_cluster_axes_populated_after_refresh():
     if idx._cpp is None:
         # Python path: inject a known biased U_drift sketch and refresh.
         # Set U_drift[:,0] to e0 (unit vector along dimension 0) — strong signal.
-        e0    = np.zeros(d, dtype=np.float32); e0[0] = 1.0
+        e0    = np.zeros(d, dtype=np.float32)
+        e0[0] = 1.0
         idx._U_drift[c_star][:] = 0.0
         idx._U_drift[c_star][:, 0] = e0   # leading eigenvec estimate = e0
         idx._local_refresh(c_star)
@@ -554,7 +553,8 @@ def test_per_cluster_axes_populated_after_refresh():
         # C++ path: insert points biased along e0 relative to c_star's centroid,
         # then manually trigger local_refresh and verify the returned axes.
         centroid = idx._cpp.get_centroids()[c_star].copy()
-        e0       = np.zeros(d, dtype='float32'); e0[0] = 1.0
+        e0       = np.zeros(d, dtype='float32')
+        e0[0]    = 1.0
         # Points placed 1 unit from centroid along e0 — stays within the cluster's
         # neighbourhood (within-cluster spread ≈ sqrt(d) ≈ 5.6).
         for _ in range(80):
@@ -741,7 +741,8 @@ def test_concurrent_rw_no_crash():
 @_register
 def test_mmap_cpp_data_path():
     """C++ mmap mode: data_path= creates a mmap file; queries and adds work correctly."""
-    import os, tempfile
+    import os
+    import tempfile
     rng = np.random.default_rng(77)
     n, d = 2000, 32
     data = rng.standard_normal((n, d)).astype(np.float32)
@@ -825,7 +826,8 @@ def test_batch_correctness_after_mutations():
 @_register
 def test_streaming_build_basic_recall():
     """streaming_build recall@10 >= 0.75 on 3000-point data."""
-    import tempfile, os
+    import tempfile
+    import os
     from ampi.streaming import streaming_build
 
     rng  = np.random.default_rng(200)
@@ -853,7 +855,8 @@ def test_streaming_build_basic_recall():
 @_register
 def test_streaming_build_add_delete():
     """After streaming_build: add spike → found as NN; delete → gone."""
-    import tempfile, os
+    import tempfile
+    import os
     from ampi.streaming import streaming_build
 
     rng  = np.random.default_rng(201)
@@ -881,7 +884,8 @@ def test_streaming_build_add_delete():
 @_register
 def test_streaming_build_cosine():
     """streaming_build with cosine metric: distances in [0,1]; spike findable and deletable."""
-    import tempfile, os
+    import tempfile
+    import os
     from ampi.streaming import streaming_build
 
     rng  = np.random.default_rng(202)
@@ -915,7 +919,8 @@ def test_streaming_build_cosine():
 @_register
 def test_streaming_build_matches_regular_recall():
     """Streaming build recall must be within 15pp of regular build on same data+seed."""
-    import tempfile, os
+    import tempfile
+    import os
     from ampi.streaming import streaming_build
 
     rng  = np.random.default_rng(203)

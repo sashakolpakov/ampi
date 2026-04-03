@@ -121,10 +121,10 @@ class _StreamingDispatcher:
 
                 sorted_projs = np.empty((self.F, n_f), dtype=np.float32)
                 sorted_idxs  = np.empty((self.F, n_f), dtype=np.int32)
-                for l in range(self.F):
-                    o = np.argsort(f_projs[:, l])
-                    sorted_projs[l] = f_projs[o, l]
-                    sorted_idxs[l]  = o.astype(np.int32)
+                for ax in range(self.F):
+                    o = np.argsort(f_projs[:, ax])
+                    sorted_projs[ax] = f_projs[o, ax]
+                    sorted_idxs[ax]  = o.astype(np.int32)
 
                 c_cones.append(SortedCone.from_arrays(sorted_projs, sorted_idxs, f_gids))
 

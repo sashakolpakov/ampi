@@ -3,17 +3,43 @@ Smoke test: build small indexes, verify exact NN is found at high recall.
 Runs in ~10s on a laptop, no datasets required.
 """
 import threading
+import traceback
 import numpy as np
 import faiss
 import os
 import tempfile
-import pytest
 
 from ampi import AMPIBinaryIndex, AMPIAffineFanIndex, AFanTuner
 from ampi.affine_fan import _normalize_metric
 
+# pytest is optional — the file is also run directly via `python tests/smoke_test.py`
 try:
-    from ampi._ampi_ext import AMPIIndex as _AMPIIndex
+    import pytest as _pytest
+    def _skipif(condition, reason=""):
+        return _pytest.mark.skipif(condition, reason=reason)
+    _raises = _pytest.raises
+except ImportError:
+    import functools
+    import contextlib
+    def _skipif(condition, reason=""):
+        def _decorator(fn):
+            if not condition:
+                return fn
+            @functools.wraps(fn)
+            def _skip(*a, **kw):
+                print(f"  SKIPPED: {reason}")
+            return _skip
+        return _decorator
+    @contextlib.contextmanager
+    def _raises(exc_type):
+        try:
+            yield
+        except exc_type:
+            return
+        raise AssertionError(f"expected {exc_type.__name__}, got no error")
+
+try:
+    import ampi._ampi_ext  # noqa: F401
     _HAS_CPP = True
 except ImportError:
     _HAS_CPP = False
@@ -54,7 +80,7 @@ def test_affinefan_recall():
     assert rec_a >= 0.80, f"AffineFan recall too low: {rec_a:.3f}"
 
 
-@pytest.mark.skipif(not _HAS_CPP, reason="C++ ext not built")
+@_skipif(not _HAS_CPP, reason="C++ ext not built")
 def test_cpp_accessor_compat():
     cpp = idx_a._cpp
     assert cpp is not None, "AMPIIndex not constructed"
@@ -74,12 +100,18 @@ def test_cpp_accessor_compat():
     assert cpp.drift_theta == 20.0, "drift_theta not writable"
     cpp.drift_theta = old_theta
 
-    dv = cpp.get_data_view();        assert dv.shape == (cpp.n, cpp.d),     "data_view shape"
-    dm = cpp.get_deleted_mask();     assert dm.shape == (cpp.n,),           "del_mask shape"
-    cv = cpp.get_centroids();        assert cv.shape == (cpp.nlist, cpp.d), "centroids shape"
-    ax = cpp.get_axes();             assert ax.shape == (cpp.F, cpp.d),     "axes shape"
-    cc = cpp.get_cluster_counts();   assert len(cc) == cpp.nlist,           "cluster_counts len"
-    ct = cpp.get_cluster_tombstones(); assert len(ct) == cpp.nlist,         "cluster_tombstones len"
+    dv = cpp.get_data_view()
+    assert dv.shape == (cpp.n, cpp.d),     "data_view shape"
+    dm = cpp.get_deleted_mask()
+    assert dm.shape == (cpp.n,),           "del_mask shape"
+    cv = cpp.get_centroids()
+    assert cv.shape == (cpp.nlist, cpp.d), "centroids shape"
+    ax = cpp.get_axes()
+    assert ax.shape == (cpp.F, cpp.d),     "axes shape"
+    cc = cpp.get_cluster_counts()
+    assert len(cc) == cpp.nlist,           "cluster_counts len"
+    ct = cpp.get_cluster_tombstones()
+    assert len(ct) == cpp.nlist,           "cluster_tombstones len"
 
     for c in range(cpp.nlist):
         gi = cpp.get_cluster_global(c)
@@ -156,7 +188,7 @@ def test_binary_query_candidates():
         "binary query_candidates not a superset of query top-k"
 
 
-@pytest.mark.skipif(not _HAS_CPP, reason="C++ ext not built")
+@_skipif(not _HAS_CPP, reason="C++ ext not built")
 def test_cpp_query_correctness():
     _fp = idx_a.F
     _cpp_ids, _py_ids = [], []
@@ -185,7 +217,7 @@ def test_metric_aliases():
     assert _normalize_metric('sqeuclidean') == 'sqeuclidean'
     assert _normalize_metric('cosine')      == 'cosine'
 
-    with pytest.raises(ValueError):
+    with _raises(ValueError):
         _normalize_metric('manhattan')
 
     q = qs[0]
@@ -213,7 +245,7 @@ def test_metric_aliases():
         f"cosine distances out of [0,1]: min={d_cos.min():.4f} max={d_cos.max():.4f}"
 
 
-@pytest.mark.skipif(not _HAS_CPP, reason="C++ ext not built")
+@_skipif(not _HAS_CPP, reason="C++ ext not built")
 def test_cpp_routing():
     from ampi._ampi_ext import best_clusters, best_fan_cones
 
@@ -252,7 +284,7 @@ def test_cpp_routing():
         "best_fan_cones zero-vector: wrong output"
 
 
-@pytest.mark.skipif(not _HAS_CPP, reason="C++ ext not built")
+@_skipif(not _HAS_CPP, reason="C++ ext not built")
 def test_cpp_oja_sketch():
     from ampi._ampi_ext import update_drift_and_check
 
@@ -301,7 +333,7 @@ def test_cpp_oja_sketch():
     assert _mm == 0, f"{_mm} refresh-flag mismatches C++ vs Python"
 
 
-@pytest.mark.skipif(not _HAS_CPP, reason="C++ ext not built")
+@_skipif(not _HAS_CPP, reason="C++ ext not built")
 def test_local_refresh_gil_safety():
     _cpp_r = idx_a._cpp
     _c_r   = next(c for c in range(_cpp_r.nlist) if _cpp_r.has_cones(c))
@@ -430,7 +462,7 @@ def test_mmap_backed_data_buffer():
             f"n wrong after mmap adds: {_mmap_idx.n}"
 
 
-@pytest.mark.skipif(not _HAS_CPP, reason="C++ ext not built")
+@_skipif(not _HAS_CPP, reason="C++ ext not built")
 def test_streaming_build_correctness():
     from ampi.streaming import streaming_build
 
@@ -480,3 +512,43 @@ def test_streaming_build_correctness():
                      for q in _sb_qs]
         _sb_rec = recall10(_sb_gt, _sb_found)
         assert _sb_rec >= 0.70, f"streaming recall@10 = {_sb_rec:.3f} < 0.70"
+
+
+# ── CLI runner (python tests/smoke_test.py) ───────────────────────────────────
+
+def main():
+    _tests = [
+        test_binary_recall,
+        test_affinefan_recall,
+        test_cpp_accessor_compat,
+        test_binary_query_candidates,
+        test_cpp_query_correctness,
+        test_metric_aliases,
+        test_cpp_routing,
+        test_cpp_oja_sketch,
+        test_local_refresh_gil_safety,
+        test_add_delete_update_api,
+        test_afantuner_smoke,
+        test_mmap_backed_data_buffer,
+        test_streaming_build_correctness,
+    ]
+    passed, failed = [], []
+    for fn in _tests:
+        name = fn.__name__
+        try:
+            fn()
+            passed.append(name)
+            print(f"[PASS] {name}")
+        except Exception:
+            failed.append(name)
+            print(f"[FAIL] {name}")
+            traceback.print_exc()
+    print(f"\n{len(passed)}/{len(passed)+len(failed)} passed")
+    if failed:
+        print("FAILED:", ", ".join(failed))
+        raise SystemExit(1)
+    print("OK")
+
+
+if __name__ == "__main__":
+    main()

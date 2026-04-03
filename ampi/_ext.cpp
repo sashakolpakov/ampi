@@ -266,7 +266,7 @@ public:
         std::vector<int32_t> ids;
         if (!axes.empty()) {
             ids.reserve(axes[0].size());
-            for (auto& p : axes[0]) {
+            for (const auto& p : axes[0]) {
                 if (!tombstones.count(p.second))
                     ids.push_back((int32_t)p.second);
             }
@@ -443,9 +443,9 @@ public:
 
 class AMPIIndex {
 public:
-    int d, F, nlist, cone_top_k;
-    double drift_theta;
-    bool cosine_metric;
+    int d = 0, F = 0, nlist = 0, cone_top_k = 1;
+    double drift_theta = 20.0;
+    bool cosine_metric = false;
 
     // Heap-mode data buffer.  Stored behind shared_ptr so that numpy arrays
     // returned by get_data_view() keep the allocation alive after a grow
@@ -458,7 +458,7 @@ public:
     void*                _mmap_addr = MAP_FAILED;
     size_t               _mmap_size = 0;
     std::vector<uint8_t> del_mask;   // capacity (0 = live, 1 = deleted)
-    uint32_t n, capacity, n_deleted;
+    uint32_t n = 0, capacity = 0, n_deleted = 0;
 
     // Phase 6: reader-writer lock.  query/query_candidates hold shared lock;
     // add/remove/batch_add/batch_delete/local_refresh hold exclusive lock.
@@ -497,7 +497,6 @@ public:
     double   merge_qe_ratio   = 0.5;  // merge if δ_qe ≤ ratio*(mQE_i+mQE_j)
     uint64_t insert_count     = 0;    // total inserts processed
 
-    // cppcheck-suppress uninitMemberVar
     AMPIIndex() = default;
 
     // Move constructor: transfer mmap ownership so the destructor only runs
@@ -755,7 +754,7 @@ public:
                 const auto& ax0 = idx.cluster_cones[c][f].axes;
                 if (!ax0.empty() && !ax0[0].empty()) {
                     idx.cluster_has_cones[c] = true;
-                    for (auto& p : ax0[0]) {
+                    for (const auto& p : ax0[0]) {
                         uint32_t gid = (uint32_t)p.second;
                         if (gid < n_total)
                             idx.point_cones[gid].push_back({(uint16_t)c, (uint16_t)f});
@@ -1033,7 +1032,7 @@ public:
         ++n_deleted;
 
         std::unordered_set<int> seen;
-        for (auto& cf : point_cones[global_id]) {
+        for (const auto& cf : point_cones[global_id]) {
             int c = cf.first, f = cf.second;
             cluster_cones[c][f].remove(global_id);
             seen.insert(c);
@@ -1100,7 +1099,7 @@ public:
         if (c < 0 || c >= nlist)
             throw py::index_error("cluster index " + std::to_string(c) +
                                   " out of range [0, " + std::to_string(nlist) + ")");
-        auto& cg = cluster_global[c];
+        const auto& cg = cluster_global[c];
         auto out = py::array_t<int32_t>((py::ssize_t)cg.size());
         auto buf = out.mutable_unchecked<1>();
         for (py::ssize_t i = 0; i < (py::ssize_t)cg.size(); ++i)
@@ -1361,10 +1360,10 @@ public:
                 std::vector<float> top_m2(M2);
                 for (int ii = 0; ii < M2; ++ii) top_m2[ii] = sq_dists[order[ii]];
                 std::nth_element(top_m2.begin(), top_m2.begin() + actual_k - 1, top_m2.end());
-                float kth_sq = top_m2[actual_k - 1];
 
                 // Pass 2: collect surviving candidates, BLAS rerank in one batch.
                 {
+                    float kth_sq = top_m2[actual_k - 1];
                     std::vector<int> survivors;
                     survivors.reserve(m - M2);
                     for (int ii = M2; ii < m; ++ii)
@@ -1808,7 +1807,7 @@ private:
 
         // Step 1: gather centered vectors x_c (n_c × d) and compute norms.
         std::vector<float> x_c((size_t)n_c * d);
-        std::vector<float> norms(n_c, 0.f);
+        std::vector<float> cent_norms(n_c, 0.f);
         for (int i = 0; i < n_c; ++i) {
             const float* xi = _data_ptr + (size_t)live_ids[i] * d;
             float s2 = 0.f;
@@ -1817,7 +1816,7 @@ private:
                 x_c[i * d + j] = cj;
                 s2 += cj * cj;
             }
-            norms[i] = (s2 > 1e-20f) ? std::sqrt(s2) : 1.f;
+            cent_norms[i] = (s2 > 1e-20f) ? std::sqrt(s2) : 1.f;
         }
 
         // Step 2: projs (n_c × F) = x_c (n_c × d) @ local_axes^T (F × d).
@@ -1836,7 +1835,7 @@ private:
         std::vector<std::vector<int>> cone_pts(F);
         std::vector<std::pair<float,int>> tmp(F);
         for (int i = 0; i < n_c; ++i) {
-            float inv_n = 1.f / norms[i];
+            float inv_n = 1.f / cent_norms[i];
             for (int l = 0; l < F; ++l)
                 tmp[l] = {-std::abs(projs[i * F + l]) * inv_n, l};
             std::nth_element(tmp.begin(), tmp.begin() + K_f, tmp.end());
@@ -1862,8 +1861,10 @@ private:
                 auto& ax_l = cone.axes[l];
                 ax_l.clear();
                 ax_l.reserve(pts.size());
-                for (int local_i : pts)
-                    ax_l.push_back({projs[local_i * F + l], live_ids[local_i]});
+                std::transform(pts.begin(), pts.end(), std::back_inserter(ax_l),
+                    [&](int local_i) -> std::pair<float, uint32_t> {
+                        return {projs[local_i * F + l], live_ids[local_i]};
+                    });
                 std::sort(ax_l.begin(), ax_l.end());
             }
             for (int local_i : pts)
@@ -1872,11 +1873,11 @@ private:
     }
 
     void _local_refresh(int c) {
-        auto& cg = cluster_global[c];
+        const auto& cg = cluster_global[c];
         std::vector<uint32_t> live;
         live.reserve(cg.size());
-        for (uint32_t gid : cg)
-            if (!del_mask[gid]) live.push_back(gid);
+        std::copy_if(cg.begin(), cg.end(), std::back_inserter(live),
+            [&](uint32_t gid) { return !del_mask[gid]; });
 
         // Derive per-cluster axes from accumulated U_drift BEFORE resetting it.
         _compute_cluster_axes(c);
@@ -1949,10 +1950,10 @@ private:
         centroid_norms_sq[fold] = nsq;
 
         // Append fold's live points to keep's cluster_global.
-        auto& cg_fold = cluster_global[fold];
+        const auto& cg_fold = cluster_global[fold];
         auto& cg_keep = cluster_global[keep];
-        for (uint32_t gid : cg_fold)
-            if (!del_mask[gid]) cg_keep.push_back(gid);
+        std::copy_if(cg_fold.begin(), cg_fold.end(), std::back_inserter(cg_keep),
+            [&](uint32_t gid) { return !del_mask[gid]; });
 
         // Clear fold cluster state.
         cg_fold.clear();
@@ -1966,8 +1967,8 @@ private:
         // Compact keep's cluster_global (remove deleted entries).
         std::vector<uint32_t> live;
         live.reserve(cg_keep.size());
-        for (uint32_t gid : cg_keep)
-            if (!del_mask[gid]) live.push_back(gid);
+        std::copy_if(cg_keep.begin(), cg_keep.end(), std::back_inserter(live),
+            [&](uint32_t gid) { return !del_mask[gid]; });
         cg_keep               = std::move(live);
         cluster_counts[keep]  = (int64_t)cg_keep.size();
         cluster_tombstones[keep] = 0;
@@ -2113,7 +2114,7 @@ bool update_drift_and_check(
         if (ab > cos_max) cos_max = ab;
     }
 
-    const float cos_theta = std::cos((float)(theta_deg * (3.14159265358979323846 / 180.0)));
+    const float cos_theta = std::cos(static_cast<float>(theta_deg) * 3.14159265f / 180.0f);
     return cos_max < cos_theta;
 }
 
