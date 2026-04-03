@@ -503,7 +503,9 @@ public:
     // on the live object.  Needed because ~AMPIIndex() suppresses the implicit
     // move constructor (C++11 rule of five).
     AMPIIndex(AMPIIndex&& o) noexcept
-        : _data_buf_sp(std::move(o._data_buf_sp)),
+        : d(o.d), F(o.F), nlist(o.nlist), cone_top_k(o.cone_top_k),
+          drift_theta(o.drift_theta), cosine_metric(o.cosine_metric),
+          _data_buf_sp(std::move(o._data_buf_sp)),
           _data_ptr(o._data_ptr),
           _mmap_path(std::move(o._mmap_path)),
           _mmap_fd(o._mmap_fd),
@@ -512,17 +514,15 @@ public:
           del_mask(std::move(o.del_mask)),
           n(o.n), capacity(o.capacity), n_deleted(o.n_deleted),
           p_mutex(std::move(o.p_mutex)),
-          d(o.d), F(o.F), nlist(o.nlist), cone_top_k(o.cone_top_k),
-          drift_theta(o.drift_theta), cosine_metric(o.cosine_metric),
           axes(std::move(o.axes)),
           centroids(std::move(o.centroids)),
           centroid_norms_sq(std::move(o.centroid_norms_sq)),
           cluster_counts(std::move(o.cluster_counts)),
           cluster_tombstones(std::move(o.cluster_tombstones)),
-          U_drift(std::move(o.U_drift)),
+          cluster_has_cones(std::move(o.cluster_has_cones)),
           cluster_global(std::move(o.cluster_global)),
           cluster_cones(std::move(o.cluster_cones)),
-          cluster_has_cones(std::move(o.cluster_has_cones)),
+          U_drift(std::move(o.U_drift)),
           cluster_axes(std::move(o.cluster_axes)),
           sketch(std::move(o.sketch)),
           norms(std::move(o.norms)),
@@ -1950,7 +1950,7 @@ private:
         centroid_norms_sq[fold] = nsq;
 
         // Append fold's live points to keep's cluster_global.
-        const auto& cg_fold = cluster_global[fold];
+        auto& cg_fold = cluster_global[fold];
         auto& cg_keep = cluster_global[keep];
         std::copy_if(cg_fold.begin(), cg_fold.end(), std::back_inserter(cg_keep),
             [&](uint32_t gid) { return !del_mask[gid]; });
