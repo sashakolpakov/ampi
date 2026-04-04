@@ -74,6 +74,41 @@ automatically when the compiled extension is absent.
 
 ---
 
+## When to use AMPI
+
+AMPI is the right tool when you need to **know that drift happened, where, and in
+what direction** — not just react to it after the fact.
+
+**Financial fraud detection** — fraud patterns shift continuously (new attack vectors,
+new merchant categories). AMPI's per-cluster Oja sketch tracks the directional drift
+of each cluster in embedding space. When the fraud embedding distribution rotates
+beyond `drift_theta`, AMPI triggers a local cone refresh for that cluster only — and
+you get a signal: *which cluster drifted, by how much, in what direction*. A reactive
+system (like a size-threshold splitter) only tells you a cluster overflowed; AMPI
+tells you the fraud pattern changed.
+
+**Model monitoring / embedding quality** — when a production model is updated or
+fine-tuned, its output embeddings shift. AMPI's drift angle per cluster can power
+an alert: "embedding space for class X has drifted 15° since last checkpoint." This
+is directly usable as a data-quality or model-health metric. A split-based index
+only tells you the Voronoi cell grew.
+
+**Low-insert-rate scientific data** — genomics, satellite imagery, telescope
+catalogs: data arrives in nightly or weekly batches, but query quality matters
+more than insert throughput. AMPI's affine fan projection approach achieves near-
+perfect recall (≥0.99 on MNIST/Fashion-MNIST at optimal parameters) with fewer
+candidates scanned than FAISS IVF, because the Cauchy-Schwarz early stopping
+skips unpromising projection directions. Insert latency (~700µs/vector at nlist≈200)
+is fine for batch workflows.
+
+**When NOT to use AMPI** — if you are inserting tens of thousands of vectors per
+second (real-time catalog updates, live recommendation feeds, chat embedding caches),
+AMPI's per-insert overhead will be the bottleneck. For those workloads, prefer a
+simpler index like [Copenhagen](https://github.com/sashakolpakov/copenhagen) that
+trades drift-awareness for O(1) amortized insert.
+
+---
+
 ## Quick Start
 
 ```python
