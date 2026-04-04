@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-    {name = "Sasha Kolpakov"}
+    {name = "Alexander Kolpakov", email = "akolpakov@uaustin.org"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
