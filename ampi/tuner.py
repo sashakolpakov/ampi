@@ -346,7 +346,7 @@ class AFanTuner:
         if verbose:
             print(f"\n[AFanTuner] Winner:  alpha={best_alpha:.3f} → nlist={best_nlist}"
                   f"  K={best_K}  F={best_F}")
-            print(f"[AFanTuner] Building full index … ", end="", flush=True)
+            print("[AFanTuner] Building full index … ", end="", flush=True)
 
         t0  = time.perf_counter()
         idx = AMPIAffineFanIndex(

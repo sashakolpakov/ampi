@@ -44,7 +44,6 @@ try:
         SortedCone             as _SortedCone,
         best_clusters          as _cpp_best_clusters,
         best_fan_cones         as _cpp_best_fan_cones,
-        update_drift_and_check as _cpp_update_drift_and_check,
         AMPIIndex              as _AMPIIndex,
     )
     _HAS_SORTED_CONE = True
@@ -175,13 +174,13 @@ class _DictCone:
 
     def is_covered(self, q_proj, w, kth_proj):
         F = self._sorted_projs.shape[0]
-        for l in range(F):
-            sp  = self._sorted_projs[l]
-            pos = int(np.searchsorted(sp, q_proj[l]))
+        for ax in range(F):
+            sp  = self._sorted_projs[ax]
+            pos = int(np.searchsorted(sp, q_proj[ax]))
             lo  = max(0, pos - w)
             hi  = min(self._n, pos + w)
-            gap_right = float(sp[hi]     - q_proj[l]) if hi < self._n else np.inf
-            gap_left  = float(q_proj[l]  - sp[lo - 1]) if lo > 0     else np.inf
+            gap_right = float(sp[hi]      - q_proj[ax]) if hi < self._n else np.inf
+            gap_left  = float(q_proj[ax]  - sp[lo - 1]) if lo > 0      else np.inf
             if min(gap_right, gap_left) >= kth_proj:
                 return True
         return False
@@ -320,10 +319,10 @@ def _build_cones_for_cluster(c_idx, c_data, centroid, axes, F, cone_top_k):
 
         s_idxs  = np.empty((F, n_f), dtype=np.int32)
         s_projs = np.empty((F, n_f), dtype=np.float32)
-        for l in range(F):
-            o = np.argsort(f_projs[:, l])
-            s_idxs[l]  = o.astype(np.int32)
-            s_projs[l] = f_projs[o, l]
+        for ax in range(F):
+            o = np.argsort(f_projs[:, ax])
+            s_idxs[ax]  = o.astype(np.int32)
+            s_projs[ax] = f_projs[o, ax]
 
         cones.append(_make_cone(f_global, s_idxs, s_projs))
         for gid in f_global:
@@ -376,8 +375,8 @@ class AMPIAffineFanIndex:
         # ── Global fan directions ─────────────────────────────────────────
         rng  = np.random.RandomState(seed)
         axes = rng.randn(self.F, self.d).astype(np.float32)
-        axes /= np.linalg.norm(axes, axis=1, keepdims=True)
-        self.axes = axes  # (F, d)
+        Q, _ = np.linalg.qr(axes.T)   # Q: (d, F) orthonormal columns
+        self.axes = Q.T.astype(np.float32)  # (F, d) orthonormal rows
 
         # ── K-means partition ─────────────────────────────────────────────
         self.centroids, assignments = _mini_batch_kmeans(
@@ -605,7 +604,8 @@ class AMPIAffineFanIndex:
         if norms[0] < 1e-6:
             return self.axes          # no signal yet — use global axes
         U_norm = U / np.maximum(norms, 1e-12)
-        return U_norm.T.astype(np.float32)  # (F, d)
+        Q, _ = np.linalg.qr(U_norm)   # Q: (d, F) orthonormal columns
+        return Q.T.astype(np.float32)  # (F, d) orthonormal rows
 
     def _check_drift(self, c):
         """Check if U_drift[:,0] has rotated > drift_theta from all fan axes.

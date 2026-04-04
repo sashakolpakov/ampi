@@ -3,8 +3,7 @@
 Runs without large datasets; uses a small synthetic index (n=2000, d=32).
 """
 import os
-import struct
-import tempfile
+import threading
 
 import numpy as np
 import pytest
@@ -17,7 +16,7 @@ from ampi.wal import (
 from ampi.checkpoint import save_checkpoint, load_checkpoint
 
 try:
-    from ampi._ampi_ext import AMPIIndex as _AMPIIndex
+    import ampi._ampi_ext  # noqa: F401
     _HAS_EXT = True
 except ImportError:
     _HAS_EXT = False
@@ -162,7 +161,7 @@ class TestCheckpoint:
         )
         rec_before = _recall10(idx)
 
-        ts = save_checkpoint(idx, ckpt)
+        save_checkpoint(idx, ckpt)
         assert os.path.getsize(ckpt) > 0
 
         idx2 = load_checkpoint(ckpt, data_path=mmap_dir)
@@ -245,6 +244,41 @@ class TestCheckpoint:
         with pytest.raises(ValueError, match="data_path"):
             load_checkpoint(ckpt)
 
+    def test_checkpoint_cosine_roundtrip(self, tmp_path):
+        ckpt = str(tmp_path / "cos.ckpt")
+        mmap_dir = str(tmp_path / "mmap")
+        os.makedirs(mmap_dir)
+
+        idx = AMPIAffineFanIndex(
+            DATA, nlist=16, num_fans=8, seed=0, metric='cosine',
+            data_path=mmap_dir,
+        )
+        save_checkpoint(idx, ckpt)
+        idx2 = load_checkpoint(ckpt, data_path=mmap_dir)
+
+        assert idx2.metric == 'cosine', f"metric after load: {idx2.metric}"
+        _, dists, ids = idx2.query(QS[0], k=5, window_size=100, probes=8, fan_probes=8)
+        assert len(ids) > 0, "cosine checkpoint: no results"
+        assert (dists >= -1e-4).all() and (dists <= 1 + 1e-4).all(), \
+            f"cosine checkpoint: distances out of [0,1]: {dists}"
+
+    def test_checkpoint_cone_top_k2(self, tmp_path):
+        ckpt = str(tmp_path / "k2.ckpt")
+        mmap_dir = str(tmp_path / "mmap")
+        os.makedirs(mmap_dir)
+
+        idx = AMPIAffineFanIndex(
+            DATA, nlist=16, num_fans=8, seed=0, cone_top_k=2,
+            data_path=mmap_dir,
+        )
+        save_checkpoint(idx, ckpt)
+        idx2 = load_checkpoint(ckpt, data_path=mmap_dir)
+
+        assert idx2.cone_top_k == 2, f"cone_top_k after load: {idx2.cone_top_k}"
+        assert idx2.n == idx.n
+        _, _, ids = idx2.query(QS[0], k=5, window_size=100, probes=8, fan_probes=8)
+        assert len(ids) > 0, "cone_top_k=2 checkpoint: no results"
+
     def test_no_cpp_raises(self, tmp_path, monkeypatch):
         ckpt = str(tmp_path / "idx.ckpt")
         mmap_dir = str(tmp_path / "mmap")
@@ -256,3 +290,48 @@ class TestCheckpoint:
         monkeypatch.setattr(idx, "_cpp", None)
         with pytest.raises(RuntimeError, match="C\\+\\+ extension"):
             save_checkpoint(idx, ckpt)
+
+
+# ── WAL thread-safety ─────────────────────────────────────────────────────────
+
+class TestWALThreadSafety:
+    def test_concurrent_log_calls(self, tmp_path):
+        """Single WALWriter used from multiple threads: all records must survive."""
+        wal = str(tmp_path / "concurrent.wal")
+        vec = np.ones(D, dtype=np.float32)
+        n_threads = 4
+        n_writes  = 50
+        errors    = []
+
+        with WALWriter(wal, D, batch_size=1) as w:
+            def _worker(tid):
+                try:
+                    for i in range(n_writes):
+                        w.log_insert(tid * n_writes + i, vec)
+                except Exception as e:
+                    errors.append(e)
+
+            threads = [threading.Thread(target=_worker, args=(i,))
+                       for i in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert not errors, f"WAL concurrent write errors: {errors}"
+        records = list(_iter_records(wal, D))
+        assert len(records) == n_threads * n_writes, \
+            f"expected {n_threads * n_writes} records, got {len(records)}"
+
+    def test_flush_makes_records_readable(self, tmp_path):
+        """flush() with batch_size>1 forces buffered records to disk."""
+        wal = str(tmp_path / "flush.wal")
+        vec = np.ones(D, dtype=np.float32)
+        w = WALWriter(wal, D, batch_size=100)
+        for i in range(10):
+            w.log_insert(i, vec)
+        # Records buffered but not yet flushed.  Explicit flush must make them readable.
+        w.flush()
+        records = list(_iter_records(wal, D))
+        assert len(records) == 10, f"expected 10 records after flush, got {len(records)}"
+        w.close()

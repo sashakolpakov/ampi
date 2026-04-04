@@ -10,9 +10,11 @@ as the foundation.
 
 **What exists:**
 - `AMPIAffineFanIndex` — in-memory, single-process, build-time-only.
-- `_ampi_ext.so` — C++ kernels (`project_data`, `l2_distances`, `union_query`).
-  `project_data` uses `ampi/_gemm.hpp` (Accelerate / OpenBLAS / MKL / AVX2+NEON
-  fallback); 20–112× faster than the prior scalar loop.
+- `_ampi_ext.so` — C++ kernels (`project_data`, `l2_distances`, `union_query`,
+  `_rerank_blas`).  `project_data` and the L2 rerank hot path both use
+  `ampi/_gemm.hpp` (Accelerate / OpenBLAS / MKL / AVX2+NEON fallback) via
+  gather + SGEMM + precomputed `norms[i]=‖xᵢ‖²`; no scalar distance loops
+  remain in the query path.
 - `AFanTuner` — GP-BO over alpha/K, Pareto suggestion sweep.
 
 **Prerequisite before Phase 1:**

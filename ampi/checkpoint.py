@@ -148,8 +148,8 @@ def save_checkpoint(idx, path: str) -> int:
                 projs0, _ = cone.get_axis_pairs(0)
                 n_f = len(projs0)
                 fh.write(struct.pack("<I", n_f))
-                for l in range(idx.F):
-                    projs_l, ids_l = cone.get_axis_pairs(l)
+                for ax in range(idx.F):
+                    projs_l, ids_l = cone.get_axis_pairs(ax)
                     fh.write(projs_l.astype(np.float32).tobytes())
                     fh.write(ids_l.astype(np.uint32).tobytes())
 
@@ -305,10 +305,10 @@ def _reconstruct_cone(all_projs, all_ids, F, n_f):
     sorted_projs = np.stack(all_projs)            # (F, n_f) float32
     sorted_idxs  = np.empty((F, n_f), dtype=np.int32)
 
-    for l in range(F):
-        # pos[j]: position of all_ids[l][j] in sorted_g0
-        pos              = np.searchsorted(sorted_g0, all_ids[l].astype(np.int32))
-        sorted_idxs[l]   = argsort_g0[pos]
+    for ax in range(F):
+        # pos[j]: position of all_ids[ax][j] in sorted_g0
+        pos              = np.searchsorted(sorted_g0, all_ids[ax].astype(np.int32))
+        sorted_idxs[ax]  = argsort_g0[pos]
 
     return _SortedCone.from_arrays(
         sorted_projs.astype(np.float32),
