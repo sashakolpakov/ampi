@@ -1073,6 +1073,155 @@ def test_rerank_blas_norms_after_deletion():
         err_msg="sq_dists wrong after deletion — norms[global_id] indexing broken")
 
 
+# ── AMPIBinaryIndex stress ────────────────────────────────────────────────────
+
+@_register
+def test_binary_stress_recall_vs_projections():
+    """AMPIBinaryIndex recall@10: L=32 ≥ 0.65, L=128 ≥ 0.80."""
+    from ampi import AMPIBinaryIndex
+
+    rng  = np.random.default_rng(300)
+    n, d = 3_000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+    qs   = rng.standard_normal((50, d)).astype('float32')
+    gt   = _brute_knn(data, qs, k=10)
+
+    for L, min_rec in [(32, 0.65), (128, 0.80)]:
+        idx  = AMPIBinaryIndex(data, num_projections=L, seed=0)
+        found = [idx.query(q, k=10, window_size=100)[2] for q in qs]
+        rec  = _recall(gt, found, k=10)
+        assert rec >= min_rec, f"BinaryIndex L={L}: recall@10={rec:.3f} < {min_rec}"
+
+
+@_register
+def test_binary_edge_cases():
+    """AMPIBinaryIndex: n=1, k>n, window_size=1 all return valid results without crash."""
+    from ampi import AMPIBinaryIndex
+
+    rng = np.random.default_rng(301)
+    q   = rng.standard_normal(8).astype('float32')
+
+    # n=1: only one data point
+    idx1 = AMPIBinaryIndex(rng.standard_normal((1, 8)).astype('float32'),
+                           num_projections=4, seed=0)
+    pts, dists, ids = idx1.query(q, k=5, window_size=10)
+    assert len(ids) == 1,    f"n=1: expected 1 result, got {len(ids)}"
+    assert (dists >= 0).all(), "n=1: negative distance"
+
+    # k > n: must return at most n results
+    idx2 = AMPIBinaryIndex(rng.standard_normal((10, 8)).astype('float32'),
+                           num_projections=4, seed=0)
+    _, _, ids2 = idx2.query(q, k=100, window_size=50)
+    assert len(ids2) <= 10,  f"k>n: got {len(ids2)} results, expected ≤10"
+
+    # window_size=1: minimal window still works
+    _, _, ids3 = idx2.query(q, k=1, window_size=1)
+    assert len(ids3) >= 1,   "window_size=1: no results returned"
+
+
+@_register
+def test_binary_candidate_superset():
+    """query_candidates must always be a superset of the top-k returned by query."""
+    from ampi import AMPIBinaryIndex
+
+    rng  = np.random.default_rng(302)
+    n, d = 1_000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+    idx  = AMPIBinaryIndex(data, num_projections=32, seed=0)
+
+    for _ in range(20):
+        q = rng.standard_normal(d).astype('float32')
+        cands = idx.query_candidates(q, window_size=50)
+        _, _, ids = idx.query(q, k=10, window_size=50)
+        missing = set(ids.tolist()) - set(cands.tolist())
+        assert not missing, f"top-k ids {missing} not in query_candidates output"
+
+
+# ── streaming_build sqeuclidean ───────────────────────────────────────────────
+
+@_register
+def test_streaming_build_sqeuclidean():
+    """streaming_build with sqeuclidean: metric preserved, distances ≥ 0, recall ≥ 0.60."""
+    import tempfile
+    import os
+    from ampi.streaming import streaming_build
+
+    rng  = np.random.default_rng(205)
+    n, d = 2_000, 32
+    data = rng.standard_normal((n, d)).astype('float32')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            idx = streaming_build(
+                lambda s, e: data[s:e],
+                n=n, d=d, nlist=16, num_fans=8,
+                metric='sqeuclidean', seed=0,
+                data_path=os.path.join(tmp, 'idx'),
+            )
+        except RuntimeError:
+            print("[SKIP] test_streaming_build_sqeuclidean: C++ ext not built")
+            return
+
+        assert idx.metric == 'sqeuclidean', f"metric: {idx.metric}"
+
+        qs    = rng.standard_normal((30, d)).astype('float32')
+        gt    = _brute_knn(data, qs, k=10)
+        found = []
+        for q in qs:
+            _, dists, ids = idx.query(q, k=10, window_size=200,
+                                      probes=idx.nlist, fan_probes=idx.F)
+            assert (dists >= 0).all(), f"sqeuclidean: negative dists: {dists.min()}"
+            found.append(ids)
+
+        rec = _recall(gt, found, k=10)
+        assert rec >= 0.60, f"sqeuclidean streaming recall@10 = {rec:.3f} < 0.60"
+
+
+# ── query k > live count ──────────────────────────────────────────────────────
+
+@_register
+def test_query_k_exceeds_live_count():
+    """query(k > n_live) must not crash and return at most n_live results."""
+    rng  = np.random.default_rng(303)
+    n, d = 20, 8
+    data = rng.standard_normal((n, d)).astype('float32')
+    idx  = AMPIAffineFanIndex(data, nlist=2, num_fans=4, seed=0)
+
+    for gid in range(0, n, 2):
+        idx.delete(gid)
+    n_live = n - n // 2
+
+    q = rng.standard_normal(d).astype('float32')
+    _, dists, ids = idx.query(q, k=100, window_size=200,
+                              probes=idx.nlist, fan_probes=idx.F)
+    assert len(ids) <= n_live, f"returned {len(ids)} results with only {n_live} live points"
+    assert len(ids) >= 1, "no results returned"
+    assert (dists >= 0).all(), f"negative distances: {dists}"
+
+
+# ── AFanTuner edge cases ──────────────────────────────────────────────────────
+
+@_register
+def test_afantuner_edge_cases():
+    """AFanTuner with n_bo_iter=1 and small n_sample must not crash."""
+    from ampi import AFanTuner
+
+    rng  = np.random.default_rng(304)
+    n, d = 500, 8
+    data = rng.standard_normal((n, d)).astype('float32')
+    qs   = rng.standard_normal((10, d)).astype('float32')
+    gt   = _brute_knn(data, qs, k=10)
+
+    tuner  = AFanTuner(data, qs, gt, n_bo_iter=1)
+    result = tuner.tune(verbose=False)
+    assert result['nlist'] >= 1, "nlist < 1"
+    assert result['F']     >= 1, "F < 1"
+
+    tuner2  = AFanTuner(data, qs, gt, n_sample=50, n_bo_iter=2)
+    result2 = tuner2.tune(verbose=False)
+    assert result2['nlist'] >= 1, "n_sample=50: nlist < 1"
+
+
 # ── runner ────────────────────────────────────────────────────────────────────
 
 def main():

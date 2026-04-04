@@ -514,6 +514,127 @@ def test_streaming_build_correctness():
         assert _sb_rec >= 0.70, f"streaming recall@10 = {_sb_rec:.3f} < 0.70"
 
 
+def test_kernels_direct():
+    """project_data / l2_distances / jit_union_query: shape, dtype, and numerical correctness."""
+    from ampi._kernels import project_data, l2_distances, jit_union_query
+
+    rng = np.random.default_rng(77)
+    n, d, L = 200, 16, 8
+    data = rng.standard_normal((n, d)).astype(np.float32)
+    dirs = rng.standard_normal((L, d)).astype(np.float32)
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+
+    # project_data
+    projs = project_data(data, dirs)
+    assert projs.shape == (L, n), f"project_data shape: {projs.shape}"
+    assert projs.dtype == np.float32, f"project_data dtype: {projs.dtype}"
+    np_projs = (dirs @ data.T).astype(np.float32)
+    np.testing.assert_allclose(projs, np_projs, atol=1e-4, err_msg="project_data vs numpy")
+
+    # l2_distances
+    q = rng.standard_normal(d).astype(np.float32)
+    cands = np.arange(0, n, 2, dtype=np.int32)
+    dists = l2_distances(data, q, cands)
+    assert dists.shape == (len(cands),), f"l2_distances shape: {dists.shape}"
+    assert (dists >= 0).all(), "l2_distances negative"
+    exact = np.sum((data[cands] - q) ** 2, axis=1).astype(np.float32)
+    np.testing.assert_allclose(dists, exact, rtol=1e-4, atol=1e-4,
+        err_msg="l2_distances vs numpy")
+
+    # jit_union_query: sorted inputs are required
+    sorted_idxs = np.argsort(projs, axis=1).astype(np.int32)
+    sorted_projs = np.sort(projs, axis=1).astype(np.float32)
+    q_projs = (dirs @ q).astype(np.float32)
+    result = jit_union_query(sorted_idxs, sorted_projs, q_projs, window_size=10)
+    assert result.ndim == 1, "jit_union_query not 1-D"
+    assert result.dtype == np.int32, f"jit_union_query dtype: {result.dtype}"
+    assert len(result) <= 2 * 10 * L, "jit_union_query: too many candidates"
+    assert len(set(result.tolist())) == len(result), "jit_union_query: duplicates"
+
+
+def test_binary_index_properties():
+    """AMPIBinaryIndex attributes: shapes, dtypes, unit-vector axes, sorted projections."""
+    n, d, L = 300, 16, 32
+    rng = np.random.default_rng(88)
+    data = rng.standard_normal((n, d)).astype(np.float32)
+    idx = AMPIBinaryIndex(data, num_projections=L, seed=3)
+
+    assert idx.n == n,   f"n: {idx.n}"
+    assert idx.d == d,   f"d: {idx.d}"
+    assert idx.L == L,   f"L: {idx.L}"
+    assert idx.proj_dirs.shape   == (L, d), f"proj_dirs shape: {idx.proj_dirs.shape}"
+    assert idx.sorted_idxs.shape == (L, n), f"sorted_idxs shape: {idx.sorted_idxs.shape}"
+    assert idx.sorted_projs.shape == (L, n), f"sorted_projs shape: {idx.sorted_projs.shape}"
+    assert idx.proj_dirs.dtype   == np.float32
+    assert idx.sorted_idxs.dtype  == np.int32
+    assert idx.sorted_projs.dtype == np.float32
+
+    norms = np.linalg.norm(idx.proj_dirs, axis=1)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-5, err_msg="proj_dirs not unit vectors")
+
+    for i in range(L):
+        assert np.all(idx.sorted_projs[i, :-1] <= idx.sorted_projs[i, 1:]), \
+            f"direction {i}: sorted_projs not sorted"
+
+    np.testing.assert_array_equal(idx.data, data)
+
+
+def test_afantuner_n_sample():
+    """AFanTuner with n_sample < n must produce a valid index."""
+    _rng_ns    = np.random.default_rng(100)
+    _n_ns, _d_ns = 1_000, 8
+    _data_ns   = _rng_ns.standard_normal((_n_ns, _d_ns)).astype("float32")
+    _qs_ns     = _rng_ns.standard_normal((10, _d_ns)).astype("float32")
+
+    _flat_ns = faiss.IndexFlatL2(_d_ns)
+    _flat_ns.add(_data_ns)
+    _, _gt_ns = _flat_ns.search(_qs_ns, 10)
+
+    _tuner_ns = AFanTuner(_data_ns, _qs_ns, _gt_ns, n_sample=200, n_bo_iter=2)
+    _res_ns   = _tuner_ns.tune(verbose=False)
+    assert isinstance(_res_ns["index"], AMPIAffineFanIndex), \
+        "AFanTuner(n_sample=200) did not return AMPIAffineFanIndex"
+    assert _res_ns["nlist"] >= 1
+
+
+@_skipif(not _HAS_CPP, reason="C++ ext not built")
+def test_streaming_build_sqeuclidean():
+    """streaming_build with sqeuclidean: metric preserved, distances non-negative."""
+    from ampi.streaming import streaming_build
+
+    _rng_sq = np.random.default_rng(66)
+    _n_sq, _d_sq = 1_000, 16
+    _data_sq = _rng_sq.standard_normal((_n_sq, _d_sq)).astype(np.float32)
+
+    with tempfile.TemporaryDirectory() as _sq_dir:
+        _idx_sq = streaming_build(
+            lambda s, e: _data_sq[s:e],
+            n=_n_sq, d=_d_sq, nlist=8, num_fans=8,
+            metric='sqeuclidean', seed=0,
+            data_path=_sq_dir,
+        )
+        assert _idx_sq.metric == 'sqeuclidean', f"metric: {_idx_sq.metric}"
+        _q_sq = _rng_sq.standard_normal(_d_sq).astype(np.float32)
+        _, _d_ret, _ids_sq = _idx_sq.query(
+            _q_sq, k=5, window_size=100, probes=_idx_sq.nlist, fan_probes=_idx_sq.F)
+        assert len(_ids_sq) == 5, f"sqeuclidean streaming: {len(_ids_sq)} results"
+        assert (_d_ret >= 0).all(), f"sqeuclidean streaming: negative dists: {_d_ret}"
+
+
+def test_query_k_robustness():
+    """query with k >= n must not crash and return ≤ n results with non-negative distances."""
+    _rng_rob = np.random.default_rng(55)
+    _data_rob = _rng_rob.standard_normal((10, 8)).astype(np.float32)
+    _idx_rob  = AMPIAffineFanIndex(_data_rob, nlist=2, num_fans=4, seed=0)
+    _q_rob    = _rng_rob.standard_normal(8).astype(np.float32)
+
+    _, _d_rob, _ids_rob = _idx_rob.query(
+        _q_rob, k=50, window_size=100, probes=_idx_rob.nlist, fan_probes=_idx_rob.F)
+    assert len(_ids_rob) <= 10, f"query returned {len(_ids_rob)} > n=10"
+    assert len(_ids_rob) > 0,   "query returned no results"
+    assert (_d_rob >= 0).all(), f"negative distances: {_d_rob}"
+
+
 # ── CLI runner (python tests/smoke_test.py) ───────────────────────────────────
 
 def main():
@@ -531,6 +652,11 @@ def main():
         test_afantuner_smoke,
         test_mmap_backed_data_buffer,
         test_streaming_build_correctness,
+        test_kernels_direct,
+        test_binary_index_properties,
+        test_afantuner_n_sample,
+        test_streaming_build_sqeuclidean,
+        test_query_k_robustness,
     ]
     passed, failed = [], []
     for fn in _tests:
