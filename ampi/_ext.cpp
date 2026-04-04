@@ -482,7 +482,10 @@ public:
     // Sketch table: sketch[gid*F + f] = dot(x_gid, global_axis_f).
     // Bessel: ||sketch(q) - sketch(x)||² ≤ ||q - x||² for any orthonormal A.
     // Used as a cheap in-RAM lower bound to prune candidates before mmap access.
-    std::vector<float> sketch;   // capacity × F, row-major
+    // Owned via shared_ptr so that numpy arrays returned by get_sketch() can
+    // hold a ref-counted copy of the capsule; _grow_buffers() allocates a fresh
+    // vector (never resizes in place) to avoid invalidating those raw pointers.
+    std::shared_ptr<std::vector<float>> _sketch_sp;  // capacity × F, row-major
 
     // Precomputed squared L2 norms: norms[gid] = ||x_gid||².
     // Used by _rerank_blas to avoid recomputing per-row norms during gather.
@@ -524,7 +527,7 @@ public:
           cluster_cones(std::move(o.cluster_cones)),
           U_drift(std::move(o.U_drift)),
           cluster_axes(std::move(o.cluster_axes)),
-          sketch(std::move(o.sketch)),
+          _sketch_sp(std::move(o._sketch_sp)),
           norms(std::move(o.norms)),
           point_cones(std::move(o.point_cones)),
           merge_interval(o.merge_interval),
@@ -765,13 +768,13 @@ public:
 
         // Load pre-computed sketch from data_path/_sketch.dat if present;
         // otherwise compute from mmap via BLAS (sequential scan, OS-prefetchable).
-        idx.sketch.resize((size_t)n_total * F, 0.f);
+        idx._sketch_sp = std::make_shared<std::vector<float>>((size_t)n_total * F, 0.f);
         {
             std::string sketch_path = data_path + "/_sketch.dat";
             std::ifstream sf(sketch_path, std::ios::binary);
             size_t expected = (size_t)n_total * F * sizeof(float);
             if (sf.good()) {
-                sf.read(reinterpret_cast<char*>(idx.sketch.data()), (std::streamsize)expected);
+                sf.read(reinterpret_cast<char*>(idx._sketch_sp->data()), (std::streamsize)expected);
                 if (!sf || (size_t)sf.gcount() != expected)
                     idx._build_sketch_all();   // partial read → recompute
             } else {
@@ -1084,11 +1087,17 @@ public:
     }
 
     py::array_t<float> get_sketch() {
-        py::capsule dummy(sketch.data(), [](void*){});
+        // Capsule holds a ref-counted copy of _sketch_sp so the underlying
+        // allocation stays alive even after _grow_buffers() replaces _sketch_sp
+        // with a fresh vector.  Mirrors the get_data_view() / _data_buf_sp pattern.
+        auto* owner = new std::shared_ptr<std::vector<float>>(_sketch_sp);
+        py::capsule capsule(owner, [](void* p) {
+            delete static_cast<std::shared_ptr<std::vector<float>>*>(p);
+        });
         return py::array_t<float>(
             {(py::ssize_t)n, (py::ssize_t)F},
             {(py::ssize_t)(F * sizeof(float)), (py::ssize_t)sizeof(float)},
-            sketch.data(), dummy);
+            _sketch_sp->data(), capsule);
     }
 
     bool has_cones(int c) const {
@@ -1326,13 +1335,13 @@ public:
 
             std::vector<float> sq_dists(m, std::numeric_limits<float>::infinity());
 
-            if (M2 >= m || sketch.empty()) {
+            if (M2 >= m || !_sketch_sp || _sketch_sp->empty()) {
                 // Small candidate set or no sketch — BLAS rerank all at once.
                 _rerank_blas(cands, qptr, q_sq, sq_dists);
             } else {
                 // Compute sketch distances for all m candidates (pure RAM).
                 std::vector<float> sk_dists(m);
-                const float* sk_table = sketch.data();
+                const float* sk_table = _sketch_sp->data();
                 const float* qsk      = q_sketch.data();
                 for (int i = 0; i < m; ++i) {
                     const float* sk = sk_table + (size_t)cands[i] * F;
@@ -1635,7 +1644,12 @@ private:
         }
         del_mask.resize(new_cap, 0);
         point_cones.resize(new_cap);
-        sketch.resize((size_t)new_cap * F, 0.f);
+        // Allocate a fresh vector rather than resize-in-place so that raw pointers
+        // held by any numpy arrays returned by get_sketch() remain valid.
+        auto new_sk = std::make_shared<std::vector<float>>((size_t)new_cap * F, 0.f);
+        if (_sketch_sp)
+            std::copy(_sketch_sp->begin(), _sketch_sp->begin() + (size_t)n * F, new_sk->begin());
+        _sketch_sp = std::move(new_sk);
         norms.resize(new_cap, 0.f);
         capacity = new_cap;
     }
@@ -1643,7 +1657,7 @@ private:
     // Compute sketch[gid*F .. +F] = axes[F×d] @ x[d]  — single BLAS call.
     // x is the raw (un-normalised, un-centered) stored vector.
     void _update_sketch_point(uint32_t gid, const float* x) {
-        float* sk = sketch.data() + (size_t)gid * F;
+        float* sk = _sketch_sp->data() + (size_t)gid * F;
         ampi::sgemm(F, 1, d,
                     axes.data(), d,
                     x, 1,
@@ -1653,14 +1667,16 @@ private:
 
     // Build sketch for all live points via BLAS: sketch (n×F) = data (n×d) @ axes^T (F×d).
     void _build_sketch_all() {
-        sketch.assign((size_t)capacity * F, 0.f);
+        if (!_sketch_sp)
+            _sketch_sp = std::make_shared<std::vector<float>>();
+        _sketch_sp->assign((size_t)capacity * F, 0.f);
         if (n == 0) return;
         // Gather live rows into a contiguous buffer, then GEMM.
         // For mmap-backed data the sequential read is OS-prefetchable.
         ampi::sgemm((int)n, F, d,
                     _data_ptr, d,
                     axes.data(), d,
-                    sketch.data(), F,
+                    _sketch_sp->data(), F,
                     /*transA=*/false, /*transB=*/true);
     }
 
