@@ -1090,6 +1090,7 @@ public:
         // Capsule holds a ref-counted copy of _sketch_sp so the underlying
         // allocation stays alive even after _grow_buffers() replaces _sketch_sp
         // with a fresh vector.  Mirrors the get_data_view() / _data_buf_sp pattern.
+        std::shared_lock<std::shared_mutex> lk(*p_mutex);
         auto* owner = new std::shared_ptr<std::vector<float>>(_sketch_sp);
         py::capsule capsule(owner, [](void* p) {
             delete static_cast<std::shared_ptr<std::vector<float>>*>(p);
@@ -1678,6 +1679,12 @@ private:
                     axes.data(), d,
                     _sketch_sp->data(), F,
                     /*transA=*/false, /*transB=*/true);
+        // Zero sketch entries for deleted slots so stale vectors don't corrupt
+        // the sketch table (matches the zeroing strategy in _build_norms_all).
+        for (uint32_t i = 0; i < n; ++i)
+            if (del_mask[i])
+                std::fill(_sketch_sp->data() + (size_t)i * F,
+                          _sketch_sp->data() + (size_t)(i + 1) * F, 0.f);
     }
 
     // Precompute centroid_norms_sq[c] = ||centroid_c||² for all clusters.

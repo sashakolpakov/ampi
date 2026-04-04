@@ -375,8 +375,8 @@ class AMPIAffineFanIndex:
         # ── Global fan directions ─────────────────────────────────────────
         rng  = np.random.RandomState(seed)
         axes = rng.randn(self.F, self.d).astype(np.float32)
-        axes /= np.linalg.norm(axes, axis=1, keepdims=True)
-        self.axes = axes  # (F, d)
+        Q, _ = np.linalg.qr(axes.T)   # Q: (d, F) orthonormal columns
+        self.axes = Q.T.astype(np.float32)  # (F, d) orthonormal rows
 
         # ── K-means partition ─────────────────────────────────────────────
         self.centroids, assignments = _mini_batch_kmeans(
@@ -604,7 +604,8 @@ class AMPIAffineFanIndex:
         if norms[0] < 1e-6:
             return self.axes          # no signal yet — use global axes
         U_norm = U / np.maximum(norms, 1e-12)
-        return U_norm.T.astype(np.float32)  # (F, d)
+        Q, _ = np.linalg.qr(U_norm)   # Q: (d, F) orthonormal columns
+        return Q.T.astype(np.float32)  # (F, d) orthonormal rows
 
     def _check_drift(self, c):
         """Check if U_drift[:,0] has rotated > drift_theta from all fan axes.
