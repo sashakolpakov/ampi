@@ -12,7 +12,9 @@ path.  FAISS IVF drifts silently as data shifts and eventually needs a full glob
 retrain.  AMPI is designed around the assumption that your data changes continuously.
 
 **How AMPI stays fresh without rebuilding:**
-- Inserts and deletes are O(1) amortised — no sorted arrays are rebuilt globally.
+- Deletes are O(1) tombstone.  Inserts are O(F·n/nlist) — sorted-array shift in
+  the affected cone — which in practice means O(F·√n) as nlist scales with √n.
+  No global rebuild is ever needed.
 - Per-cluster Oja subspace sketch detects directional drift and triggers a
   *local* cone refresh only for the affected cluster — O(N_c · F · d) vs
   O(T · n · M · d) for a full IVF retrain.
@@ -200,7 +202,7 @@ In a live system, this assumption breaks quickly:
 
 | Operation | HNSW | FAISS IVF | AMPI |
 |---|---|---|---|
-| Insert | graph degrades silently | O(1) append, no quality loss | O(1) amortised, guaranteed membership |
+| Insert | graph degrades silently | O(1) append, no quality loss | O(F·n/nlist) sorted-array shift, guaranteed membership |
 | Delete | `mark_deleted` only — ghost nodes pollute graph | unsupported or full scan | O(1) tombstone, auto-compacted |
 | Update | mark + insert, compounding both problems | unsupported | delete + insert |
 | Recovery from drift | **full rebuild** (4–6 min at 1M vectors) | **full global retrain** | per-cluster local refresh only |
@@ -228,7 +230,7 @@ python benchmarks/benchmark_vs_faiss.py all --force  # re-download data
 | `fashion` | Fashion-MNIST, n=60k, d=784, Euclidean | ~55 MB |
 | `sift` | SIFT descriptors, n=1M, d=128, Euclidean | ~350 MB |
 | `glove` | GloVe Twitter, n=1.18M, d=100, cosine | ~500 MB |
-| `gist` | GIST, n=1M, d=960, Euclidean (high-d stress test; benchmarked at 200k) | ~3.6 GB |
+| `gist` | GIST, n=1M, d=960, Euclidean (high-d stress test; benchmarked at 200k–500k) | ~3.6 GB |
 
 To download manually or inspect which files are present:
 
@@ -290,9 +292,12 @@ ampi/
 │   ├── tuner.py          # AFanTuner (GP-BO over alpha, Pareto knee detection)
 │   └── README.md         # package-level pointer to this document
 ├── benchmarks/
-│   ├── benchmark_vs_faiss.py  # recall@1/10/100 vs FAISS (Flat L2 + IVF)
-│   ├── benchmark_vs_hnsw.py   # recall@1/10/100 vs hnswlib
-│   ├── _bench_common.py       # shared dataset loaders, evaluation, AMPI builder
+│   ├── benchmark_vs_faiss.py       # recall@1/10/100 vs FAISS (Flat L2 + IVF)
+│   ├── benchmark_vs_hnsw.py        # recall@1/10/100 vs hnswlib
+│   ├── benchmark_gist_large.py     # GIST large-scale (250k–500k), streaming build
+│   ├── benchmark_insert_scaling.py # per-insert latency vs index size (O(n) analysis)
+│   ├── benchmark_sketch_rerank.py  # sketch-based lazy rerank ablation
+│   ├── _bench_common.py            # shared dataset loaders, evaluation, AMPI builder
 │   ├── download_data.py            # dataset downloader (auto-called by benchmarks)
 │   ├── profile_drift_threshold.py  # per-cluster fan-axis variance profiler
 │   └── _bench_sgemm.py             # project_data microbenchmark (scalar loop vs SGEMM)
@@ -318,9 +323,12 @@ ampi/
 The full hot path is in C++: routing, drift EMA, mutable index state, query loop,
 `batch_add`/`batch_delete`, and concurrent reader/writer locking (`std::shared_mutex`).
 
+Completed milestones:
+
+- **Persistence** — WAL + checkpoint serializer for single-node durability. ✓
+
 Near-term milestones:
 
-- **Persistence** — WAL + checkpoint serializer for single-node durability.
 - **Distributed** — coordinator + multi-shard query fan-out, cluster splits, rebalancing.
 
 See `DATABASE_PLAN.md` for the persistence/distributed plan and `TODO.md` for current

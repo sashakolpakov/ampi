@@ -484,14 +484,21 @@ def build_ampi_configs(data, queries, gt, metric='l2', data_path=None):
                 os.makedirs(kw["data_path"], exist_ok=True)
             af_indexes[ktk] = _build(tag, AMPIAffineFanIndex, **kw)
 
-    print("  Warming up AMPI indexes...", flush=True)
-    for w in [wb, 2 * wb, 4 * wb]:
-        for q in queries[:WARMUP]:
-            idx_bin.query(q, k=K, window_size=w)
-    for ktk, idx_af in af_indexes.items():
-        for q in queries[:WARMUP]:
-            idx_af.query(q, k=K, window_size=wb, probes=10, fan_probes=best_F)
-    print("  Warmup complete.")
+    if data_path is None:
+        # In-memory data: warmup primes JIT and branch predictors.
+        print("  Warming up AMPI indexes...", flush=True)
+        for w in [wb, 2 * wb, 4 * wb]:
+            for q in queries[:WARMUP]:
+                idx_bin.query(q, k=K, window_size=w)
+        for ktk, idx_af in af_indexes.items():
+            for q in queries[:WARMUP]:
+                idx_af.query(q, k=K, window_size=wb, probes=10, fan_probes=best_F)
+        print("  Warmup complete.")
+    else:
+        # mmap-backed data: warmup would page-fault the entire file for each
+        # query and take longer than the actual benchmark. Skip it — QPS is
+        # averaged over all N_QUERIES so cold pages are priced in fairly.
+        print("  Skipping warmup (mmap-backed data).")
 
     # Build the query-parameter sweep configs
     limit         = MAX_CAND_FRAC * n

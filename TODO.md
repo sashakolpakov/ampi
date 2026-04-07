@@ -152,7 +152,6 @@ All phases merged (branch `cpp-pipeline`).
 - [x] `_CppConesProxy` / `_CppClusterCones` — Python `cluster_cones[c][f]` proxies to live
       C++ `SortedCone` objects (no `None` stubs).
 
-### Open
 - [x] Replace `std::vector` per-cone sorted array with B-tree / skip-list when
       n_cone > 10k (reduces insert from O(n_cone) shift to O(log n_cone)).
 
@@ -169,8 +168,8 @@ All phases merged (branch `cpp-pipeline`).
 - [x] Fashion-MNIST (60k, d=784)
 - [x] SIFT-128 full 1M
 - [x] Recall@1 / Recall@100 curves (benchmarks/benchmark.py reports all three)
-- [x] GIST (1M, d=960) — 200k cap (historical); full 1M now unblocked via streaming build.
-- [ ] GIST full 1M benchmark — unblocked by `streaming_build`; run to validate recall/QPS.
+- [x] GIST (1M, d=960) — benchmarked at 200k, 250k, and 500k via streaming build.
+- [ ] GIST full 1M benchmark — disk/RAM constrained on dev machine; 500k is current max.
 - [x] Profile per-cluster fan-axis variance to validate drift-detection threshold θ_drift
 - [x] Vote-distribution analysis: implemented `query_candidates_with_votes` for both
       Binary and AffineFan (branch `vote-distribution`).  Finding: no usable signal —

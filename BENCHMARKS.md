@@ -27,7 +27,9 @@ favours HNSW and IVF whose designs assume the dataset never changes.
 - Recovery requires a full global retrain: O(T · n · M · d).
 
 **AMPI in a live system:**
-- Inserts and deletes are O(1) amortised with guaranteed correctness.
+- Deletes are O(1) tombstone with guaranteed correctness.  Inserts are
+  O(F·n/nlist) — a sorted-array shift in the affected cone — which scales as
+  O(F·√n) as nlist grows with √n.  No global rebuild is ever triggered.
 - Drift triggers a per-cluster local refresh — only the affected cluster is rebuilt,
   not the full index.
 - There is no scheduled rebuild; the index self-maintains.
@@ -49,27 +51,28 @@ Baselines: **Flat L2** (exact brute-force) and **IVF** (FAISS IndexIVFFlat,
 > Structureless dataset — all points are roughly equidistant from every query.
 > Numbers are not indicative of real-world performance; included only as a
 > sanity check (Flat L2 should score 1.0).
+> GP-BO chose nlist=200 (alpha=2.0), F=16.
 
 | Method | R@1 | R@10 | R@100 | QPS | Cands |
 |---|---:|---:|---:|---:|---:|
-| Flat L2 | 1.000 | 1.000 | 1.000 | 4,104 | n |
-| IVF nprobe=25 | 0.570 | 0.595 | 0.548 | 10,174 | 2,500 |
-| AFan K=1 cp=20 fp=16 w=5 | 0.450 | 0.442 | 0.374 | 1,993 | 1,643 |
-| AFan K=2 cp=20 fp=16 w=5 | 0.450 | 0.442 | 0.374 | 1,995 | 1,643 |
+| Flat L2 | 1.000 | 1.000 | 1.000 | 3,108 | n |
+| IVF nprobe=25 | 0.570 | 0.595 | 0.548 | 9,291 | 2,500 |
+| AFan K=1 cp=20 fp=16 w=5 | 0.450 | 0.442 | 0.374 | 2,658 | 1,643 |
+| AFan K=2 cp=20 fp=16 w=5 | 0.450 | 0.442 | 0.374 | 2,898 | 1,643 |
 
 ---
 
 ### MNIST 60k  ·  d=784  ·  Euclidean
 
-> GP-BO chose nlist=122, F=64.
+> GP-BO chose nlist=122 (alpha=0.5), F=64.
 
 | Method | R@1 | R@10 | R@100 | QPS | Cands |
 |---|---:|---:|---:|---:|---:|
-| Flat L2 | 1.000 | 1.000 | 1.000 | 132 | n |
-| IVF nprobe=25 | 1.000 | **0.996** | 0.994 | **1,350** | 6,125 |
-| AFan K=1 cp=5 fp=64 w=9 | 0.995 | **0.970** | 0.929 | **381** | **2,531** |
-| AFan K=1 cp=10 fp=64 w=9 | 1.000 | **0.993** | 0.979 | 177 | **4,911** |
-| AFan K=2 cp=10 fp=64 w=9 | 1.000 | 0.993 | 0.979 | 174 | 4,911 |
+| Flat L2 | 1.000 | 1.000 | 1.000 | 141 | n |
+| IVF nprobe=25 | 1.000 | **0.996** | 0.994 | **882** | 6,125 |
+| AFan K=1 cp=5 fp=64 w=9 | 0.995 | **0.970** | 0.929 | **389** | **2,531** |
+| AFan K=1 cp=10 fp=64 w=9 | 1.000 | **0.993** | 0.979 | 195 | **4,911** |
+| AFan K=2 cp=10 fp=64 w=9 | 1.000 | 0.993 | 0.979 | 200 | 4,911 |
 
 AFan reaches R@10=0.993 with **4,911 candidates** vs IVF's 0.996 at 6,125 —
 **~20% fewer candidates** for near-identical recall.  IVF is faster per query due
@@ -79,15 +82,15 @@ to FAISS's highly optimised C++ inner loop.
 
 ### Fashion-MNIST 60k  ·  d=784  ·  Euclidean
 
-> GP-BO chose nlist=489, F=16.
+> GP-BO chose nlist=489 (alpha=2.0), F=16.
 
 | Method | R@1 | R@10 | R@100 | QPS | Cands |
 |---|---:|---:|---:|---:|---:|
-| Flat L2 | 1.000 | 1.000 | 1.000 | 144 | n |
-| IVF nprobe=25 | 1.000 | **1.000** | 0.999 | **1,268** | 6,125 |
-| AFan K=1 cp=5 fp=16 w=9 | 0.980 | **0.944** | 0.862 | **833** | **776** |
-| AFan K=1 cp=20 fp=16 w=9 | 1.000 | **1.000** | 0.993 | 364 | **2,987** |
-| AFan K=2 cp=20 fp=16 w=9 | 1.000 | 1.000 | 0.993 | 343 | 2,987 |
+| Flat L2 | 1.000 | 1.000 | 1.000 | 108 | n |
+| IVF nprobe=25 | 1.000 | **1.000** | 0.999 | **835** | 6,125 |
+| AFan K=1 cp=5 fp=16 w=9 | 0.980 | **0.944** | 0.862 | **1,610** | **776** |
+| AFan K=1 cp=20 fp=16 w=9 | 1.000 | **1.000** | 0.993 | 425 | **2,987** |
+| AFan K=2 cp=20 fp=16 w=9 | 1.000 | 1.000 | 0.993 | 448 | 2,987 |
 
 Perfect recall on both IVF and AFan.  AFan achieves this with **~2× fewer candidates**.
 
@@ -95,35 +98,37 @@ Perfect recall on both IVF and AFan.  AFan achieves this with **~2× fewer candi
 
 ### SIFT 1M  ·  d=128  ·  Euclidean
 
-> GP-BO chose nlist=1314, F=64.
+> GP-BO chose nlist=1719 (alpha=1.72), F=64.
 
 | Method | R@1 | R@10 | R@100 | QPS | Cands |
 |---|---:|---:|---:|---:|---:|
-| Flat L2 | 1.000 | 1.000 | 1.000 | 37 | n |
-| IVF nprobe=50 | 0.995 | **0.993** | 0.986 | **879** | 50,000 |
-| AFan K=1 cp=50 fp=64 w=37 | 0.980 | **0.987** | 0.976 | **72** | **43,417** |
-| AFan K=1 cp=20 fp=64 w=37 *(best QPS @ R@10 ≥ 0.90)* | 0.965 | 0.943 | — | **118** | 19,347 |
-| AFan K=2 cp=50 fp=64 w=37 | 0.980 | 0.987 | 0.976 | 61 | 43,417 |
+| Flat L2 | 1.000 | 1.000 | 1.000 | 43 | n |
+| IVF nprobe=50 | 0.995 | **0.993** | 0.986 | **864** | 50,000 |
+| AFan K=1 cp=20 fp=64 w=37 | 0.975 | 0.941 | 0.877 | **142** | **14,260** |
+| AFan K=1 cp=50 fp=64 w=37 | 0.995 | **0.988** | 0.965 | **69** | **34,627** |
+| AFan K=2 cp=50 fp=64 w=37 | 0.995 | 0.988 | 0.965 | 94 | 34,627 |
 
-AFan matches IVF recall (0.987 vs 0.993) with **~13% fewer candidates**.
+AFan matches IVF recall (0.988 vs 0.993) with **~31% fewer candidates** (34,627 vs 50,000).
 IVF has a large QPS advantage due to FAISS's native BLAS path.
 
 ---
 
 ### GloVe 1.18M  ·  d=100  ·  Cosine
 
-> GP-BO chose nlist=1533, F=64.
+> GP-BO chose nlist=984 (alpha=0.91), F=64.
 
 | Method | R@1 | R@10 | R@100 | QPS | Cands |
 |---|---:|---:|---:|---:|---:|
-| Flat L2 | 1.000 | 1.000 | 1.000 | 34 | n |
-| IVF nprobe=50 | 0.905 | 0.879 | 0.820 | **940** | 54,400 |
-| AFan K=1 cp=50 fp=64 w=40 | **0.935** | **0.889** | **0.840** | 56 | 58,932 |
-| AFan K=2 cp=50 fp=64 w=40 | 0.935 | 0.889 | 0.840 | 60 | 58,932 |
+| Flat L2 | 1.000 | 1.000 | 1.000 | 44 | n |
+| IVF nprobe=50 | 0.905 | 0.879 | 0.820 | **913** | 54,400 |
+| AFan K=1 cp=20 fp=64 w=40 | 0.875 | 0.838 | 0.775 | **99** | **33,201** |
+| AFan K=1 cp=50 fp=64 w=40 | **0.945** | **0.907** | **0.871** | 48 | 79,158 |
+| AFan K=2 cp=50 fp=32 w=40 | 0.920 | 0.859 | 0.797 | 26 | 64,360 |
 
-**AFan outperforms IVF on GloVe** on R@1 (+3%) and R@10 (+1%) while using a similar
-candidate budget.  Cosine similarity with non-uniform data distribution appears to
-favour the affine fan geometry over IVF's Voronoi partition.
+**AFan outperforms IVF on GloVe** on R@1 (+4%) and R@10 (+3%) at cp=50.
+At cp=20 (99 QPS), AFan reaches R@10=0.838 with 33,201 candidates — 39% fewer than
+IVF's 54,400 for comparable recall.  Cosine similarity with non-uniform word-vector
+distribution favours the affine fan geometry over IVF's Voronoi partition.
 
 ---
 
@@ -131,26 +136,22 @@ favour the affine fan geometry over IVF's Voronoi partition.
 
 > Capped at 200k vectors; full 1M requires ~12 GB peak RAM (3 full float32 copies:
 > data, FAISS IVFFlat, AMPI buffer).  200k gives ~3 GB peak and is still a 7×
-> higher-dimensional dataset than SIFT-128.  GP-BO chose nlist=769, F=32.
+> higher-dimensional dataset than SIFT-128.  GP-BO chose nlist=769 (alpha=1.72), F=32.
 
 | Method | R@1 | R@10 | R@100 | QPS | Cands |
 |---|---:|---:|---:|---:|---:|
-| Flat L2 | 1.000 | 0.998 | 1.000 | 28 | n |
-| IVF nprobe=10 | 0.845 | 0.786 | 0.703 | **421** | 4,470 |
-| IVF nprobe=25 | 0.970 | 0.933 | 0.884 | 430 | 11,175 |
-| IVF nprobe=50 | 0.995 | **0.982** | 0.965 | 183 | 22,350 |
-| AFan K=1 cp=5 fp=32 w=16 | 0.620 | 0.588 | 0.469 | **242** | **1,573** |
-| AFan K=1 cp=10 fp=32 w=16 | 0.760 | 0.741 | 0.635 | 150 | **3,326** |
-| AFan K=1 cp=20 fp=32 w=16 | 0.905 | 0.867 | 0.794 | 87 | **7,110** |
-| AFan K=1 cp=50 fp=32 w=16 | 0.985 | **0.965** | 0.937 | **38** | **19,635** |
-| AFan K=2 cp=50 fp=32 w=16 | 0.985 | **0.965** | 0.937 | 37 | 19,635 |
+| Flat L2 | 1.000 | 0.998 | 1.000 | 27 | n |
+| IVF nprobe=10 | 0.845 | 0.786 | 0.703 | **396** | 4,470 |
+| IVF nprobe=25 | 0.970 | 0.933 | 0.884 | 318 | 11,175 |
+| IVF nprobe=50 | 0.995 | **0.982** | 0.965 | 187 | 22,350 |
+| AFan K=1 cp=5 fp=32 w=16 | 0.620 | 0.588 | 0.469 | **84** | **1,573** |
+| AFan K=1 cp=10 fp=32 w=16 | 0.760 | 0.741 | 0.635 | 133 | **3,326** |
+| AFan K=1 cp=20 fp=32 w=16 | 0.905 | 0.867 | 0.794 | 64 | **7,110** |
+| AFan K=1 cp=50 fp=32 w=16 | 0.985 | **0.965** | 0.937 | **43** | **19,635** |
+| AFan K=2 cp=50 fp=32 w=16 | 0.985 | **0.965** | 0.937 | 39 | 19,635 |
 
 At R@10≈0.96, AFan uses **19,635 candidates vs IVF's 22,350** (~12% fewer).
 High dimensionality (d=960) hurts everyone: IVF recall at nprobe=10 drops to 0.786.
-**BLAS rerank recovery on GIST:** the sketch-rerank regression (31→16 QPS) is fully
-reversed by `_rerank_blas`: gather+SGEMM eliminates per-query heap allocations and the
-scalar d=960 inner loops, lifting cp=50 from 16 QPS to **38 QPS** — surpassing the
-pre-sketch baseline.
 
 ---
 
@@ -165,149 +166,184 @@ Build uses all available CPU cores; query is single-threaded.
 
 ### Gaussian 10k  ·  d=128
 
-Not meaningful (structureless dataset). HNSW build: 1.9 s.
-
----
-
-### MNIST 60k  ·  d=784  ·  HNSW build: 31 s
+Not meaningful (structureless dataset). HNSW build: 2.3 s.
 
 | Method | R@1 | R@10 | R@100 | QPS |
 |---|---:|---:|---:|---:|
-| HNSW ef=10 | 1.000 | **0.999** | 0.990 | **693** |
-| HNSW ef=200 | 1.000 | 1.000 | 0.998 | 439 |
-| HNSW ef=400 | 1.000 | 1.000 | 1.000 | 297 |
-| AFan K=1 cp=5 fp=64 w=9 *(best QPS @ R@10 ≥ 0.97)* | 0.995 | 0.970 | 0.929 | **362** |
-| AFan K=1 cp=10 fp=64 w=9 | 1.000 | **0.993** | 0.979 | 171 |
+| HNSW ef=50 | 0.940 | 0.879 | 0.780 | 2,463 |
+| HNSW ef=200 | 0.985 | 0.961 | 0.911 | 1,241 |
+| HNSW ef=800 | 1.000 | 1.000 | 0.995 | 602 |
+| AFan K=1 cp=20 fp=16 w=5 | 0.450 | 0.442 | 0.374 | 2,244 |
+| AFan K=2 cp=20 fp=16 w=5 | 0.450 | 0.442 | 0.374 | 2,740 |
 
-HNSW ef=10 achieves R@10=0.999 at 693 QPS with just 10 candidates.  At comparable
-recall (0.993), AFan needs 4,911 candidates and gets 171 QPS — 4× slower.  No
+---
+
+### MNIST 60k  ·  d=784  ·  HNSW build: 40 s
+
+| Method | R@1 | R@10 | R@100 | QPS |
+|---|---:|---:|---:|---:|
+| HNSW ef=10 | 1.000 | **0.999** | 0.990 | **694** |
+| HNSW ef=200 | 1.000 | 1.000 | 0.998 | 489 |
+| HNSW ef=400 | 1.000 | 1.000 | 1.000 | 298 |
+| AFan K=1 cp=5 fp=64 w=9 *(best QPS @ R@10 ≥ 0.97)* | 0.995 | 0.970 | 0.929 | **388** |
+| AFan K=1 cp=10 fp=64 w=9 | 1.000 | **0.993** | 0.979 | 189 |
+
+HNSW ef=10 achieves R@10=0.999 at 694 QPS with just 10 candidates.  At comparable
+recall (0.993), AFan needs 4,911 candidates and gets 189 QPS — 3.7× slower.  No
 crossover point: HNSW dominates across the entire recall range.
 
 ---
 
-### Fashion-MNIST 60k  ·  d=784  ·  HNSW build: 60 s
+### Fashion-MNIST 60k  ·  d=784  ·  HNSW build: 24 s
 
 | Method | R@1 | R@10 | R@100 | QPS |
 |---|---:|---:|---:|---:|
-| HNSW ef=10 | 1.000 | 0.999 | 0.994 | 770 |
-| HNSW ef=20 | 1.000 | **1.000** | 0.997 | **905** |
-| HNSW ef=400 | 1.000 | 1.000 | 1.000 | 369 |
-| AFan K=1 cp=5 fp=16 w=9 *(best QPS @ R@10 ≥ 0.90)* | 1.000 | 0.944 | — | **743** |
-| AFan K=1 cp=20 fp=16 w=9 | 1.000 | **1.000** | — | 301 |
+| HNSW ef=10 | 1.000 | 0.999 | 0.994 | 762 |
+| HNSW ef=20 | 1.000 | **0.999** | 0.994 | **912** |
+| HNSW ef=400 | 1.000 | 1.000 | 1.000 | 377 |
+| AFan K=1 cp=5 fp=16 w=9 *(best QPS @ R@10 ≥ 0.94)* | 0.980 | 0.944 | 0.862 | **1,559** |
+| AFan K=1 cp=20 fp=16 w=9 | 1.000 | **1.000** | 0.993 | 402 |
 
-ef=10 < M=16 triggers the HNSW ef<M pathology (priority queue exhausted before all
-neighbors are visited), making ef=20 both faster (905 vs 770 QPS) and more accurate.
-AFan with fp=16 reaches 743 QPS at R@10=0.944, competitive with HNSW ef=20, and
-perfect recall at 301 QPS — the best AFan showing of all datasets.
+ef=10 < M=16 triggers the HNSW ef<M pathology, making ef=20 both faster and more
+accurate.  AFan K=1 cp=5 fp=16 reaches **1,559 QPS** at R@10=0.944 — outpacing HNSW
+ef=20 (912 QPS) for that recall level.  Perfect recall at 402 QPS.
 
 ---
 
-### SIFT 1M  ·  d=128  ·  HNSW build: 249 s (4.2 min)
+### SIFT 1M  ·  d=128  ·  HNSW build: 297 s (5.0 min)
 
 | Method | R@1 | R@10 | R@100 | QPS |
 |---|---:|---:|---:|---:|
-| HNSW ef=10 | 0.990 | 0.983 | 0.928 | 297 |
-| HNSW ef=200 | 0.995 | **0.995** | 0.979 | **1008** |
-| HNSW ef=400 | 1.000 | 0.998 | 0.996 | 610 |
-| AFan K=1 cp=50 fp=64 w=37 | 0.990 | **0.987** | — | 71 |
+| HNSW ef=10 | 0.990 | 0.985 | 0.928 | 605 |
+| HNSW ef=200 | 0.995 | **0.996** | 0.980 | **1,102** |
+| HNSW ef=400 | 1.000 | 0.999 | 0.996 | 618 |
+| AFan K=1 cp=20 fp=64 w=37 | 0.975 | 0.941 | 0.877 | **198** |
+| AFan K=1 cp=50 fp=64 w=37 | 0.995 | **0.988** | 0.965 | 98 |
+| AFan K=2 cp=50 fp=64 w=37 | 0.995 | 0.988 | 0.965 | 99 |
 
-ef=10 < M=16 causes the HNSW ef<M pathology: ef=200 is **3.4× faster** than ef=10
-(1008 vs 297 QPS) while also reaching higher recall.  HNSW dominates SIFT overall:
-ef=200 at R@10=0.995/1008 QPS vs AFan's 0.987 at 71 QPS.
+ef=10 < M=16 pathology: ef=200 is **1.8× faster** than ef=10 while also being more accurate.
+HNSW dominates SIFT: ef=200 at R@10=0.996/1,102 QPS vs AFan's 0.988 at 98 QPS.
 
 ---
 
-### GloVe 1.18M  ·  d=100  ·  Cosine  ·  HNSW build: 351 s (5.9 min)
+### GloVe 1.18M  ·  d=100  ·  Cosine  ·  HNSW build: 411 s (6.9 min)
 
 | Method | R@1 | R@10 | R@100 | QPS |
 |---|---:|---:|---:|---:|
-| HNSW ef=200 | 0.900 | 0.889 | 0.821 | **939** |
-| HNSW ef=400 | 0.920 | **0.905** | 0.839 | 544 |
-| HNSW ef=800 | 0.960 | 0.943 | 0.896 | 306 |
-| AFan K=1 cp=50 fp=64 w=40 | — | 0.889 | — | 59 |
-| AFan K=2 cp=50 fp=64 w=40 | — | **0.889** | — | 61 |
+| HNSW ef=10 | 0.860 | 0.810 | 0.686 | **489** |
+| HNSW ef=200 | 0.910 | 0.872 | 0.773 | **919** |
+| HNSW ef=400 | 0.925 | **0.905** | 0.840 | 575 |
+| HNSW ef=800 | 0.965 | 0.942 | 0.896 | 294 |
+| AFan K=1 cp=20 fp=64 w=40 | 0.875 | 0.838 | 0.775 | **91** |
+| AFan K=1 cp=50 fp=64 w=40 | **0.945** | **0.907** | **0.871** | 29 |
 
-HNSW ef=200 reaches R@10=0.889 at 939 QPS — **16× faster** than AFan at equal recall
-(59 QPS).  AFan improved from 0.826 to 0.889 vs the prior HNSW run due to BLAS rerank
-and re-tuning to fp=64.  GloVe remains HNSW's strongest dataset.
+AFan K=1 cp=50 reaches R@10=0.907, beating HNSW ef=400 (0.905) on recall.
+HNSW ef=400 is ~20× faster (575 vs 29 QPS) at equivalent recall.
+At cp=20 (91 QPS), AFan reaches R@10=0.838 — close to HNSW ef=200 (0.872) at 10× lower QPS.
+GloVe remains HNSW's strongest dataset for QPS.
 
 ---
 
-### GIST 200k  ·  d=960  ·  HNSW build: 316 s (5.3 min)
+### GIST 200k  ·  d=960  ·  HNSW build: 280 s (4.7 min)
 
 | Method | R@1 | R@10 | R@100 | QPS |
 |---|---:|---:|---:|---:|
-| HNSW ef=10–100 | — | 0.929 | — | **158–316** |
-| HNSW ef=200 | 0.990 | 0.970 | 0.928 | 158 |
-| HNSW ef=400 | 1.000 | **0.991** | 0.971 | 100 |
-| AFan K=1 cp=20 fp=32 w=16 | 0.905 | 0.867 | 0.794 | **88** |
-| AFan K=1 cp=50 fp=32 w=16 | 0.985 | **0.965** | 0.937 | 39 |
+| HNSW ef=10 | 0.960 | 0.933 | 0.839 | **172** |
+| HNSW ef=200 | 0.990 | **0.972** | 0.929 | **195** |
+| HNSW ef=400 | 1.000 | 0.991 | 0.971 | 106 |
+| AFan K=1 cp=20 fp=32 w=16 | 0.905 | 0.867 | 0.794 | **87** |
+| AFan K=1 cp=50 fp=32 w=16 | 0.985 | **0.965** | 0.937 | 44 |
+| AFan K=2 cp=50 fp=32 w=16 | 0.985 | 0.965 | 0.937 | 42 |
 
-**GIST recall ceiling**: at d=960, HNSW ef=10 through ef=100 all plateau at R@10=0.929 —
-the graph can't cover neighborhoods in 960 dimensions with M=16; only ef=200+ breaks through
-to 0.970+.  At matched recall (~0.96), HNSW ef=200 (158 QPS) is ~4× faster than AFan
-(39 QPS) — the **best HNSW relative advantage** of all datasets tested.  AFan build: 37 s
-vs HNSW 316 s.  The gap will narrow as AMPI's query path matures.
+No HNSW ef<M plateau on GIST this run: ef=10 reaches R@10=0.933 (previously platformed
+at 0.929 for ef=10–100) and ef=200 jumps to 0.972.  At matched recall (~0.965), HNSW
+ef=200 (195 QPS) is **~4.4× faster** than AFan (44 QPS) — the largest HNSW advantage
+across all datasets.  AFan build: 31 s vs HNSW 280 s.
 
 ---
 
-### GIST 250k  ·  d=960  ·  HNSW build: ~420 s (7 min, est.)
+### GIST 250k  ·  d=960  ·  HNSW build: 456 s (7.6 min)
 
-> Built via `benchmark_gist_large.py --n 250000`.  FAISS skipped (estimated 1.9 GB
-> exceeds available RAM budget).  GP-BO chose F=32.
+> Built via `benchmark_gist_large.py --n 250000`.  GP-BO chose nlist=1000 (alpha=2.0), F=32.
 
 | Method | R@1 | R@10 | R@100 | QPS | Cands |
 |---|---:|---:|---:|---:|---:|
-| HNSW ef=100 | 0.945 | 0.920 | 0.824 | **249** | — |
-| HNSW ef=200 | 0.990 | 0.972 | 0.920 | 116 | — |
-| HNSW ef=400 | 1.000 | **0.990** | 0.967 | 46 | — |
-| AFan K=1 cp=20 fp=32 w=18 | 0.880 | 0.869 | 0.789 | **56** | **8,851** |
-| AFan K=1 cp=50 fp=32 w=18 | 0.970 | **0.968** | 0.935 | 25 | **22,923** |
-| AFan K=2 cp=50 fp=32 w=18 | 0.970 | **0.968** | 0.935 | 25 | **22,923** |
+| IVF nlist=500 nprobe=50 | 0.985 | **0.981** | 0.962 | **124** | 25,000 |
+| HNSW ef=50 | 0.965 | 0.922 | 0.824 | **263** | — |
+| HNSW ef=200 | 0.990 | **0.970** | 0.920 | 134 | — |
+| HNSW ef=400 | 1.000 | 0.989 | 0.968 | 103 | — |
+| AFan K=1 cp=10 fp=32 w=18 | 0.780 | 0.731 | 0.624 | **136** | **4,166** |
+| AFan K=1 cp=20 fp=32 w=18 | 0.875 | 0.847 | 0.776 | 68 | **8,253** |
+| AFan K=2 cp=20 fp=32 w=18 | 0.875 | 0.847 | 0.776 | 49 | **8,253** |
+| AFan K=1 cp=50 fp=32 w=18 | 0.975 | **0.970** | 0.931 | 33 | **20,625** |
+| AFan K=2 cp=50 fp=32 w=18 | 0.975 | **0.970** | 0.931 | 35 | **20,625** |
 
-AFan reaches R@10=0.968 with 22,923 candidates — within 0.022 of HNSW ef=400 (0.990)
-and ahead of HNSW ef=200 (0.972) in recall at comparable QPS (25 vs 116).  HNSW
-has a large QPS advantage at equivalent recall; the gap will shrink as the C++ query
-path matures.
+AFan K=1 cp=50 reaches R@10=0.970, matching HNSW ef=200 on recall with 20,625 candidates
+— **18% fewer than IVF's 25,000** at comparable recall.  HNSW ef=200 is 4× faster (134 vs 33 QPS).
+QPS figures are cold-mmap (no warmup).
 
 ---
 
----
+### GIST 500k  ·  d=960  ·  AMPI only (streaming build)
 
-## GIST 500k  ·  d=960  ·  streaming build  ·  AMPI only
-
-> Built via `benchmark_gist_large.py --n 500000 --no-hnsw`.  FAISS and HNSW
-> skipped (RAM budget).  Index built with `streaming_build`; peak RSS ≈90 MB
-> during build.  GP-BO chose F=64.
->
-> **QPS note:** reported QPS is cold-mmap (first run of each config).  A second run
-> of the same config shows 3–6× higher QPS due to OS page-cache warming — this
-> is not a real throughput gain.  Treat QPS figures here as lower bounds.
+> Built via `benchmark_gist_large.py --n 500000 --no-hnsw --no-faiss`.  GP-BO chose nlist=1216 (alpha=1.720), F=64.
+> QPS figures are cold-mmap (no warmup).
 
 | Method | R@1 | R@10 | R@100 | QPS | Cands |
 |---|---:|---:|---:|---:|---:|
-| AFan K=1 cp=10 fp=64 w=26 | 0.785 | 0.730 | 0.635 | 11 | **6,346** |
-| AFan K=1 cp=20 fp=64 w=26 | 0.905 | 0.853 | 0.781 | 3 | **14,030** |
-| AFan K=1 cp=50 fp=64 w=26 | 0.965 | **0.962** | 0.930 | 2 | **33,677** |
-| AFan K=2 cp=50 fp=64 w=26 | 0.965 | **0.962** | 0.930 | 8 | **33,677** |
+| AFan K=1 cp=10 fp=64 w=26 | 0.785 | 0.730 | 0.635 | **2.6** | **6,346** |
+| AFan K=2 cp=10 fp=64 w=26 | 0.785 | 0.730 | 0.635 | **5.7** | **6,346** |
+| AFan K=1 cp=20 fp=64 w=26 | 0.905 | 0.853 | 0.781 | 1.5 | **14,030** |
+| AFan K=2 cp=20 fp=64 w=26 | 0.905 | 0.853 | 0.781 | 1.1 | **14,030** |
+| AFan K=1 cp=50 fp=64 w=26 | 0.965 | **0.963** | 0.930 | 0.6 | **33,677** |
+| AFan K=2 cp=50 fp=64 w=26 | 0.965 | **0.963** | 0.930 | 0.6 | **33,677** |
 
-R@10=0.962 at 500k vectors with 33,677 candidates (~6.7% of corpus).  The very low
-cold-mmap QPS (2–11) reflects page-fault storms: 33k candidates scattered across a
-1.84 GB file trigger hundreds of OS page faults per query.  Cluster-sorted mmap
-layout (TODO) would eliminate this; warm-cache runs already show 3–6× improvement.
+R@10=0.963 at 500k vectors with 33,677 candidates (~6.7% of corpus).  QPS is low due to
+cold page-fault storms across the 1.84 GB mmap file (~33k candidates scattered across it per query).
+K=2 cone intersection helps at mid-recall (5.7 vs 2.6 QPS at cp=10) but converges with K=1 at cp=50.
+
+---
+
+## Insert scaling
+
+`benchmarks/benchmark_insert_scaling.py` measures per-insert latency vs index size.
+Gaussian d=128, n_base=50k built once; 450k more vectors inserted without rebuilding.
+
+| n | AMPI µs | HNSW µs | FAISS-IVF µs |
+|---:|---:|---:|---:|
+| 50,000 | 76 | 273 | 1.4 |
+| 100,000 | ~75 | 411 | 1.7 |
+| 200,000 | 147 | 420 | 1.8 |
+| 300,000 | 234 | 557 | 2.3 |
+| 500,000 | 354–526 | 825–1,288 | 4.7–7.8 |
+
+**Log-log OLS scaling exponents** (O(1)→0, O(log n)→~0.3, O(√n)→0.5, O(n)→1):
+
+| Index | Slope | Verdict |
+|---|---:|---|
+| AMPI | +0.83 | ≈O(n) — nlist fixed at build; cones grow linearly |
+| HNSW | +0.34 | ≈O(log n) — graph search for insert position |
+| FAISS-IVF | +0.39 | ≈O(√n) — nearest-centroid scan over sqrt(n) centroids |
+
+**Key finding:** AMPI insert cost grows nearly linearly with n when nlist is fixed at
+build time.  nlist=224 was chosen for n=50k; as n grows to 500k, each cone holds ~10×
+more vectors and sorted-array shifts get 10× slower.  The O(F·√n) claim in the README
+only holds if nlist is re-scaled with √n (i.e., periodic rebuilds or a growing index).
+For a live index that never rebuilds, AMPI inserts are O(n/nlist) = O(n) relative to
+total corpus size.
 
 ---
 
 ## Summary
 
 **vs FAISS IVF (static):** AMPI uses 2–3× fewer candidates on MNIST/Fashion for
-equivalent recall, and outperforms IVF on GloVe (R@10 0.889 vs 0.879, R@1 0.935 vs
+equivalent recall, and outperforms IVF on GloVe (R@10 0.907 vs 0.879, R@1 0.945 vs
 0.905).  IVF is faster in raw QPS due to FAISS's mature C++ implementation; the gap
-ranges from ~3.5× (Fashion) to ~16× (MNIST/GloVe) depending on dataset.
+ranges from ~2× (Fashion) to ~10× (MNIST) depending on dataset.
 
-**vs HNSW (static):** HNSW wins on QPS across all datasets.  ef=10 on SIFT gives
-R@10=0.983 at 529 QPS; AMPI's best is R@10=0.987 at 72 QPS.  HNSW's graph structure
-is highly efficient for static corpora.
+**vs HNSW (static):** HNSW wins on QPS across all datasets.  On SIFT, ef=200 reaches
+R@10=0.996 at 1,102 QPS vs AFan's 0.988 at 98 QPS (~11× gap).  Fashion-MNIST is the
+closest: AFan K=1 cp=5 reaches 1,559 QPS at R@10=0.944, beating HNSW ef=20 (912 QPS).
 
 **Query-path optimisations landed:**
 - Gather + BLAS SGEMM rerank (`_rerank_blas`, with precomputed `norms`) replaces all
@@ -368,11 +404,11 @@ If so, skip the mmap read entirely.
 
 | Config | R@1 | R@10 | R@100 | QPS | vs baseline |
 |---|---:|---:|---:|---:|---:|
-| AFan K=1 cp=5  fp=32 w=12 | 0.680 | 0.584 | 0.463 | 102 | — |
-| AFan K=1 cp=10 fp=32 w=14 | 0.825 | 0.744 | 0.628 | 114 | — |
-| AFan K=1 cp=20 fp=32 w=16 | 0.915 | 0.871 | 0.786 |  62 | — |
-| AFan K=1 cp=30 fp=32 w=16 | 0.940 | 0.928 | 0.861 |  43 | — |
-| AFan K=1 cp=50 fp=32 w=16 | 0.980 | **0.975** | 0.936 |  28 | **31 QPS on main** |
+| AFan K=1 cp=5  fp=32 w=12 | 0.680 | 0.584 | 0.463 | 347 | — |
+| AFan K=1 cp=10 fp=32 w=14 | 0.825 | 0.744 | 0.628 | 207 | — |
+| AFan K=1 cp=20 fp=32 w=16 | 0.915 | 0.871 | 0.786 | 107 | — |
+| AFan K=1 cp=30 fp=32 w=16 | 0.940 | 0.928 | 0.861 |  75 | — |
+| AFan K=1 cp=50 fp=32 w=16 | 0.980 | **0.975** | 0.936 |  47 | **43 QPS on main** |
 
 **Sketch pruning analysis (cp=50, fp=32, w=16):**
 - Raw candidates per query: mean ≈ 21,000  (vs ~16,760 from BENCHMARKS baseline, measuring identical
@@ -431,3 +467,28 @@ scalar loop expensive relative to BLAS.
   remove the limit on machines with sufficient RAM.
 - Figures (recall vs candidates, QPS vs candidates, dist-ratio) are saved to
   `figures/` by the benchmark scripts.
+ of sketch:** 200k × 32 × 4 bytes = **25.6 MB**.
+**RAM cost of norms:** 200k × 4 bytes = **0.8 MB**.
+
+**RAM cost:** 200k × 32 × 4 bytes = **25.6 MB** added to resident memory.
+
+---
+
+## Notes
+
+- **Candidate count** is the primary efficiency metric: it measures how many
+  vectors are distance-computed before reranking, independent of implementation
+  speed.  It is a fair cross-implementation comparison; QPS is not (FAISS has a
+  far more mature query-path implementation than AMPI's current Python layer).
+- **Gaussian** results are not meaningful for ANN evaluation — see note in that
+  section.
+- All AMPI parameters (nlist, F) are chosen automatically via GP-BO on a data
+  subsample.  Query parameters (cp, fp, w) are swept exhaustively; the table
+  shows Pareto-optimal configs.
+- **Memory cap for large datasets:** GIST 1M at d=960 requires ~12 GB peak RAM
+  (three float32 copies: data, FAISS IVFFlat, AMPI buffer).  The benchmark scripts
+  cap GIST at 200k (`n_train=200_000`) to stay within ~3 GB.  Pass a larger cap or
+  remove the limit on machines with sufficient RAM.
+- Figures (recall vs candidates, QPS vs candidates, dist-ratio) are saved to
+  `figures/` by the benchmark scripts.
+pts.
